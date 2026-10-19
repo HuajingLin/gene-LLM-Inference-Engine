@@ -13,7 +13,7 @@ ppm-project/
 ├── src/                  
 │   └── check_model_stories15M.cpp
 ├── models/
-│   
+│   └── stories15M # TinyStories
 ├── 
 └── 
 ```
