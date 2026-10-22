@@ -12,3 +12,14 @@ __pycache__/
 # model data
 models/*
 !models/README.md
+
+# reference data
+ref_out/
+
+# dummy files
+dummy/
+
+# build artifacts
+build/
+
+tokenizer/
