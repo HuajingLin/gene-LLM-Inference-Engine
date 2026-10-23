@@ -14,13 +14,17 @@ endif()
 add_library(geneinfer STATIC
   src/loader/mapped_file.cpp
   src/loader/checkpoint.cpp
+  src/tokenizer/tokenizer.cpp
 )
 target_include_directories(geneinfer PUBLIC src)
 
 add_executable(gi_inspect tools/inspect_main.cpp)
 target_link_libraries(gi_inspect PRIVATE geneinfer)
 
-foreach(tgt geneinfer gi_inspect)
+add_executable(gi_tokenize tools/tokenize_main.cpp)
+target_link_libraries(gi_tokenize PRIVATE geneinfer)
+
+foreach(tgt geneinfer gi_inspect gi_tokenize)
   if(MSVC)
     target_compile_options(${tgt} PRIVATE /W4 /utf-8)
     target_compile_definitions(${tgt} PRIVATE _CRT_SECURE_NO_WARNINGS)

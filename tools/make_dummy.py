@@ -1,17 +1,12 @@
 #!/usr/bin/env python3
-"""make_dummy.py — Generates a small Llama2.c checkpoint (with random weights) 
-and a tokenizer for offline testing.
+"""make_dummy.py - generate a tiny random-weight llama2.c checkpoint + tokenizer for offline testing.
 
-This allows you to verify the layout expected by the C++ loader and ensure that 
-the NumPy reference implementation runs correctly—all without needing to download
- any external files.
-(Note: The output generated using random weights will be gibberish; 
-this is expected, as the tool is intended only for testing the "pipeline,"
- not for evaluating "model quality.")
+Nothing needs to be downloaded: it lets you check the C++ loader layout and that the NumPy reference runs.
+(Random weights produce gibberish, which is expected - this only tests the plumbing, not model quality.)
 
 Usage:
-python tools/make_dummy.py --out dummy              # Shared lm_head
-python tools/make_dummy.py --out dummy_u --unshared # Independent lm_head (vocab size in the header is represented as a negative number)
+  python tools/make_dummy.py --out dummy              # shared lm_head
+  python tools/make_dummy.py --out dummy_u --unshared # separate lm_head (negative vocab in the header)
 """
 from __future__ import annotations
 
@@ -29,17 +24,19 @@ from llama2c_io import Config, tensor_layout  # noqa: E402
 def build_vocab() -> tuple[list[bytes], list[float]]:
     vocab: list[bytes] = [b"<unk>", b"\n<s>\n", b"\n</s>\n"]
     scores: list[float] = [0.0, 0.0, 0.0]
-    for b in range(256):                      # byte-fallback token：id = byte + 3
+    for b in range(256):                      # byte-fallback tokens: id = byte + 3
         vocab.append(f"<0x{b:02X}>".encode())
         scores.append(0.0)
     singles = [b" "] + [bytes([c]) for c in range(ord("a"), ord("z") + 1)] + [b".", b","]
-    merges = [b" t", b"th", b"he", b" the", b"in", b"an", b" a", b"on", b"er", b" s", b"ing"]
+    # one multi-byte character of each UTF-8 length (2, 3 and 4 bytes)
+    singles += ["\u00e9".encode(), "\u65e5".encode(), "\U0001F642".encode()]
+    merges = [b" t", b"th", b"he", b" the", b"in", b"an", b" a", b"on", b"er", b" s", b"ing", b"aa"]
     for i, t in enumerate(singles):
         vocab.append(t)
-        scores.append(-100.0 - i)             # Single-character scores are very low, so they are prioritized for merging.
+        scores.append(-100.0 - i)             # single characters get very low scores, so merges win
     for i, t in enumerate(merges):
         vocab.append(t)
-        scores.append(-1.0 - i)               # Mergers that appear earlier take precedence.
+        scores.append(-1.0 - i)               # earlier merges take priority
     return vocab, scores
 
 

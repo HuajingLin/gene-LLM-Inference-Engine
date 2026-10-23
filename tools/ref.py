@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""ref.py — NumPy Reference implementation, generating a "standard answer"
+"""ref.py - M0: NumPy reference implementation that produces the "answer key".
 
-Do three things:
-  1. Implement llama2.c's forward pass with KV Cache using pure NumPy;
-  2. Generate greedily (temperature=0), saving text and token ids;
-  3. Save the complete logits at the last prompt position for M4 comparison.
+Does three things:
+  1. implements the llama2.c forward pass in pure NumPy (with a KV cache, one token at a time);
+  2. generates greedily (temperature=0) and saves the text and token ids;
+  3. saves the full logits of the "last prompt position", to compare against in M4.
 
 Usage:
   python tools/ref.py --model models/stories15M.bin --tokenizer models/tokenizer.bin \
@@ -22,24 +22,24 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from llama2c_io import Tokenizer, read_checkpoint  # noqa: E402
 
-# Normalization 
+
 def rmsnorm(x: np.ndarray, weight: np.ndarray) -> np.ndarray:
     ss = np.float32(np.mean(x * x) + np.float32(1e-5))
     return weight * (x * (np.float32(1.0) / np.sqrt(ss)))
 
-# Convert scores into a probability distribution
+
 def softmax(x: np.ndarray) -> np.ndarray:
-    e = np.exp(x - x.max())  # Subtract the maximum value first to prevent overflow in the exponential function (exp).
+    e = np.exp(x - x.max())  # subtract the max first to avoid exp overflow
     return e / e.sum()
 
-# Rotary Position Embedding
+
 def rope_freqs(head_size: int) -> np.ndarray:
-    """Rotation frequency for each pair of adjacent dimensions (2i, 2i+1):1 / 10000^(2i/head_size)。"""
+    """Rotation frequency of each adjacent dimension pair (2i, 2i+1): 1 / 10000^(2i/head_size)."""
     return 1.0 / (10000.0 ** (np.arange(0, head_size, 2, dtype=np.float64) / head_size))
 
-# Apply positional encoding to vectors
+
 def apply_rope(v: np.ndarray, pos: int, head_size: int) -> np.ndarray:
-    """Pairing method in llama2.c: adjacent dimensions (0,1),(2,3)...; Within each head, the frequencies start from the beginning."""
+    """llama2.c pairing: adjacent dimensions (0,1),(2,3)...; frequencies restart in every head."""
     freqs = np.tile(rope_freqs(head_size), v.shape[0] // head_size)
     angle = pos * freqs
     cos, sin = np.cos(angle).astype(np.float32), np.sin(angle).astype(np.float32)
@@ -59,7 +59,7 @@ class Model:
         self.value_cache = np.zeros_like(self.key_cache)
 
     def check_rope_tables(self) -> float:
-        """Verify our newly calculated cos/sin formulas against the `freq_cis` table stored in the file, and return the maximum absolute error."""
+        """Check the on-the-fly cos/sin formula against the freq_cis tables stored in the file; returns the max abs error."""
         c, w = self.cfg, self.w
         angle = np.outer(np.arange(c.seq_len), rope_freqs(c.head_size))
         err_r = np.abs(np.cos(angle) - w["freq_cis_real"]).max()
@@ -67,10 +67,10 @@ class Model:
         return float(max(err_r, err_i))
 
     def forward(self, token: int, pos: int) -> np.ndarray:
-        """Process a token at position pos, and return the logits for the next token (float32[vocab])."""
+        """Process one token at position pos; return the logits (float32[vocab]) for the next token."""
         c, w = self.cfg, self.w
         hs = c.head_size
-        x = np.array(w["token_embedding"][token], dtype=np.float32)  # Copy to avoid modifying weights
+        x = np.array(w["token_embedding"][token], dtype=np.float32)  # copy, so the weights are never modified
 
         for l in range(c.n_layers):
             # ---- attention ----
@@ -86,20 +86,20 @@ class Model:
 
             attn_out = np.empty(c.dim, dtype=np.float32)
             for h in range(c.n_heads):
-                kvh = h // c.kv_mul  # GQA：Multiple Q heads share the same set of KV heads.
+                kvh = h // c.kv_mul  # GQA: several query heads share one KV head
                 qh = q[h * hs:(h + 1) * hs]
                 K = self.key_cache[l, :pos + 1, kvh * hs:(kvh + 1) * hs]    # [pos+1, hs]
                 V = self.value_cache[l, :pos + 1, kvh * hs:(kvh + 1) * hs]
                 scores = (K @ qh) / np.sqrt(np.float32(hs))
                 attn_out[h * hs:(h + 1) * hs] = softmax(scores) @ V
-            x = x + w["wo"][l] @ attn_out  # Residual
+            x = x + w["wo"][l] @ attn_out  # residual
 
             # ---- FFN (SwiGLU) ----
             xb = rmsnorm(x, w["rms_ffn"][l])
             gate = w["w1"][l] @ xb
             up = w["w3"][l] @ xb
             gate = gate * (np.float32(1.0) / (np.float32(1.0) + np.exp(-gate)))  # SiLU
-            x = x + w["w2"][l] @ (gate * up)  # Residual
+            x = x + w["w2"][l] @ (gate * up)  # residual
 
         x = rmsnorm(x, w["rms_final"])
         return (w["wcls"] @ x).astype(np.float32)
@@ -118,16 +118,16 @@ def generate_greedy(model: Model, tok: Tokenizer, prompt: str, steps: int):
     while pos < steps:
         logits = model.forward(token, pos)
         if pos == len(prompt_tokens) - 1:
-            first_logits = logits.copy()  # Logits at the final prompt position → determine the first generated token
+            first_logits = logits.copy()  # logits at the last prompt position decide the first generated token
 
         if pos < len(prompt_tokens) - 1:
-            nxt = prompt_tokens[pos + 1]  # Still feeding the prompt, no sampling
+            nxt = prompt_tokens[pos + 1]  # still feeding the prompt, no sampling
         else:
-            nxt = int(np.argmax(logits))  # Greedy
+            nxt = int(np.argmax(logits))  # greedy
             generated.append(nxt)
         pos += 1
 
-        if nxt in (Tokenizer.BOS, Tokenizer.EOS):  # Sequence ended
+        if nxt in (Tokenizer.BOS, Tokenizer.EOS):  # end of sequence
             break
         if pos > len(prompt_tokens) - 1:
             out += tok.decode_piece(token, nxt)
@@ -141,7 +141,7 @@ def main() -> None:
     ap.add_argument("--model", required=True)
     ap.add_argument("--tokenizer", required=True)
     ap.add_argument("--prompt", default="Once upon a time")
-    ap.add_argument("--steps", type=int, default=128, help="Total position count limit (including prompt)")
+    ap.add_argument("--steps", type=int, default=128, help="maximum number of positions (including the prompt)")
     ap.add_argument("--out", default="ref_out")
     args = ap.parse_args()
 
@@ -151,7 +151,7 @@ def main() -> None:
     model = Model(ckpt)
 
     print(f"[config] {cfg}")
-    print(f"[rope]   Currently calculated cos/sin vs. freq_cis table in the file - Maximum error: {model.check_rope_tables():.2e}")
+    print(f"[rope]   max abs error of computed cos/sin vs. the freq_cis tables in the file: {model.check_rope_tables():.2e}")
 
     prompt_tokens, generated, text, first_logits = generate_greedy(model, tok, args.prompt, args.steps)
 
@@ -161,6 +161,8 @@ def main() -> None:
     top5 = np.argsort(-first_logits)[:5]
     record = {
         "model": str(args.model),
+        "tokenizer": str(args.tokenizer),
+        "vocab_size": cfg.vocab_size,
         "prompt": args.prompt,
         "steps": args.steps,
         "prompt_tokens": prompt_tokens,
