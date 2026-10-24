@@ -21,9 +21,3 @@ dummy/
 
 # build artifacts
 build/
-
-src/model/
-tests/verify_forward.py
-
-tools/forward_main.cpp
-tools/ref.py

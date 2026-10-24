@@ -16,6 +16,9 @@ Text Input
 ```
 cmake -S . -B build
 cmake --build build --config Release
+
+$ python3 tests/verify_forward.py --exe build/gi_forward \
+    --model models/stories15M/stories15M.bin --golden ref_out/ref.json
 ```
 
 ## Project Structure
