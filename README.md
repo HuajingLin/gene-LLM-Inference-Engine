@@ -10,6 +10,8 @@ Text Input
 → Sampler (selects the next token) → appended to the KV Cache
 → Detokenizer (token IDs → text stream output)
 ```
+[Project Wiki](https://github.com/HuajingLin/gene-LLM-Inference-Engine/wiki/M1.-Preparing-for-comparison-and-verification)
+
 # run
 ```
 cmake -S . -B build
@@ -26,9 +28,13 @@ ppm-project/
 │   ├── loader/
 │   │   ├── mapped_file.h / .cpp    # Cross-platform mmap (POSIX / Windows)
 │   │   └── checkpoint.h / .cpp     # Config、Weights、Checkpoint::load
-│   └── tokenizer/
-│       └── tokenizer.h / .cpp      #tokenizer
-│   
+│   ├── tokenizer/
+│   │   ├── tokenizer.h / .cpp      #tokenizer
+│   │   └── kernel_check_main.cpp
+│   ├── kernels/
+│   │   └── kernels.h / .cpp
+│   └── model/
+│       └── transformer.h / .cpp
 ├── models/
 │   └── stories15M/         # TinyStories
 ├── tools/
@@ -36,8 +42,12 @@ ppm-project/
 │   ├── llama2c_io.py       # Loading checkpoints/tokenizers using NumPy
 │   ├── ref.py              # M0: Reference forward + greedy generation; outputs the standar answer
 │   ├── make_dummy.py       # Generate a small, random model for offline testing purposes
-│   └── tokenize_main.cpp   # gi_tokenize
+│   ├── tokenize_main.cpp   # gi_tokenize
+│   ├── kernel_check_main.cpp
+│   └── forward_main.cpp
 └── tests/
     ├── verify_loader.py    # M1 Verification: C++ Output vs. NumPy Element-wise Comparison
-    └── verify_tokenizer.py # Comparison with Python reference implementation
+    ├── verify_tokenizer.py # Comparison with Python reference implementation
+    ├── verify_kernels.py
+    └── verify_forward.py
 ```

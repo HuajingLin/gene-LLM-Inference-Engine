@@ -15,6 +15,8 @@ add_library(geneinfer STATIC
   src/loader/mapped_file.cpp
   src/loader/checkpoint.cpp
   src/tokenizer/tokenizer.cpp
+  src/kernels/kernels.cpp
+  src/model/transformer.cpp
 )
 target_include_directories(geneinfer PUBLIC src)
 
@@ -24,7 +26,13 @@ target_link_libraries(gi_inspect PRIVATE geneinfer)
 add_executable(gi_tokenize tools/tokenize_main.cpp)
 target_link_libraries(gi_tokenize PRIVATE geneinfer)
 
-foreach(tgt geneinfer gi_inspect gi_tokenize)
+add_executable(gi_kernel_check tools/kernel_check_main.cpp)
+target_link_libraries(gi_kernel_check PRIVATE geneinfer)
+
+add_executable(gi_forward tools/forward_main.cpp)
+target_link_libraries(gi_forward PRIVATE geneinfer)
+
+foreach(tgt geneinfer gi_inspect gi_tokenize gi_kernel_check gi_forward)
   if(MSVC)
     target_compile_options(${tgt} PRIVATE /W4 /utf-8)
     target_compile_definitions(${tgt} PRIVATE _CRT_SECURE_NO_WARNINGS)

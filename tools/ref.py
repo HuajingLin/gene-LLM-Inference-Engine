@@ -66,11 +66,17 @@ class Model:
         err_i = np.abs(np.sin(angle) - w["freq_cis_imag"]).max()
         return float(max(err_r, err_i))
 
-    def forward(self, token: int, pos: int) -> np.ndarray:
-        """Process one token at position pos; return the logits (float32[vocab]) for the next token."""
+    def forward(self, token: int, pos: int, trace: dict | None = None) -> np.ndarray:
+        """Process one token at position pos; return the logits (float32[vocab]) for the next token.
+
+        If `trace` is a dict, copies of intermediate activations are stored in it (names match
+        the tags used by the C++ Transformer trace callback).
+        """
         c, w = self.cfg, self.w
         hs = c.head_size
         x = np.array(w["token_embedding"][token], dtype=np.float32)  # copy, so the weights are never modified
+        if trace is not None:
+            trace["embedding"] = x.copy()
 
         for l in range(c.n_layers):
             # ---- attention ----
@@ -93,6 +99,8 @@ class Model:
                 scores = (K @ qh) / np.sqrt(np.float32(hs))
                 attn_out[h * hs:(h + 1) * hs] = softmax(scores) @ V
             x = x + w["wo"][l] @ attn_out  # residual
+            if trace is not None:
+                trace[f"layer{l:02d}_attn_out"] = x.copy()
 
             # ---- FFN (SwiGLU) ----
             xb = rmsnorm(x, w["rms_ffn"][l])
@@ -100,8 +108,12 @@ class Model:
             up = w["w3"][l] @ xb
             gate = gate * (np.float32(1.0) / (np.float32(1.0) + np.exp(-gate)))  # SiLU
             x = x + w["w2"][l] @ (gate * up)  # residual
+            if trace is not None:
+                trace[f"layer{l:02d}_ffn_out"] = x.copy()
 
         x = rmsnorm(x, w["rms_final"])
+        if trace is not None:
+            trace["final_norm"] = x.copy()
         return (w["wcls"] @ x).astype(np.float32)
 
 
