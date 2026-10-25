@@ -24,56 +24,57 @@ $ python3 tests/verify_forward.py --exe build/gi_forward \
 ## Project Structure
 
 ```
-ppm-project/
+gene-llm-engine/
 ├── CMakeLists.txt
 ├── .gitignore
 ├── src/
-│   ├── loader/
-│   │   ├── mapped_file.h / .cpp    # Cross-platform mmap (POSIX / Windows)
-│   │   └── checkpoint.h / .cpp     # Config、Weights、Checkpoint::load
+│   ├── loader/                     # M (Milestone)
+│   │   ├── mapped_file.h / .cpp    # M1: Cross-platform mmap (POSIX / Windows)
+│   │   └── checkpoint.h / .cpp     # M1: Config、Weights、Checkpoint::load
 │   │
 │   ├── tokenizer/
-│   │   ├── tokenizer.h / .cpp      #tokenizer
+│   │   ├── tokenizer.h / .cpp      # M2: tokenizer
 │   │   └── kernel_check_main.cpp
 │   │
 │   ├── kernels/
-│   │   └── kernels.h / .cpp
+│   │   └── kernels.h / .cpp        # M3: operators
 │   │
 │   ├── model/
-│   │   └── transformer.h / .cpp
+│   │   └── transformer.h / .cpp    # M4
 │   │
 │   ├── sampler/
-│   │   └── sampler.h / .cpp
+│   │   └── sampler.h / .cpp        # M5
 │   │
 │   ├── runtime/
-│   │   └── generator.h / c.pp
+│   │   └── generator.h / c.pp      # M5
 │   │
 │   └── util/
-│       └── process_memory.h / .cpp
+│       └── process_memory.h / .cpp # M6
 │   
 ├── models/
-│   └── stories15M/         # TinyStories
+│   ├── stories15M/             # TinyStories
+│   └── SmolLM2-135M/           # SmolLM2
 │   
 ├── tools/
-│   ├── inspect_main.cpp    # gi_inspect: Print configuration and the fingerprint of each tensor
-│   ├── llama2c_io.py       # Loading checkpoints/tokenizers using NumPy
-│   ├── ref.py              # M0: Reference forward + greedy generation; outputs the standar answer
-│   ├── make_dummy.py       # Generate a small, random model for offline testing purposes
-│   ├── tokenize_main.cpp   # gi_tokenize
-│   ├── kernel_check_main.cpp
-│   ├── forward_main.cpp
-│   ├── generate_main.cpp
-│   └── sampler_check_main.cpp
+│   ├── ref.py                  # M0: Reference forward + greedy generation; outputs the standar answer
+│   ├── llama2c_io.py           # M1: Loading checkpoints/tokenizers using NumPy
+│   ├── make_dummy.py           # M1: Generate a small, random model for offline testing purposes
+│   ├── inspect_main.cpp        # M1: gi_inspect: Print configuration and the fingerprint of each tensor
+│   ├── tokenize_main.cpp       # M2: gi_tokenize
+│   ├── kernel_check_main.cpp   # M3: gi_kernel_check
+│   ├── forward_main.cpp        # M4: gi_forward
+│   ├── generate_main.cpp       # M5: gi_generate
+│   └── sampler_check_main.cpp  # M5: gi_sampler_check
 │   
 ├── tests/
-│    ├── verify_loader.py    # M1 Verification: C++ Output vs. NumPy Element-wise Comparison
-│    ├── verify_tokenizer.py # Comparison with Python reference implementation
-│    ├── verify_kernels.py
-│    ├── verify_forward.py
-│    ├── verify_sampler.py
-│    ├── verify_generate.py
-│    └── verify_bench.py
+│    ├── verify_loader.py       # M1: Verification: C++ Output vs. NumPy Element-wise Comparison
+│    ├── verify_tokenizer.py    # M2: Comparison with Python reference implementation
+│    ├── verify_kernels.py      # M3
+│    ├── verify_forward.py      # M4
+│    ├── verify_sampler.py      # M5
+│    ├── verify_generate.py     # M5
+│    └── verify_bench.py        # M6
 │
 └── bench/
-     └── bench_main.cpp
+     └── bench_main.cpp         # M6: gi_bench
 ```
