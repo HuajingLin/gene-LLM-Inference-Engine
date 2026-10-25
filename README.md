@@ -31,15 +31,26 @@ ppm-project/
 │   ├── loader/
 │   │   ├── mapped_file.h / .cpp    # Cross-platform mmap (POSIX / Windows)
 │   │   └── checkpoint.h / .cpp     # Config、Weights、Checkpoint::load
+│   │
 │   ├── tokenizer/
 │   │   ├── tokenizer.h / .cpp      #tokenizer
 │   │   └── kernel_check_main.cpp
+│   │
 │   ├── kernels/
 │   │   └── kernels.h / .cpp
-│   └── model/
-│       └── transformer.h / .cpp
+│   │
+│   ├── model/
+│   │   └── transformer.h / .cpp
+│   │
+│   ├── sampler/
+│   │   └── sampler.h / .cpp
+│   │
+│   └── runtime/
+│       └── generator.h / c.pp
+│   
 ├── models/
 │   └── stories15M/         # TinyStories
+│   
 ├── tools/
 │   ├── inspect_main.cpp    # gi_inspect: Print configuration and the fingerprint of each tensor
 │   ├── llama2c_io.py       # Loading checkpoints/tokenizers using NumPy
@@ -47,10 +58,15 @@ ppm-project/
 │   ├── make_dummy.py       # Generate a small, random model for offline testing purposes
 │   ├── tokenize_main.cpp   # gi_tokenize
 │   ├── kernel_check_main.cpp
-│   └── forward_main.cpp
+│   ├── forward_main.cpp
+│   ├── generate_main.cpp
+│   └── sampler_check_main.cpp
+│   
 └── tests/
     ├── verify_loader.py    # M1 Verification: C++ Output vs. NumPy Element-wise Comparison
     ├── verify_tokenizer.py # Comparison with Python reference implementation
     ├── verify_kernels.py
-    └── verify_forward.py
+    ├── verify_forward.py
+    ├── verify_sampler.py
+    └── verify_generate.py
 ```

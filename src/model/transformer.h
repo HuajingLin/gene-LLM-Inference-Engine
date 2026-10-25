@@ -39,7 +39,11 @@ public:
     // Processes `token` at position `pos` and returns the logits (vocab_size floats) that
     // predict the next token. The returned pointer stays valid until the next forward() call.
     // Throws std::out_of_range for an invalid token id or position.
-    const float* forward(int token, int pos);
+    //
+    // While feeding a prompt, the logits of all but the last position are never used. Pass
+    // compute_logits = false for those: the final norm and the (large) classifier matrix
+    // product are skipped and nullptr is returned. The KV cache is updated either way.
+    const float* forward(int token, int pos, bool compute_logits = true);
 
     const Config& config() const { return cfg_; }
     int max_seq_len() const { return ctx_len_; }

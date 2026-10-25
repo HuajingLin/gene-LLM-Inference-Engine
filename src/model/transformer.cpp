@@ -39,7 +39,7 @@ Transformer::Transformer(const Checkpoint& checkpoint, int max_seq_len)
     value_cache_.assign(cache_size, 0.0f);
 }
 
-const float* Transformer::forward(int token, int pos) {
+const float* Transformer::forward(int token, int pos, bool compute_logits) {
     if (token < 0 || token >= cfg_.vocab_size) {
         throw std::out_of_range("forward: token id " + std::to_string(token) + " out of range");
     }
@@ -125,6 +125,7 @@ const float* Transformer::forward(int token, int pos) {
     }
 
     // 3. Final norm and classifier (for shared weights, wcls is the embedding table).
+    if (!compute_logits) return nullptr;
     kernels::rmsnorm(x, x, w_.rms_final, dim);
     if (trace_) trace_("final_norm", -1, x, dim);
     kernels::matvec(logits_.data(), w_.wcls, x, cfg_.vocab_size, dim);
