@@ -45,8 +45,11 @@ ppm-project/
 │   ├── sampler/
 │   │   └── sampler.h / .cpp
 │   │
-│   └── runtime/
-│       └── generator.h / c.pp
+│   ├── runtime/
+│   │   └── generator.h / c.pp
+│   │
+│   └── util/
+│       └── process_memory.h / .cpp
 │   
 ├── models/
 │   └── stories15M/         # TinyStories
@@ -62,11 +65,15 @@ ppm-project/
 │   ├── generate_main.cpp
 │   └── sampler_check_main.cpp
 │   
-└── tests/
-    ├── verify_loader.py    # M1 Verification: C++ Output vs. NumPy Element-wise Comparison
-    ├── verify_tokenizer.py # Comparison with Python reference implementation
-    ├── verify_kernels.py
-    ├── verify_forward.py
-    ├── verify_sampler.py
-    └── verify_generate.py
+├── tests/
+│    ├── verify_loader.py    # M1 Verification: C++ Output vs. NumPy Element-wise Comparison
+│    ├── verify_tokenizer.py # Comparison with Python reference implementation
+│    ├── verify_kernels.py
+│    ├── verify_forward.py
+│    ├── verify_sampler.py
+│    ├── verify_generate.py
+│    └── verify_bench.py
+│
+└── bench/
+     └── bench_main.cpp
 ```

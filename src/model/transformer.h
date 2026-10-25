@@ -48,6 +48,10 @@ public:
     const Config& config() const { return cfg_; }
     int max_seq_len() const { return ctx_len_; }
 
+    // Memory owned by this object (the weights are not included: they live in the mmap).
+    std::size_t kv_cache_bytes() const;  // keys + values for all layers and positions
+    std::size_t scratch_bytes() const;   // activation buffers, attention scores, logits
+
     void set_trace(TraceFn fn) { trace_ = std::move(fn); }
 
 private:

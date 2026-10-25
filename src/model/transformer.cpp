@@ -39,6 +39,15 @@ Transformer::Transformer(const Checkpoint& checkpoint, int max_seq_len)
     value_cache_.assign(cache_size, 0.0f);
 }
 
+std::size_t Transformer::kv_cache_bytes() const {
+    return (key_cache_.size() + value_cache_.size()) * sizeof(float);
+}
+
+std::size_t Transformer::scratch_bytes() const {
+    return (x_.size() + xb_.size() + xb2_.size() + hb_.size() + hb2_.size() + q_.size() +
+            att_.size() + logits_.size()) * sizeof(float);
+}
+
 const float* Transformer::forward(int token, int pos, bool compute_logits) {
     if (token < 0 || token >= cfg_.vocab_size) {
         throw std::out_of_range("forward: token id " + std::to_string(token) + " out of range");

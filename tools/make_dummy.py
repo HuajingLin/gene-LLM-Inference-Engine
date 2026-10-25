@@ -7,6 +7,7 @@ Nothing needs to be downloaded: it lets you check the C++ loader layout and that
 Usage:
   python tools/make_dummy.py --out dummy              # shared lm_head
   python tools/make_dummy.py --out dummy_u --unshared # separate lm_head (negative vocab in the header)
+  python tools/make_dummy.py --out big --dim 512 --hidden 2048 --layers 8 --heads 8 --kv-heads 8 --seq-len 256
 """
 from __future__ import annotations
 
@@ -45,11 +46,18 @@ def main() -> None:
     ap.add_argument("--out", default="dummy")
     ap.add_argument("--unshared", action="store_true")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--dim", type=int, default=16)
+    ap.add_argument("--hidden", type=int, default=40)
+    ap.add_argument("--layers", type=int, default=2)
+    ap.add_argument("--heads", type=int, default=4)
+    ap.add_argument("--kv-heads", type=int, default=2)
+    ap.add_argument("--seq-len", type=int, default=32)
     args = ap.parse_args()
 
     vocab, scores = build_vocab()
-    cfg = Config(dim=16, hidden_dim=40, n_layers=2, n_heads=4, n_kv_heads=2,   # with GQA
-                 vocab_size=len(vocab), seq_len=32, shared_classifier=not args.unshared)
+    cfg = Config(dim=args.dim, hidden_dim=args.hidden, n_layers=args.layers, n_heads=args.heads,
+                 n_kv_heads=args.kv_heads,   # the defaults use GQA (4 query heads, 2 KV heads)
+                 vocab_size=len(vocab), seq_len=args.seq_len, shared_classifier=not args.unshared)
 
     rng = np.random.default_rng(args.seed)
     out_dir = Path(args.out)

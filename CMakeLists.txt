@@ -19,6 +19,7 @@ add_library(geneinfer STATIC
   src/model/transformer.cpp
   src/sampler/sampler.cpp
   src/runtime/generator.cpp
+  src/util/process_memory.cpp
 )
 target_include_directories(geneinfer PUBLIC src)
 
@@ -40,7 +41,10 @@ target_link_libraries(gi_generate PRIVATE geneinfer)
 add_executable(gi_sampler_check tools/sampler_check_main.cpp)
 target_link_libraries(gi_sampler_check PRIVATE geneinfer)
 
-foreach(tgt geneinfer gi_inspect gi_tokenize gi_kernel_check gi_forward gi_generate gi_sampler_check)
+add_executable(gi_bench bench/bench_main.cpp)
+target_link_libraries(gi_bench PRIVATE geneinfer)
+
+foreach(tgt geneinfer gi_inspect gi_tokenize gi_kernel_check gi_forward gi_generate gi_sampler_check gi_bench)
   if(MSVC)
     target_compile_options(${tgt} PRIVATE /W4 /utf-8)
     target_compile_definitions(${tgt} PRIVATE _CRT_SECURE_NO_WARNINGS)
