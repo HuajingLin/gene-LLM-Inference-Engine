@@ -1,18 +1,13 @@
 # Gene LLM Engine
 Lightweight LLM Inference Engine
-Core Data Flow:
-```
-Text Input
-→ Tokenizer (text → token IDs)
-→ Prefill (processes the entire prompt at once, populates the KV Cache)
-→ Decode Loop (generates one token at a time)
-  Embedding → N × Transformer Blocks → RMSNorm → LM Head → logits
-→ Sampler (selects the next token) → appended to the KV Cache
-→ Detokenizer (token IDs → text stream output)
+
+```diff
+- Stage 1: stories15M
++ Stage 2: SmolLM2-135M
 ```
 [Project Wiki](https://github.com/HuajingLin/gene-LLM-Inference-Engine/wiki/M1.-Preparing-for-comparison-and-verification)
 
-# run
+## run
 ```
 cmake -S . -B build
 cmake --build build --config Release
@@ -22,9 +17,9 @@ $ python3 tests/verify_forward.py --exe build/gi_forward \
 ```
 
 ## Project Structure
-
+Stage 1: M1 ~ M6
 ```
-gene-llm-engine/
+geneInfer/
 ├── CMakeLists.txt
 ├── .gitignore
 ├── src/
@@ -56,7 +51,7 @@ gene-llm-engine/
 │   └── SmolLM2-135M/           # SmolLM2
 │   
 ├── tools/
-│   ├── ref.py                  # M0: Reference forward + greedy generation; outputs the standar answer
+│   ├── ref.py                  # M1: Reference forward + greedy generation; outputs the standar answer
 │   ├── llama2c_io.py           # M1: Loading checkpoints/tokenizers using NumPy
 │   ├── make_dummy.py           # M1: Generate a small, random model for offline testing purposes
 │   ├── inspect_main.cpp        # M1: gi_inspect: Print configuration and the fingerprint of each tensor

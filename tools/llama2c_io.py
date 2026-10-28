@@ -102,7 +102,7 @@ def read_checkpoint(path: str | Path) -> Checkpoint:
 
 # --------------------------------------------------------------------------- tokenizer
 class Tokenizer:
-    """llama2.c 的 tokenizer.bin:
+    """tokenizer.bin of `llama2.c` format, used for BPE encoding and decoding.
         int32 max_token_length
         Repeated `vocab_size` times: `float32` score, `int32` length, and the token content (a sequence of bytes of the specified length).
 Special IDs: 0 = `<unk>`, 1 = `<s>` (BOS), 2 = `</s>` (EOS); the ID for a byte-fallback token is the byte value + 3.
