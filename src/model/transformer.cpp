@@ -19,6 +19,17 @@ inline std::size_t sz(int v) { return static_cast<std::size_t>(v); }
 
 Transformer::Transformer(const Checkpoint& checkpoint, int max_seq_len)
     : cfg_(checkpoint.config()), w_(checkpoint.weights()) {
+    // The forward pass below implements llama2.c's conventions. Refuse models that need more
+    // instead of silently computing wrong results.
+    if (cfg_.attn_dim() != cfg_.dim) {
+        throw std::invalid_argument("Transformer: models with n_heads * head_dim != dim are not supported yet");
+    }
+    if (cfg_.rope_style != RopeStyle::Interleaved || cfg_.rope_theta != 10000.0f ||
+        cfg_.rms_norm_eps != 1e-5f) {
+        throw std::invalid_argument(
+            "Transformer: this model needs RoPE / RMSNorm settings (pairing style, theta, epsilon) "
+            "that are not implemented yet");
+    }
     if (max_seq_len < 0 || max_seq_len > cfg_.seq_len) {
         throw std::invalid_argument("max_seq_len must be in [0, " + std::to_string(cfg_.seq_len) +
                                     "], got " + std::to_string(max_seq_len));
@@ -77,20 +88,21 @@ const float* Transformer::forward(int token, int pos, bool compute_logits) {
 
     for (int l = 0; l < cfg_.n_layers; ++l) {
         const std::size_t layer = sz(l);
+        const LayerWeights& lw = w_.layers[layer];
 
         // Start of this layer's slice of the KV cache; positions follow, each kv_dim wide.
         float* layer_keys = key_cache_.data() + layer * sz(ctx_len_) * sz(kv_dim);
         float* layer_values = value_cache_.data() + layer * sz(ctx_len_) * sz(kv_dim);
 
         // ---------------- attention block ----------------
-        kernels::rmsnorm(xb, x, w_.rms_att + layer * sz(dim), dim);
+        kernels::rmsnorm(xb, x, lw.rms_att, dim);
 
         // K and V of the current position are written directly into the cache.
         float* k = layer_keys + sz(pos) * sz(kv_dim);
         float* v = layer_values + sz(pos) * sz(kv_dim);
-        kernels::matvec(q, w_.wq + layer * sz(dim) * sz(dim), xb, dim, dim);
-        kernels::matvec(k, w_.wk + layer * sz(kv_dim) * sz(dim), xb, kv_dim, dim);
-        kernels::matvec(v, w_.wv + layer * sz(kv_dim) * sz(dim), xb, kv_dim, dim);
+        kernels::matvec(q, lw.wq, xb, dim, dim);
+        kernels::matvec(k, lw.wk, xb, kv_dim, dim);
+        kernels::matvec(v, lw.wv, xb, kv_dim, dim);
 
         // Rotary position embedding on q and k (v is not rotated).
         kernels::rope(q, dim, pos, head_size);
@@ -118,17 +130,17 @@ const float* Transformer::forward(int token, int pos, bool compute_logits) {
         }
 
         // Output projection, then add to the residual stream.
-        kernels::matvec(xb2, w_.wo + layer * sz(dim) * sz(dim), xb, dim, dim);
+        kernels::matvec(xb2, lw.wo, xb, dim, dim);
         kernels::add(x, xb2, dim);
         if (trace_) trace_("attn_out", l, x, dim);
 
         // ---------------- feed-forward block (SwiGLU) ----------------
-        kernels::rmsnorm(xb, x, w_.rms_ffn + layer * sz(dim), dim);
-        kernels::matvec(hb, w_.w1 + layer * sz(hidden) * sz(dim), xb, hidden, dim);   // gate
-        kernels::matvec(hb2, w_.w3 + layer * sz(hidden) * sz(dim), xb, hidden, dim);  // up
+        kernels::rmsnorm(xb, x, lw.rms_ffn, dim);
+        kernels::matvec(hb, lw.w1, xb, hidden, dim);   // gate
+        kernels::matvec(hb2, lw.w3, xb, hidden, dim);  // up
         kernels::silu(hb, hidden);
         kernels::mul(hb, hb2, hidden);
-        kernels::matvec(xb, w_.w2 + layer * sz(dim) * sz(hidden), hb, dim, hidden);   // down
+        kernels::matvec(xb, lw.w2, hb, dim, hidden);   // down
         kernels::add(x, xb, dim);
         if (trace_) trace_("ffn_out", l, x, dim);
     }

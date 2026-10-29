@@ -1,9 +1,12 @@
-#include "checkpoint.h"
+#include "loader/checkpoint.h"
 
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <sstream>
 #include <stdexcept>
+
+#include "loader/safetensors.h"
 
 namespace geneinfer {
 
@@ -16,8 +19,7 @@ constexpr std::size_t kHeaderBytes = kHeaderInts * sizeof(std::int32_t);
 
 std::size_t product(const std::vector<std::int64_t>& shape) {
     std::size_t n = 1;
-    for (auto s : shape)
-        n *= static_cast<std::size_t>(s);
+    for (auto s : shape) n *= static_cast<std::size_t>(s);
     return n;
 }
 
@@ -32,12 +34,28 @@ void validate(const Config& c) {
     }
     if (c.dim % c.n_heads != 0) fail("dim must be divisible by n_heads");
     if (c.n_heads % c.n_kv_heads != 0) fail("n_heads must be divisible by n_kv_heads");
-    if (c.head_size() % 2 != 0) fail("head_size must be even (RoPE rotates pairs)");
+    if ((c.dim / c.n_heads) % 2 != 0) fail("head_size must be even (RoPE rotates pairs)");
 }
 
 }  // namespace
 
+// ---- special members (SafetensorsFile is incomplete in the header) --------------------------
+Checkpoint::Checkpoint() = default;
+Checkpoint::~Checkpoint() = default;
+Checkpoint::Checkpoint(Checkpoint&&) noexcept = default;
+Checkpoint& Checkpoint::operator=(Checkpoint&&) noexcept = default;
+
+std::size_t Checkpoint::file_size() const {
+    return safetensors_ ? safetensors_->file_size() : file_.size();
+}
+
 Checkpoint Checkpoint::load(const std::string& path) {
+    std::error_code ec;
+    if (std::filesystem::is_directory(std::filesystem::path(path), ec)) return load_hf(path);
+    return load_llama2c(path);
+}
+
+Checkpoint Checkpoint::load_llama2c(const std::string& path) {
     Checkpoint ck;
     ck.file_ = MappedFile(path);
 
@@ -46,7 +64,7 @@ Checkpoint Checkpoint::load(const std::string& path) {
     if (file_size < kHeaderBytes) fail("file too small to contain a header");
 
     // ---- 1. header ----------------------------------------------------------
-    // Use `memcpy` for reading to avoid type-punning (which leads to undefined behavior) on unaligned or aliased memory.
+    // Read with memcpy to avoid casting possibly unaligned/aliased memory (undefined behavior).
     std::int32_t h[kHeaderInts];
     std::memcpy(h, base, kHeaderBytes);
 
@@ -60,8 +78,10 @@ Checkpoint Checkpoint::load(const std::string& path) {
     c.vocab_size = std::abs(h[5]);
     c.seq_len = h[6];
     validate(c);
+    c.head_dim = c.dim / c.n_heads;  // llama2.c: the heads exactly tile the hidden dimension
+    // rope_theta, rms_norm_eps and rope_style keep their llama2.c defaults.
 
-    // ---- 2. Split tensors in a fixed order ---------------------------------------
+    // ---- 2. slice the tensors in their fixed order ----------------------------------
     const std::int64_t L = c.n_layers, D = c.dim, H = c.hidden_dim, V = c.vocab_size;
     const std::int64_t KV = c.kv_dim(), HS = c.head_size(), S = c.seq_len;
 
@@ -85,29 +105,45 @@ Checkpoint Checkpoint::load(const std::string& path) {
 
     Weights& w = ck.w_;
     w.token_embedding = take("token_embedding", {V, D});
-    w.rms_att = take("rms_att", {L, D});
-    w.wq = take("wq", {L, D, D});     // n_heads * head_size == dim
-    w.wk = take("wk", {L, KV, D});
-    w.wv = take("wv", {L, KV, D});
-    w.wo = take("wo", {L, D, D});
-    w.rms_ffn = take("rms_ffn", {L, D});
-    w.w1 = take("w1", {L, H, D});
-    w.w2 = take("w2", {L, D, H});
-    w.w3 = take("w3", {L, H, D});
+    const float* rms_att = take("rms_att", {L, D});
+    const float* wq = take("wq", {L, D, D});     // n_heads * head_size == dim
+    const float* wk = take("wk", {L, KV, D});
+    const float* wv = take("wv", {L, KV, D});
+    const float* wo = take("wo", {L, D, D});
+    const float* rms_ffn = take("rms_ffn", {L, D});
+    const float* w1 = take("w1", {L, H, D});
+    const float* w2 = take("w2", {L, D, H});
+    const float* w3 = take("w3", {L, H, D});
     w.rms_final = take("rms_final", {D});
-    // Legacy RoPE precomputation table. Neither `run.c` nor we use it 
-    // (as `cos`/`sin` values ​​are calculated on the fly during runtime), 
-    //but it must be skipped over.
+    // Legacy precomputed RoPE tables. Neither run.c nor this engine uses them
+    // (cos/sin are computed on the fly), but they must be skipped.
     take("freq_cis_real", {S, HS / 2});
     take("freq_cis_imag", {S, HS / 2});
     w.wcls = c.shared_classifier ? w.token_embedding : take("wcls", {V, D});
 
-    // ---- 3. Sizes must match exactly: expose format/version issues early --------------
+    // ---- 3. the size must match exactly: this exposes a wrong export format/version early ----
     if (offset != file_size) {
         std::ostringstream os;
         os << "size mismatch: header implies " << offset << " bytes, file has " << file_size
            << " bytes (wrong format/version, e.g. int8-quantized or v1+ export?)";
         fail(os.str());
+    }
+
+    // ---- 4. the file stores each tensor type for all layers back to back: build per-layer pointers ----
+    const std::size_t sd = static_cast<std::size_t>(D), sh = static_cast<std::size_t>(H);
+    const std::size_t skv = static_cast<std::size_t>(KV);
+    w.layers.resize(static_cast<std::size_t>(L));
+    for (std::size_t l = 0; l < w.layers.size(); ++l) {
+        LayerWeights& lw = w.layers[l];
+        lw.rms_att = rms_att + l * sd;
+        lw.wq = wq + l * sd * sd;
+        lw.wk = wk + l * skv * sd;
+        lw.wv = wv + l * skv * sd;
+        lw.wo = wo + l * sd * sd;
+        lw.rms_ffn = rms_ffn + l * sd;
+        lw.w1 = w1 + l * sh * sd;
+        lw.w2 = w2 + l * sd * sh;
+        lw.w3 = w3 + l * sh * sd;
     }
 
     return ck;

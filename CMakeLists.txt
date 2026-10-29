@@ -14,6 +14,10 @@ endif()
 add_library(geneinfer STATIC
   src/loader/mapped_file.cpp
   src/loader/checkpoint.cpp
+  src/loader/hf_checkpoint.cpp
+  src/loader/dtype.cpp
+  src/loader/safetensors.cpp
+  src/util/json.cpp
   src/tokenizer/tokenizer.cpp
   src/kernels/kernels.cpp
   src/model/transformer.cpp
@@ -22,6 +26,9 @@ add_library(geneinfer STATIC
   src/util/process_memory.cpp
 )
 target_include_directories(geneinfer PUBLIC src)
+if(WIN32)
+  target_link_libraries(geneinfer PUBLIC psapi)
+endif()
 
 add_executable(gi_inspect tools/inspect_main.cpp)
 target_link_libraries(gi_inspect PRIVATE geneinfer)
@@ -44,7 +51,13 @@ target_link_libraries(gi_sampler_check PRIVATE geneinfer)
 add_executable(gi_bench bench/bench_main.cpp)
 target_link_libraries(gi_bench PRIVATE geneinfer)
 
-foreach(tgt geneinfer gi_inspect gi_tokenize gi_kernel_check gi_forward gi_generate gi_sampler_check gi_bench)
+add_executable(gi_json_check tools/json_check_main.cpp)
+target_link_libraries(gi_json_check PRIVATE geneinfer)
+
+add_executable(gi_dtype_check tools/dtype_check_main.cpp)
+target_link_libraries(gi_dtype_check PRIVATE geneinfer)
+
+foreach(tgt geneinfer gi_inspect gi_tokenize gi_kernel_check gi_forward gi_generate gi_sampler_check gi_bench gi_json_check gi_dtype_check)
   if(MSVC)
     target_compile_options(${tgt} PRIVATE /W4 /utf-8)
     target_compile_definitions(${tgt} PRIVATE _CRT_SECURE_NO_WARNINGS)
