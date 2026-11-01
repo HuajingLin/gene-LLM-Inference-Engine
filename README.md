@@ -5,7 +5,7 @@ Lightweight LLM Inference Engine
 + Stage 1: stories15M
 - Stage 2: SmolLM2-135M
 ```
-[Project Wiki](https://github.com/HuajingLin/gene-LLM-Inference-Engine/wiki/M1.-Preparing-for-comparison-and-verification)
+[Project Wiki](https://github.com/HuajingLin/gene-LLM-Inference-Engine/wiki/M7.-Load-model-SmolLM2%E2%80%90135M)
 
 ## run
 ```
@@ -47,9 +47,12 @@ geneInfer/
 │   ├── runtime/
 │   │   └── generator.h / c.pp      # M5
 │   │
-│   └── util/
-│       ├── process_memory.h / .cpp # M6
-│       └── json.h / .cpp           # M7 JSON Parser
+│   ├── util/
+│   │   ├── process_memory.h / .cpp # M6
+│   │   └── json.h / .cpp           # M7 JSON Parser
+│   │
+│   └── common/
+│       └── rope_style.h            # M8
 │   
 ├── models/
 │   ├── stories15M/             # TinyStories
@@ -68,7 +71,9 @@ geneInfer/
 │   ├── hf_io.py                # M7: Read and write HF tensors
 │   ├── make_dummy_hf.py        # M7: generating random numbers for model
 │   ├── json_check_main.cpp     # M7: gi_json_check
-│   └── dtype_check_main.cpp    # M7: gi_dtype_check
+│   ├── dtype_check_main.cpp    # M7: gi_dtype_check
+│   ├── hf_golden.py            # M8
+│   └── env_check.py            # M8
 │   
 ├── tests/
 │    ├── verify_loader.py       # M1: Verification: C++ Output vs. NumPy Element-wise Comparison

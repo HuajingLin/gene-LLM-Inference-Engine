@@ -19,5 +19,8 @@ ref_out/
 # dummy files
 dummy/
 
+# golden_hf files
+golden_hf/
+
 # build artifacts
 build/

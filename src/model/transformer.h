@@ -61,11 +61,12 @@ private:
 
     // Activation buffers (allocated once, reused for every token).
     std::vector<float> x_;      // [dim]       residual stream
-    std::vector<float> xb_;     // [dim]       scratch (normalized input / attention output)
+    std::vector<float> xb_;     // [dim]       scratch (normalized input, FFN output)
     std::vector<float> xb2_;    // [dim]       scratch (projection output)
     std::vector<float> hb_;     // [hidden]    FFN gate
     std::vector<float> hb2_;    // [hidden]    FFN up
-    std::vector<float> q_;      // [dim]       query
+    std::vector<float> q_;      // [attn_dim]  query
+    std::vector<float> ao_;     // [attn_dim]  attention output (all heads concatenated)
     std::vector<float> att_;    // [n_heads, ctx_len] attention scores of the current token
     std::vector<float> logits_; // [vocab]
 

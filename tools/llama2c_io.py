@@ -1,6 +1,6 @@
-"""llama2c_io.py — Reading checkpoints and tokenizers in the `llama2.c` format (NumPy-based implementation).
+"""llama2c_io.py - readers for llama2.c checkpoints and tokenizers (NumPy version).
 
-This serves as a "reference implementation" in Python: the memory layout, BPE encoding, and decoding logic are all aligned with `run.c` from `karpathy/llama2.c`.
+This is the "answer key" for the C++ implementation: layout, BPE encoding and decoding all follow run.c in karpathy/llama2.c.
 """
 from __future__ import annotations
 
@@ -26,10 +26,19 @@ class Config:
     vocab_size: int
     seq_len: int
     shared_classifier: bool
+    # Settings that llama2.c does not store (its fixed conventions are the defaults):
+    head_dim: int = 0                    # 0 = dim // n_heads
+    rope_theta: float = 10000.0
+    rms_norm_eps: float = 1e-5
+    rope_style: str = "interleaved"      # or "half_split" (Hugging Face)
 
     @property
     def head_size(self) -> int:
-        return self.dim // self.n_heads
+        return self.head_dim or self.dim // self.n_heads
+
+    @property
+    def attn_dim(self) -> int:
+        return self.n_heads * self.head_size
 
     @property
     def kv_dim(self) -> int:
@@ -41,7 +50,7 @@ class Config:
 
 
 def tensor_layout(c: Config) -> list[tuple[str, tuple[int, ...]]]:
-    """List all tensors and their shapes in the order they appear in the files. Weight matrices are in [out, in] row-major order."""
+    """List all tensors in file order with their shapes. Weight matrices are row-major [out, in]."""
     L, D, H, V = c.n_layers, c.dim, c.hidden_dim, c.vocab_size
     KV, HS, S = c.kv_dim, c.head_size, c.seq_len
     layout = [
@@ -68,8 +77,8 @@ def tensor_layout(c: Config) -> list[tuple[str, tuple[int, ...]]]:
 @dataclass
 class Checkpoint:
     config: Config
-    tensors: dict[str, np.ndarray]   # name -> float32 view (memmap, consumes no additional memory)
-    offsets: dict[str, int]          # name -> Byte offset within a file
+    tensors: dict[str, np.ndarray]   # name -> float32 view (memmap, no extra memory)
+    offsets: dict[str, int]          # name -> byte offset within the file
     file_size: int
 
 
@@ -102,10 +111,10 @@ def read_checkpoint(path: str | Path) -> Checkpoint:
 
 # --------------------------------------------------------------------------- tokenizer
 class Tokenizer:
-    """tokenizer.bin of `llama2.c` format, used for BPE encoding and decoding.
+    """The llama2.c tokenizer.bin format:
         int32 max_token_length
-        Repeated `vocab_size` times: `float32` score, `int32` length, and the token content (a sequence of bytes of the specified length).
-Special IDs: 0 = `<unk>`, 1 = `<s>` (BOS), 2 = `</s>` (EOS); the ID for a byte-fallback token is the byte value + 3.
+        repeated vocab_size times: float32 score, int32 len, then len bytes of token text
+    Special ids: 0=<unk>  1=<s>(BOS)  2=</s>(EOS); byte-fallback token id = byte value + 3.
     """
 
     BOS, EOS = 1, 2
@@ -130,10 +139,10 @@ Special IDs: 0 = `<unk>`, 1 = `<s>` (BOS), 2 = `</s>` (EOS); the ID for a byte-f
         if bos:
             tokens.append(self.BOS)
         if text:
-            # SentencePiece adds a "virtual space" prefix to the text by default.
+            # sentencepiece prepends a "dummy prefix" space to the text by default
             tokens.append(self.lookup[b" "])
 
-        # 1) Break down into individual Unicode characters; if a character is not in the vocabulary, fall back to byte-based encoding (id = byte + 3).
+        # 1) split into single Unicode characters; fall back to bytes (id = byte + 3) if the vocab lacks one
         for ch in text:
             b = ch.encode("utf-8")
             if b in self.lookup:
@@ -141,7 +150,7 @@ Special IDs: 0 = `<unk>`, 1 = `<s>` (BOS), 2 = `</s>` (EOS); the ID for a byte-f
             else:
                 tokens.extend(byte + 3 for byte in b)
 
-        # 2) BPE: Repeatedly merge adjacent token pairs that have the highest score in the vocabulary after merging.
+        # 2) BPE: repeatedly merge the adjacent pair whose concatenation is in the vocab with the highest score
         while True:
             best_score, best_id, best_idx = -1e10, -1, -1
             for i in range(len(tokens) - 1):
@@ -160,8 +169,8 @@ Special IDs: 0 = `<unk>`, 1 = `<s>` (BOS), 2 = `</s>` (EOS); the ID for a byte-f
     def decode_piece(self, prev: int, tok: int) -> bytes:
         piece = self.vocab[tok]
         if prev == self.BOS and piece.startswith(b" "):
-            piece = piece[1:]  # The leading space before the first token following the BOS should be removed.
+            piece = piece[1:]  # drop the leading space of the first token after BOS
         m = self._BYTE_RE.fullmatch(piece)
-        if m:  # Byte-fallback token, in the form of <0x0A>
+        if m:  # byte-fallback token, e.g. <0x0A>
             piece = bytes([int(m.group(1), 16)])
         return piece

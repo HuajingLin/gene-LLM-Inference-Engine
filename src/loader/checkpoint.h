@@ -16,16 +16,12 @@
 #include <string>
 #include <vector>
 
+#include "common/rope_style.h"
 #include "loader/mapped_file.h"
 
 namespace geneinfer {
 
 class SafetensorsFile;
-
-// How RoPE pairs up the elements of a head:
-//   Interleaved: (x[0], x[1]), (x[2], x[3]), ...        llama2.c
-//   HalfSplit:   (x[i], x[i + head_dim/2])              Hugging Face Llama ("rotate_half")
-enum class RopeStyle { Interleaved, HalfSplit };
 
 struct Config {
     int dim = 0;          // hidden size (d_model)

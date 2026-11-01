@@ -81,21 +81,27 @@ void add(float* a, const float* b, int n) {
     }
 }
 
-void rope(float* v, int n, int pos, int head_size) {
+void rope(float* v, int n, int pos, int head_size, float theta, RopeStyle style) {
     assert(head_size > 0 && head_size % 2 == 0 && n % head_size == 0);
-    for (int i = 0; i < n; i += 2) {
-        const int head_dim = i % head_size;  // position inside the current head
-        // Angles are computed in double precision: for large `pos` a float angle
-        // would lose several digits. (A precomputed cos/sin table will replace
-        // this later; the pow/cos/sin calls per element are deliberately simple.)
-        const double freq = 1.0 / std::pow(10000.0, static_cast<double>(head_dim) / head_size);
-        const double angle = static_cast<double>(pos) * freq;
-        const float c = static_cast<float>(std::cos(angle));
-        const float s = static_cast<float>(std::sin(angle));
-        const float v0 = v[i];
-        const float v1 = v[i + 1];
-        v[i] = v0 * c - v1 * s;
-        v[i + 1] = v0 * s + v1 * c;
+    const int half = head_size / 2;
+    for (int base = 0; base < n; base += head_size) {
+        for (int k = 0; k < half; ++k) {
+            // Angles are computed in double precision: for large `pos` a float angle
+            // would lose several digits. (A precomputed cos/sin table will replace
+            // this later; the pow/cos/sin calls per element are deliberately simple.)
+            const double freq = 1.0 / std::pow(static_cast<double>(theta),
+                                               2.0 * static_cast<double>(k) / head_size);
+            const double angle = static_cast<double>(pos) * freq;
+            const float c = static_cast<float>(std::cos(angle));
+            const float s = static_cast<float>(std::sin(angle));
+
+            float* a = (style == RopeStyle::Interleaved) ? v + base + 2 * k : v + base + k;
+            float* b = (style == RopeStyle::Interleaved) ? a + 1 : v + base + k + half;
+            const float a0 = *a;
+            const float b0 = *b;
+            *a = a0 * c - b0 * s;
+            *b = a0 * s + b0 * c;
+        }
     }
 }
 

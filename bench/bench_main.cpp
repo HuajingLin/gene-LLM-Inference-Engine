@@ -6,6 +6,7 @@
 //   --prompt-tokens N   positions processed as "prompt" (default 32)
 //   --decode-tokens N   positions processed one by one with sampling (default 128)
 //   --runs N            measured runs (default 5)
+//   --max-seq-len N     cap the context length / KV cache (default: the model's)
 //   --warmup N          unmeasured runs first, to fault in the memory-mapped weights (default 1)
 //   --label TEXT        free-text tag stored in the report (e.g. "scalar baseline")
 //   --json FILE         also write the report as JSON
@@ -45,7 +46,7 @@ namespace {
     std::fprintf(stderr, "error: %s\n", msg.c_str());
     std::fprintf(stderr,
                  "usage: gi_bench --model M [--prompt-tokens N] [--decode-tokens N] [--runs N]\n"
-                 "                [--warmup N] [--label TEXT] [--json FILE]\n");
+                 "                [--warmup N] [--max-seq-len N] [--label TEXT] [--json FILE]\n");
     std::exit(2);
 }
 
@@ -91,7 +92,7 @@ std::string compiler_string() {
 
 int main(int argc, char** argv) {
     std::string model_path, label, json_path;
-    int prompt_tokens = 32, decode_tokens = 128, runs = 5, warmup = 1;
+    int prompt_tokens = 32, decode_tokens = 128, runs = 5, warmup = 1, max_seq_len = 0;
 
     for (int i = 1; i < argc; ++i) {
         const std::string flag = argv[i];
@@ -104,6 +105,7 @@ int main(int argc, char** argv) {
         else if (flag == "--decode-tokens") decode_tokens = static_cast<int>(parse_int(flag, value()));
         else if (flag == "--runs") runs = static_cast<int>(parse_int(flag, value()));
         else if (flag == "--warmup") warmup = static_cast<int>(parse_int(flag, value()));
+        else if (flag == "--max-seq-len") max_seq_len = static_cast<int>(parse_int(flag, value()));
         else if (flag == "--label") label = value();
         else if (flag == "--json") json_path = value();
         else usage_error("unknown option " + flag);
@@ -119,7 +121,7 @@ int main(int argc, char** argv) {
         const Config& cfg = ck.config();
         const std::size_t rss_after_load = current_rss_bytes();
 
-        Transformer model(ck);
+        Transformer model(ck, max_seq_len);
         SamplerConfig greedy;
         greedy.temperature = 0.0f;
         Sampler sampler(greedy, cfg.vocab_size);

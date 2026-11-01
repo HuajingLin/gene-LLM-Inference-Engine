@@ -5,6 +5,7 @@
 // Options:
 //   --prompt TEXT        text to continue (default: empty, i.e. start from BOS)
 //   --steps N            maximum number of positions including the prompt (default: model context)
+//   --max-seq-len N      cap the context length, i.e. the KV cache memory (default: the model's)
 //   --temperature F      0 = greedy (default 0.8)
 //   --top-k N            keep only the N most likely tokens (default 0 = off)
 //   --top-p F            nucleus sampling threshold in (0, 1] (default 0.9; 1 = off)
@@ -35,7 +36,7 @@ namespace {
 [[noreturn]] void usage_error(const std::string& msg) {
     std::fprintf(stderr, "error: %s\n", msg.c_str());
     std::fprintf(stderr,
-                 "usage: gi_generate --model M --tokenizer T [--prompt TEXT] [--steps N]\n"
+                 "usage: gi_generate --model M --tokenizer T [--prompt TEXT] [--steps N] [--max-seq-len N]\n"
                  "                   [--temperature F] [--top-k N] [--top-p F] [--seed N]\n"
                  "                   [--no-echo] [--quiet] [--dump-tokens FILE]\n");
     std::exit(2);
@@ -66,7 +67,7 @@ std::uint64_t parse_seed(const std::string& v) {
 
 int main(int argc, char** argv) {
     std::string model_path, tokenizer_path, prompt, dump_path;
-    int steps = 0;
+    int steps = 0, max_seq_len = 0;
     bool echo = true, quiet = false, seed_given = false;
     SamplerConfig scfg;
     scfg.temperature = 0.8f;
@@ -82,6 +83,7 @@ int main(int argc, char** argv) {
         else if (flag == "--tokenizer") tokenizer_path = value();
         else if (flag == "--prompt") prompt = value();
         else if (flag == "--steps") steps = static_cast<int>(parse_int(flag, value()));
+        else if (flag == "--max-seq-len") max_seq_len = static_cast<int>(parse_int(flag, value()));
         else if (flag == "--temperature") scfg.temperature = static_cast<float>(parse_double(flag, value()));
         else if (flag == "--top-k") scfg.top_k = static_cast<int>(parse_int(flag, value()));
         else if (flag == "--top-p") scfg.top_p = static_cast<float>(parse_double(flag, value()));
@@ -100,7 +102,7 @@ int main(int argc, char** argv) {
     try {
         const Checkpoint ck = Checkpoint::load(model_path);
         const Tokenizer tok = Tokenizer::load(tokenizer_path, ck.config().vocab_size);
-        Transformer model(ck);
+        Transformer model(ck, max_seq_len);
         Sampler sampler(scfg, ck.config().vocab_size);
 
         const std::vector<int> ids = tok.encode(prompt, /*bos=*/true, /*eos=*/false);

@@ -123,3 +123,32 @@ def llama_tensor_layout(cfg: dict) -> list[tuple[str, tuple[int, ...]]]:
     if not d["shared_classifier"]:
         layout.append(("lm_head.weight", (V, D)))
     return layout
+
+
+# --------------------------------------------------------------------------- as a reference model
+# Role names of the weights structure -> Hugging Face tensor name (per layer).
+HF_ROLE = {"rms_att": "input_layernorm", "wq": "self_attn.q_proj", "wk": "self_attn.k_proj",
+           "wv": "self_attn.v_proj", "wo": "self_attn.o_proj", "rms_ffn": "post_attention_layernorm",
+           "w1": "mlp.gate_proj", "w2": "mlp.down_proj", "w3": "mlp.up_proj"}
+
+
+def read_hf_model(directory: str | Path):
+    """Loads a Llama model directory as a llama2c_io.Checkpoint-like object (config + stacked float32
+    tensors with the same names as the llama2.c layout), so tools/ref.py can run it."""
+    from llama2c_io import Checkpoint, Config   # local import: llama2c_io does not depend on this module
+
+    directory = Path(directory)
+    cfg = read_hf_config(directory)
+    d = derived_config(cfg)
+    config = Config(dim=d["dim"], hidden_dim=d["hidden_dim"], n_layers=d["n_layers"], n_heads=d["n_heads"],
+                    n_kv_heads=d["n_kv_heads"], vocab_size=d["vocab_size"], seq_len=d["seq_len"],
+                    shared_classifier=d["shared_classifier"], head_dim=d["head_dim"],
+                    rope_theta=float(d["rope_theta"]), rms_norm_eps=float(d["rms_norm_eps"]),
+                    rope_style="half_split")
+    st = read_safetensors(directory / "model.safetensors")
+    f32 = lambda name: st[name].as_float32()    # noqa: E731
+    tensors = {"token_embedding": f32("model.embed_tokens.weight"), "rms_final": f32("model.norm.weight")}
+    for role, hf_name in HF_ROLE.items():
+        tensors[role] = np.stack([f32(f"model.layers.{l}.{hf_name}.weight") for l in range(d["n_layers"])])
+    tensors["wcls"] = tensors["token_embedding"] if d["shared_classifier"] else f32("lm_head.weight")
+    return Checkpoint(config, tensors, {}, (directory / "model.safetensors").stat().st_size)

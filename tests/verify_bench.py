@@ -89,7 +89,8 @@ def main() -> int:
 
         # ---- 2. memory formulas ------------------------------------------------------------
         kv = c.n_layers * ctx * c.kv_dim * 2 * 4
-        scratch = (4 * c.dim + 2 * c.hidden_dim + c.n_heads * ctx + c.vocab_size) * 4
+        # x, xb, xb2 | q and the attention output | FFN gate and up | attention scores | logits
+        scratch = (3 * c.dim + 2 * c.attn_dim + 2 * c.hidden_dim + c.n_heads * ctx + c.vocab_size) * 4
         weights = 0
         for name, shape in tensor_layout(c):
             if name.startswith("freq_cis"):

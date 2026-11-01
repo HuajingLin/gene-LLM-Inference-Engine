@@ -23,8 +23,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from llama2c_io import Tokenizer, read_checkpoint  # noqa: E402
 
 
-def rmsnorm(x: np.ndarray, weight: np.ndarray) -> np.ndarray:
-    ss = np.float32(np.mean(x * x) + np.float32(1e-5))
+def rmsnorm(x: np.ndarray, weight: np.ndarray, eps: float = 1e-5) -> np.ndarray:
+    ss = np.float32(np.mean(x * x) + np.float32(eps))
     return weight * (x * (np.float32(1.0) / np.sqrt(ss)))
 
 
@@ -33,29 +33,44 @@ def softmax(x: np.ndarray) -> np.ndarray:
     return e / e.sum()
 
 
-def rope_freqs(head_size: int) -> np.ndarray:
-    """Rotation frequency of each adjacent dimension pair (2i, 2i+1): 1 / 10000^(2i/head_size)."""
-    return 1.0 / (10000.0 ** (np.arange(0, head_size, 2, dtype=np.float64) / head_size))
+def rope_freqs(head_size: int, theta: float = 10000.0) -> np.ndarray:
+    """Rotation frequency of each 2-D vector k of a head: 1 / theta^(2k/head_size)."""
+    return 1.0 / (float(theta) ** (np.arange(0, head_size, 2, dtype=np.float64) / head_size))
 
 
-def apply_rope(v: np.ndarray, pos: int, head_size: int) -> np.ndarray:
-    """llama2.c pairing: adjacent dimensions (0,1),(2,3)...; frequencies restart in every head."""
-    freqs = np.tile(rope_freqs(head_size), v.shape[0] // head_size)
-    angle = pos * freqs
+def apply_rope(v: np.ndarray, pos: int, head_size: int, theta: float = 10000.0,
+               style: str = "interleaved") -> np.ndarray:
+    """Rotary position embedding of every head of `v`; the frequencies restart in every head.
+
+    style "interleaved" (llama2.c):   vector k = (x[2k], x[2k+1])
+    style "half_split" (Hugging Face): vector k = (x[k], x[k + head_size/2])   ("rotate_half")
+    """
+    angle = pos * rope_freqs(head_size, theta)
     cos, sin = np.cos(angle).astype(np.float32), np.sin(angle).astype(np.float32)
-    pairs = v.reshape(-1, 2)
-    out = np.empty_like(pairs)
-    out[:, 0] = pairs[:, 0] * cos - pairs[:, 1] * sin
-    out[:, 1] = pairs[:, 0] * sin + pairs[:, 1] * cos
+    heads = np.asarray(v, dtype=np.float32).reshape(-1, head_size)
+    out = np.empty_like(heads)
+    if style == "interleaved":
+        a, b = heads[:, 0::2], heads[:, 1::2]
+        out[:, 0::2] = a * cos - b * sin
+        out[:, 1::2] = a * sin + b * cos
+    elif style == "half_split":
+        half = head_size // 2
+        a, b = heads[:, :half], heads[:, half:]
+        out[:, :half] = a * cos - b * sin
+        out[:, half:] = a * sin + b * cos
+    else:
+        raise ValueError(f"unknown RoPE style {style!r}")
     return out.reshape(-1)
 
 
 class Model:
-    def __init__(self, ckpt):
+    def __init__(self, ckpt, max_len: int | None = None):
+        """`max_len` caps the KV cache (models with a long context would otherwise allocate a lot)."""
         self.cfg = ckpt.config
         self.w = ckpt.tensors
         c = self.cfg
-        self.key_cache = np.zeros((c.n_layers, c.seq_len, c.kv_dim), dtype=np.float32)
+        n_positions = min(c.seq_len, max_len) if max_len else c.seq_len
+        self.key_cache = np.zeros((c.n_layers, n_positions, c.kv_dim), dtype=np.float32)
         self.value_cache = np.zeros_like(self.key_cache)
 
     def check_rope_tables(self) -> float:
@@ -74,23 +89,24 @@ class Model:
         """
         c, w = self.cfg, self.w
         hs = c.head_size
+        eps, theta, style = c.rms_norm_eps, c.rope_theta, c.rope_style
         x = np.array(w["token_embedding"][token], dtype=np.float32)  # copy, so the weights are never modified
         if trace is not None:
             trace["embedding"] = x.copy()
 
         for l in range(c.n_layers):
             # ---- attention ----
-            xb = rmsnorm(x, w["rms_att"][l])
+            xb = rmsnorm(x, w["rms_att"][l], eps)
             q = w["wq"][l] @ xb
             k = w["wk"][l] @ xb
             v = w["wv"][l] @ xb
-            q = apply_rope(q, pos, hs)
-            k = apply_rope(k, pos, hs)
+            q = apply_rope(q, pos, hs, theta, style)
+            k = apply_rope(k, pos, hs, theta, style)
 
             self.key_cache[l, pos] = k
             self.value_cache[l, pos] = v
 
-            attn_out = np.empty(c.dim, dtype=np.float32)
+            attn_out = np.empty(c.attn_dim, dtype=np.float32)
             for h in range(c.n_heads):
                 kvh = h // c.kv_mul  # GQA: several query heads share one KV head
                 qh = q[h * hs:(h + 1) * hs]
@@ -103,7 +119,7 @@ class Model:
                 trace[f"layer{l:02d}_attn_out"] = x.copy()
 
             # ---- FFN (SwiGLU) ----
-            xb = rmsnorm(x, w["rms_ffn"][l])
+            xb = rmsnorm(x, w["rms_ffn"][l], eps)
             gate = w["w1"][l] @ xb
             up = w["w3"][l] @ xb
             gate = gate * (np.float32(1.0) / (np.float32(1.0) + np.exp(-gate)))  # SiLU
@@ -111,7 +127,7 @@ class Model:
             if trace is not None:
                 trace[f"layer{l:02d}_ffn_out"] = x.copy()
 
-        x = rmsnorm(x, w["rms_final"])
+        x = rmsnorm(x, w["rms_final"], eps)
         if trace is not None:
             trace["final_norm"] = x.copy()
         return (w["wcls"] @ x).astype(np.float32)

@@ -12,6 +12,8 @@
 //   - no function allocates memory or throws; sizes are the caller's responsibility
 #pragma once
 
+#include "common/rope_style.h"
+
 namespace geneinfer {
 namespace kernels {
 
@@ -42,12 +44,15 @@ void mul(float* a, const float* b, int n);
 // a[i] += b[i]   (residual connections)
 void add(float* a, const float* b, int n);
 
-// Rotary position embedding (RoPE), in place, using llama2.c's pairing:
-// adjacent elements (v[2i], v[2i+1]) form a 2-D vector that is rotated by
-// pos * freq_i, where freq_i = 10000^(-2i / head_size) and i restarts at 0 for
-// every head. `n` is the full vector length (dim for q, kv_dim for k) and must be
-// a multiple of head_size; head_size must be even.
-void rope(float* v, int n, int pos, int head_size);
+// Rotary position embedding (RoPE), in place. Every head (head_size consecutive floats) is
+// treated as head_size/2 two-dimensional vectors; vector k is rotated by the angle
+// pos * theta^(-2k / head_size). `style` decides which two elements form a vector:
+//   Interleaved: (v[2k], v[2k+1])            llama2.c
+//   HalfSplit:   (v[k], v[k + head_size/2])  Hugging Face Llama
+// `n` is the full vector length (attn_dim for q, kv_dim for k) and must be a multiple of
+// head_size; head_size must be even.
+void rope(float* v, int n, int pos, int head_size, float theta = 10000.0f,
+          RopeStyle style = RopeStyle::Interleaved);
 
 }  // namespace kernels
 }  // namespace geneinfer

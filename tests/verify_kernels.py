@@ -134,13 +134,50 @@ def main() -> int:
         v = rng.standard_normal(n).astype(np.float32)
         record("rope", f"n={n} head={hs} pos={pos}",
                err(run(exe, ["rope", n, pos, hs], v), apply_rope(v.copy(), pos, hs)))
+    # theta and pairing style: llama2.c uses (10000, interleaved), Hugging Face Llama (any theta, half_split)
+    for style in ("interleaved", "half_split"):
+        for theta in (10000.0, 100000.0, 500000.0, 1000000.0):
+            for n, hs, pos in ((2, 2, 3), (8, 4, 0), (8, 4, 5), (64, 8, 17), (192, 64, 1), (576, 64, 100),
+                               (576, 64, 8191), (128, 128, 2047), (96, 48, 31999)):
+                v = rng.standard_normal(n).astype(np.float32)
+                record("rope", f"{style} theta={theta:g} n={n} head={hs} pos={pos}",
+                       err(run(exe, ["rope", n, pos, hs, repr(theta), style], v),
+                           apply_rope(v.copy(), pos, hs, theta, style)))
+    # The half_split style written exactly the way Hugging Face's Llama code states it (cos/sin duplicated
+    # over both halves, q * cos + rotate_half(q) * sin), in float64: an independent formulation of the
+    # semantics, not a copy of the implementation under test.
+    def hf_style_rope(x, pos, head_dim, theta):
+        heads = x.astype(np.float64).reshape(-1, head_dim)
+        inv_freq = 1.0 / (theta ** (np.arange(0, head_dim, 2, dtype=np.float64) / head_dim))
+        emb = np.concatenate([pos * inv_freq, pos * inv_freq])           # [head_dim]
+        cos, sin = np.cos(emb), np.sin(emb)
+        rotate_half = np.concatenate([-heads[:, head_dim // 2:], heads[:, :head_dim // 2]], axis=-1)
+        return (heads * cos + rotate_half * sin).reshape(-1)
+
+    for theta in (10000.0, 100000.0):
+        for n, hs, pos in ((16, 16, 1), (192, 64, 9), (576, 64, 100), (128, 32, 3)):
+            v = rng.standard_normal(n).astype(np.float32)
+            record("rope", f"HF formulation theta={theta:g} n={n} head={hs} pos={pos}",
+                   err(run(exe, ["rope", n, pos, hs, repr(theta), "half_split"], v),
+                       hf_style_rope(v, pos, hs, theta)))
+
+    v = rng.standard_normal(48).astype(np.float32)  # the two styles must really differ
+    a = run(exe, ["rope", 48, 7, 48, "10000", "interleaved"], v)
+    b = run(exe, ["rope", 48, 7, 48, "10000", "half_split"], v)
+    if np.allclose(a, b, atol=1e-3):
+        failures.append("interleaved and half_split RoPE gave the same result")
+    v = rng.standard_normal(64).astype(np.float32)  # half_split also preserves the length of each pair
+    out = run(exe, ["rope", 64, 33, 32, "100000", "half_split"], v)
+    pairs = lambda x: np.sqrt(x[:, :16].astype(np.float64) ** 2 + x[:, 16:].astype(np.float64) ** 2)
+    record("rope", "half_split preserves norm", err(pairs(out.reshape(-1, 32)), pairs(v.reshape(-1, 32))))
     v = rng.standard_normal(48).astype(np.float32)  # rotation preserves each pair's length
     out = run(exe, ["rope", 48, 123, 48], v)
     pair_norm = lambda a: np.sqrt(a[0::2].astype(np.float64) ** 2 + a[1::2].astype(np.float64) ** 2)
     record("rope", "preserves norm", err(pair_norm(out), pair_norm(v)))
 
     # ---- invalid arguments must be rejected, not crash ----------------------------------
-    for bad in (["rope", 10, 0, 4], ["rope", 8, 0, 3], ["softmax", 0], ["matvec", 0, 5]):
+    for bad in (["rope", 10, 0, 4], ["rope", 8, 0, 3], ["softmax", 0], ["matvec", 0, 5],
+                ["rope", 8, 0, 4, "abc"], ["rope", 8, 0, 4, "1"], ["rope", 8, 0, 4, "10000", "diagonal"]):
         p = subprocess.run([exe, *map(str, bad)], input=b"", capture_output=True)
         if p.returncode == 0:
             failures.append(f"invalid arguments {bad} were accepted")

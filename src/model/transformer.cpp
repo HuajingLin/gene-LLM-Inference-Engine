@@ -19,17 +19,6 @@ inline std::size_t sz(int v) { return static_cast<std::size_t>(v); }
 
 Transformer::Transformer(const Checkpoint& checkpoint, int max_seq_len)
     : cfg_(checkpoint.config()), w_(checkpoint.weights()) {
-    // The forward pass below implements llama2.c's conventions. Refuse models that need more
-    // instead of silently computing wrong results.
-    if (cfg_.attn_dim() != cfg_.dim) {
-        throw std::invalid_argument("Transformer: models with n_heads * head_dim != dim are not supported yet");
-    }
-    if (cfg_.rope_style != RopeStyle::Interleaved || cfg_.rope_theta != 10000.0f ||
-        cfg_.rms_norm_eps != 1e-5f) {
-        throw std::invalid_argument(
-            "Transformer: this model needs RoPE / RMSNorm settings (pairing style, theta, epsilon) "
-            "that are not implemented yet");
-    }
     if (max_seq_len < 0 || max_seq_len > cfg_.seq_len) {
         throw std::invalid_argument("max_seq_len must be in [0, " + std::to_string(cfg_.seq_len) +
                                     "], got " + std::to_string(max_seq_len));
@@ -41,7 +30,8 @@ Transformer::Transformer(const Checkpoint& checkpoint, int max_seq_len)
     xb2_.resize(sz(cfg_.dim));
     hb_.resize(sz(cfg_.hidden_dim));
     hb2_.resize(sz(cfg_.hidden_dim));
-    q_.resize(sz(cfg_.dim));
+    q_.resize(sz(cfg_.attn_dim()));
+    ao_.resize(sz(cfg_.attn_dim()));
     att_.resize(sz(cfg_.n_heads) * sz(ctx_len_));
     logits_.resize(sz(cfg_.vocab_size));
 
@@ -56,7 +46,7 @@ std::size_t Transformer::kv_cache_bytes() const {
 
 std::size_t Transformer::scratch_bytes() const {
     return (x_.size() + xb_.size() + xb2_.size() + hb_.size() + hb2_.size() + q_.size() +
-            att_.size() + logits_.size()) * sizeof(float);
+            ao_.size() + att_.size() + logits_.size()) * sizeof(float);
 }
 
 const float* Transformer::forward(int token, int pos, bool compute_logits) {
@@ -70,10 +60,12 @@ const float* Transformer::forward(int token, int pos, bool compute_logits) {
 
     const int dim = cfg_.dim;
     const int hidden = cfg_.hidden_dim;
+    const int attn_dim = cfg_.attn_dim();  // n_heads * head_dim (== dim for llama2.c models)
     const int kv_dim = cfg_.kv_dim();
     const int kv_mul = cfg_.kv_mul();
     const int head_size = cfg_.head_size();
     const float inv_scale = 1.0f / std::sqrt(static_cast<float>(head_size));
+    const float eps = cfg_.rms_norm_eps;
 
     float* x = x_.data();
     float* xb = xb_.data();
@@ -81,6 +73,7 @@ const float* Transformer::forward(int token, int pos, bool compute_logits) {
     float* hb = hb_.data();
     float* hb2 = hb2_.data();
     float* q = q_.data();
+    float* ao = ao_.data();
 
     // 1. Token embedding: copy one row of the embedding table into the residual stream.
     std::memcpy(x, w_.token_embedding + sz(token) * sz(dim), sz(dim) * sizeof(float));
@@ -95,18 +88,18 @@ const float* Transformer::forward(int token, int pos, bool compute_logits) {
         float* layer_values = value_cache_.data() + layer * sz(ctx_len_) * sz(kv_dim);
 
         // ---------------- attention block ----------------
-        kernels::rmsnorm(xb, x, lw.rms_att, dim);
+        kernels::rmsnorm(xb, x, lw.rms_att, dim, eps);
 
         // K and V of the current position are written directly into the cache.
         float* k = layer_keys + sz(pos) * sz(kv_dim);
         float* v = layer_values + sz(pos) * sz(kv_dim);
-        kernels::matvec(q, lw.wq, xb, dim, dim);
+        kernels::matvec(q, lw.wq, xb, attn_dim, dim);
         kernels::matvec(k, lw.wk, xb, kv_dim, dim);
         kernels::matvec(v, lw.wv, xb, kv_dim, dim);
 
         // Rotary position embedding on q and k (v is not rotated).
-        kernels::rope(q, dim, pos, head_size);
-        kernels::rope(k, kv_dim, pos, head_size);
+        kernels::rope(q, attn_dim, pos, head_size, cfg_.rope_theta, cfg_.rope_style);
+        kernels::rope(k, kv_dim, pos, head_size, cfg_.rope_theta, cfg_.rope_style);
 
         // Each query head attends over all positions 0..pos of its (shared) KV head.
         for (int h = 0; h < cfg_.n_heads; ++h) {
@@ -120,8 +113,8 @@ const float* Transformer::forward(int token, int pos, bool compute_logits) {
             }
             kernels::softmax(scores, pos + 1);
 
-            // Weighted sum of the value vectors; the head's output goes into xb.
-            float* out = xb + sz(h) * sz(head_size);
+            // Weighted sum of the value vectors; the head's output goes into ao.
+            float* out = ao + sz(h) * sz(head_size);
             std::fill(out, out + head_size, 0.0f);
             for (int t = 0; t <= pos; ++t) {
                 const float* vt = layer_values + sz(t) * sz(kv_dim) + sz(kv_head) * sz(head_size);
@@ -130,12 +123,12 @@ const float* Transformer::forward(int token, int pos, bool compute_logits) {
         }
 
         // Output projection, then add to the residual stream.
-        kernels::matvec(xb2, lw.wo, xb, dim, dim);
+        kernels::matvec(xb2, lw.wo, ao, dim, attn_dim);
         kernels::add(x, xb2, dim);
         if (trace_) trace_("attn_out", l, x, dim);
 
         // ---------------- feed-forward block (SwiGLU) ----------------
-        kernels::rmsnorm(xb, x, lw.rms_ffn, dim);
+        kernels::rmsnorm(xb, x, lw.rms_ffn, dim, eps);
         kernels::matvec(hb, lw.w1, xb, hidden, dim);   // gate
         kernels::matvec(hb2, lw.w3, xb, hidden, dim);  // up
         kernels::silu(hb, hidden);
@@ -147,7 +140,7 @@ const float* Transformer::forward(int token, int pos, bool compute_logits) {
 
     // 3. Final norm and classifier (for shared weights, wcls is the embedding table).
     if (!compute_logits) return nullptr;
-    kernels::rmsnorm(x, x, w_.rms_final, dim);
+    kernels::rmsnorm(x, x, w_.rms_final, dim, eps);
     if (trace_) trace_("final_norm", -1, x, dim);
     kernels::matvec(logits_.data(), w_.wcls, x, cfg_.vocab_size, dim);
 

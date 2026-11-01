@@ -1,6 +1,9 @@
 // forward_main.cpp - feeds a token sequence through the model and dumps the results.
 //
-//   gi_forward <model.bin> <out_dir> <token_id> [<token_id> ...]
+//   gi_forward <model> <out_dir> [--max-seq-len N] <token_id> [<token_id> ...]
+//
+// <model> is a llama2.c file or a Hugging Face model directory. --max-seq-len caps the context
+// (and with it the KV cache memory); it must be at least the number of tokens.
 //
 // Token i is processed at position i. Files written to <out_dir> (raw float32):
 //   logits.f32                 [num_tokens, vocab]  logits after every position
@@ -35,7 +38,7 @@ void write_floats(const fs::path& path, const float* data, std::size_t count) {
 
 int main(int argc, char** argv) {
     if (argc < 4) {
-        std::fprintf(stderr, "usage: %s <model.bin> <out_dir> <token_id> [<token_id> ...]\n", argv[0]);
+        std::fprintf(stderr, "usage: %s <model> <out_dir> [--max-seq-len N] <token_id> [<token_id> ...]\n", argv[0]);
         return 2;
     }
 
@@ -45,15 +48,24 @@ int main(int argc, char** argv) {
         fs::create_directories(out_dir);
 
         std::vector<int> tokens;
-        for (int i = 3; i < argc; ++i) tokens.push_back(std::atoi(argv[i]));
-        const int n = static_cast<int>(tokens.size());
-        if (n > ck.config().seq_len) {
-            throw std::runtime_error("sequence of " + std::to_string(n) +
-                                     " tokens exceeds the model context length " +
-                                     std::to_string(ck.config().seq_len));
+        int max_seq_len = 0;
+        for (int i = 3; i < argc; ++i) {
+            if (std::string(argv[i]) == "--max-seq-len") {
+                if (i + 1 >= argc) throw std::runtime_error("--max-seq-len needs a value");
+                max_seq_len = std::atoi(argv[++i]);
+            } else {
+                tokens.push_back(std::atoi(argv[i]));
+            }
         }
+        const int n = static_cast<int>(tokens.size());
+        if (n == 0) throw std::runtime_error("no token ids given");
 
-        Transformer model(ck);
+        Transformer model(ck, max_seq_len);
+        if (n > model.max_seq_len()) {
+            throw std::runtime_error("sequence of " + std::to_string(n) +
+                                     " tokens exceeds the context length " +
+                                     std::to_string(model.max_seq_len()));
+        }
 
         bool capture = false;  // only the last position is traced
         model.set_trace([&](const char* tag, int layer, const float* data, int size) {

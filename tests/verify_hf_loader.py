@@ -16,7 +16,7 @@ with a clear error. With --model, a real model directory is checked.
 Usage:
   python tests/verify_hf_loader.py --exe build/gi_inspect                              # dummy models
   python tests/verify_hf_loader.py --exe build/gi_inspect --model models/SmolLM2-135M  # real model
-  (optionally: --forward-exe build/gi_forward to check that unsupported settings are refused)
+  (optionally: --forward-exe build/gi_forward to also check that a loaded model runs through gi_forward)
 """
 from __future__ import annotations
 
@@ -248,10 +248,16 @@ def main() -> int:
         if run(args.exe, empty).returncode != 1:
             failures.append("an empty directory was not rejected")
 
-        if args.forward_exe:   # the forward pass must refuse HF settings it does not implement yet
-            p = run(args.forward_exe, good, tmp / "out", 1, 2)
-            if p.returncode != 1 or "not implemented" not in p.stderr:
-                failures.append(f"gi_forward did not refuse an unsupported model cleanly: {p.stderr.strip()[:120]}")
+        if args.forward_exe:   # the forward pass must run a loaded Hugging Face model end to end
+            out = tmp / "fwd_out"
+            p = run(args.forward_exe, good, out, "--max-seq-len", 4, 1, 2)
+            vocab = json.loads((good / "config.json").read_text())["vocab_size"]
+            logits = out / "logits.f32"
+            if p.returncode != 0 or not logits.exists() or logits.stat().st_size != 2 * vocab * 4:
+                failures.append(f"gi_forward could not run a Hugging Face model: {p.stderr.strip()[:120]}")
+            p = run(args.forward_exe, good, out, "--max-seq-len", 2, 1, 2, 3)   # more tokens than the context
+            if p.returncode != 1 or "exceeds the context" not in p.stderr:
+                failures.append("gi_forward accepted a sequence longer than --max-seq-len")
 
     if failures:
         print("FAIL")

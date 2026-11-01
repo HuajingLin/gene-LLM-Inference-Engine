@@ -9,7 +9,8 @@
 //   gi_kernel_check axpy    <n> <alpha>            stdin: y[n], x[n]                  -> y + alpha*x
 //   gi_kernel_check mul     <n>                    stdin: a[n], b[n]                  -> a*b
 //   gi_kernel_check add     <n>                    stdin: a[n], b[n]                  -> a+b
-//   gi_kernel_check rope    <n> <pos> <head_size>  stdin: v[n]                        -> out[n]
+//   gi_kernel_check rope    <n> <pos> <head_size> [theta] [interleaved|half_split]
+//                                                  stdin: v[n]                        -> out[n]
 //
 // All data is raw little-endian float32.
 #include <cstdio>
@@ -56,7 +57,8 @@ int usage() {
     std::fprintf(stderr,
                  "usage: gi_kernel_check <op> <args...>\n"
                  "  matvec <rows> <cols> | rmsnorm <n> | softmax <n> | silu <n>\n"
-                 "  dot <n> | axpy <n> <alpha> | mul <n> | add <n> | rope <n> <pos> <head_size>\n");
+                 "  dot <n> | axpy <n> <alpha> | mul <n> | add <n> |\n"
+                 "  rope <n> <pos> <head_size> [theta] [interleaved|half_split]\n");
     return 2;
 }
 
@@ -120,14 +122,26 @@ int main(int argc, char** argv) {
             if (op == "mul") k::mul(a.data(), b.data(), n);
             else k::add(a.data(), b.data(), n);
             write_floats(a);
-        } else if (op == "rope" && argc == 5) {
+        } else if (op == "rope" && argc >= 5 && argc <= 7) {
             const int n = arg_int(argv, 2, "n"), pos = arg_int(argv, 3, "pos");
             const int head_size = arg_int(argv, 4, "head_size");
+            float theta = 10000.0f;
+            geneinfer::RopeStyle style = geneinfer::RopeStyle::Interleaved;
+            if (argc >= 6) {
+                char* end = nullptr;
+                theta = std::strtof(argv[5], &end);
+                if (end == argv[5] || *end != '\0' || !(theta > 1.0f)) throw std::runtime_error("invalid theta");
+            }
+            if (argc == 7) {
+                const std::string s = argv[6];
+                if (s == "half_split") style = geneinfer::RopeStyle::HalfSplit;
+                else if (s != "interleaved") throw std::runtime_error("style must be interleaved or half_split");
+            }
             if (n <= 0 || pos < 0 || head_size <= 0 || head_size % 2 != 0 || n % head_size != 0) {
                 throw std::runtime_error("rope needs n > 0, pos >= 0, even head_size dividing n");
             }
             auto v = read_floats(static_cast<std::size_t>(n));
-            k::rope(v.data(), n, pos, head_size);
+            k::rope(v.data(), n, pos, head_size, theta, style);
             write_floats(v);
         } else {
             return usage();
