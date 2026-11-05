@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <stdexcept>
+#include <unordered_map>
 
 namespace geneinfer {
 
@@ -68,6 +69,7 @@ private:
     JsonValue parse_object(int depth) {
         ++pos_;  // '{'
         JsonValue obj = JsonValue::make_object();
+        std::unordered_map<std::string, std::size_t> index;  // key -> member position (duplicate detection)
         skip_ws();
         if (peek() == '}') { ++pos_; return obj; }
         for (;;) {
@@ -78,7 +80,14 @@ private:
             if (peek() != ':') fail("expected ':' after the key");
             ++pos_;
             skip_ws();
-            obj.set(key, parse_value(depth + 1));
+            JsonValue value = parse_value(depth + 1);
+            const auto seen = index.find(key);
+            if (seen != index.end()) {
+                obj.replace_member(seen->second, std::move(value));  // duplicate key: the last value wins
+            } else {
+                index.emplace(key, obj.member_count());
+                obj.add_member(std::move(key), std::move(value));
+            }
             skip_ws();
             if (peek() == ',') { ++pos_; continue; }
             if (peek() == '}') { ++pos_; return obj; }
@@ -339,6 +348,16 @@ void JsonValue::set(const std::string& key, JsonValue v) {
         if (kv.first == key) { kv.second = std::move(v); return; }
     }
     members_.emplace_back(key, std::move(v));
+}
+
+void JsonValue::add_member(std::string key, JsonValue v) {
+    if (type_ != Type::Object) type_error("an object");
+    members_.emplace_back(std::move(key), std::move(v));
+}
+
+void JsonValue::replace_member(std::size_t index, JsonValue v) {
+    if (type_ != Type::Object) type_error("an object");
+    members_.at(index).second = std::move(v);
 }
 
 JsonValue parse_json(const std::string& text) { return Parser(text).parse_document(); }

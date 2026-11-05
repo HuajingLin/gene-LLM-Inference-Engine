@@ -33,7 +33,9 @@ geneInfer/
 │   │
 │   ├── tokenizer/
 │   │   ├── tokenizer.h / .cpp      # M2: tokenizer
-│   │   └── kernel_check_main.cpp
+│   │   ├── hf_tokenizer.h / .cpp   # M9
+│   │   ├── unicode.h / .cpp        # M9
+│   │   └── text_tokenizer.h / .cpp # M10
 │   │
 │   ├── kernels/
 │   │   └── kernels.h / .cpp        # M3: operators
@@ -73,7 +75,15 @@ geneInfer/
 │   ├── json_check_main.cpp     # M7: gi_json_check
 │   ├── dtype_check_main.cpp    # M7: gi_dtype_check
 │   ├── hf_golden.py            # M8
-│   └── env_check.py            # M8
+│   ├── env_check.py            # M8
+│   ├── hf_tokenize_main.cpp    # M9: gi_hf_tokenize
+│   ├── unicode_check_main.cpp  # M9: gi_unicode_check
+│   ├── hf_tok_ref.py           # M9 standard answer
+│   ├── tok_corpus.py           # M9 Test corpus
+│   ├── make_dummy_hf_tokenizer.py  # M9 
+│   ├── hf_tokenizer_golden.py      # M9 HF Golden Data
+│   ├── gen_unicode_tables.py       # M9
+│   └── hf_tokenizer_probe.p        # M9
 │   
 ├── tests/
 │    ├── verify_loader.py       # M1: Verification: C++ Output vs. NumPy Element-wise Comparison
@@ -85,7 +95,10 @@ geneInfer/
 │    ├── verify_bench.py        # M6
 │    ├── verify_json.py         # M7
 │    ├── verify_dtype.py        # M7
-│    └── verify_hf_loader.py    # M7
+│    ├── verify_hf_loader.py    # M7
+│    ├── verify_hf_tokenizer.py # M9
+│    ├── verify_unicode.py      # M9
+│    └── verify_generate_hf.py  # M10
 │
 └── bench/
      └── bench_main.cpp         # M6: gi_bench

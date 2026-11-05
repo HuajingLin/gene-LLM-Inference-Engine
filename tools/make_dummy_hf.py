@@ -8,6 +8,7 @@ Examples:
   python tools/make_dummy_hf.py --out dummy_hf                       # float32, tied embeddings
   python tools/make_dummy_hf.py --out dummy_hf --dtype bf16 --untied
   python tools/make_dummy_hf.py --out dummy_hf --dim 48 --heads 4 --head-dim 16   # attn_dim != dim
+  python tools/make_dummy_hf.py --out dummy_hf --with-tokenizer 300               # + tokenizer.json (vocab follows it)
 """
 from __future__ import annotations
 
@@ -20,6 +21,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from hf_io import f32_to_bf16, llama_tensor_layout, write_safetensors  # noqa: E402
+from make_dummy_hf_tokenizer import build_tokenizer  # noqa: E402
 
 
 def make_config(args) -> dict:
@@ -32,7 +34,7 @@ def make_config(args) -> dict:
         "rms_norm_eps": args.eps, "rope_theta": args.rope_theta, "rope_scaling": None,
         "rope_interleaved": False, "tie_word_embeddings": not args.untied,
         "torch_dtype": {"f32": "float32", "bf16": "bfloat16", "f16": "float16"}[args.dtype],
-        "bos_token_id": 0, "eos_token_id": 0,
+        "bos_token_id": 0, "eos_token_id": args.eos_id[0] if len(args.eos_id) == 1 else list(args.eos_id),
     }
     if args.head_dim:
         cfg["head_dim"] = args.head_dim
@@ -58,12 +60,27 @@ def main() -> None:
     ap.add_argument("--kv-heads", type=int, default=2)
     ap.add_argument("--head-dim", type=int, default=0, help="0 = dim / heads")
     ap.add_argument("--vocab", type=int, default=100)
+    ap.add_argument("--with-tokenizer", type=int, default=0, metavar="MERGES",
+                    help="also write a tokenizer with this many merges; the model vocabulary becomes its size (+ --vocab-pad)")
+    ap.add_argument("--tokenizer-variant", choices=["sequence", "bytelevel", "noregex"], default="sequence")
+    ap.add_argument("--vocab-pad", type=int, default=0, help="extra model vocabulary entries beyond the tokenizer's")
+    ap.add_argument("--pad-sinks", action="store_true",
+                    help="untied only, needs --vocab-pad >= 2: the last two vocabulary ids get lm_head rows of +5 and -5, "
+                         "so greedy decoding keeps sampling ids the tokenizer does not know")
+    ap.add_argument("--eos-id", type=lambda t: [int(x) for x in t.split(",")], default=[0],
+                    help="eos_token_id for config.json; a comma list writes the list form")
     ap.add_argument("--max-pos", type=int, default=64)
     ap.add_argument("--rope-theta", type=float, default=100000.0)
     ap.add_argument("--eps", type=float, default=1e-5)
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
 
+    out = Path(args.out)
+    out.mkdir(parents=True, exist_ok=True)
+    if args.with_tokenizer:
+        args.vocab = build_tokenizer(out, args.with_tokenizer, args.tokenizer_variant) + args.vocab_pad
+    if args.pad_sinks and not (args.untied and args.vocab_pad >= 2 and args.with_tokenizer):
+        ap.error("--pad-sinks needs --untied, --with-tokenizer and --vocab-pad >= 2")
     cfg = make_config(args)
     rng = np.random.default_rng(args.seed)
     tensors = []
@@ -73,6 +90,8 @@ def main() -> None:
         else:
             arr = 0.2 * rng.standard_normal(shape)
         arr = arr.astype(np.float32)
+        if args.pad_sinks and name == "lm_head.weight":
+            arr[-2], arr[-1] = 5.0, -5.0
         if args.dtype == "f32":
             dtype_name, raw = "F32", arr.astype("<f4").tobytes()
         elif args.dtype == "bf16":
@@ -91,8 +110,6 @@ def main() -> None:
     rng.shuffle(order)   # real files do not store tensors in layer order; neither do we
     tensors = [tensors[i] for i in order]
 
-    out = Path(args.out)
-    out.mkdir(parents=True, exist_ok=True)
     (out / "config.json").write_text(json.dumps(cfg, indent=2), encoding="utf-8")
     write_safetensors(out / "model.safetensors", tensors, metadata={"format": "pt"})
     total = sum(len(t[3]) for t in tensors)

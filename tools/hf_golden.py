@@ -55,17 +55,32 @@ def run_numpy(model_dir: str, ids: list[int], new_tokens: int):
     return seq, np.stack(all_logits), trace, {"backend": "numpy", "vocab_size": ckpt.config.vocab_size}
 
 
+def encode_prompt(model_dir: str, auto_tokenizer, prompt: str):
+    """Token ids of the prompt. The `tokenizers` library reading tokenizer.json is the reference: some
+    transformers versions (5.22.0 with SmolLM2) drop the Digits pre-tokenizer that tokenizer.json declares and
+    give other ids for texts with digits. Falls back to AutoTokenizer if `tokenizers` is not importable."""
+    try:
+        from tokenizers import Tokenizer
+        tk = Tokenizer.from_file(str(Path(model_dir) / "tokenizer.json"))
+        return list(tk.encode(prompt, add_special_tokens=False).ids), "tokenizers"
+    except ImportError:
+        return list(auto_tokenizer(prompt)["input_ids"]), "transformers"
+
+
 def run_torch(model_dir: str, ids: list[int] | None, prompt: str | None, new_tokens: int):
     import torch
     import transformers
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(model_dir)
-    model = AutoModelForCausalLM.from_pretrained(model_dir, dtype=torch.float32,
-                                                 attn_implementation="eager")
-    model.eval()
+    try:   # newer transformers call the argument `dtype`; older ones only know `torch_dtype`
+        model = AutoModelForCausalLM.from_pretrained(model_dir, dtype=torch.float32, attn_implementation="eager")
+    except (TypeError, ValueError):
+        model = AutoModelForCausalLM.from_pretrained(model_dir, torch_dtype=torch.float32, attn_implementation="eager")
+    model = model.float().eval()   # float32 whatever the library's default dtype is
+    prompt_ids_from = "given"
     if ids is None:
-        ids = list(tokenizer(prompt)["input_ids"])
+        ids, prompt_ids_from = encode_prompt(model_dir, tokenizer, prompt)
     seq = list(ids)
 
     with torch.no_grad():
@@ -94,7 +109,8 @@ def run_torch(model_dir: str, ids: list[int] | None, prompt: str | None, new_tok
     trace = {k: v.float().numpy() for k, v in captured.items()}
     info = {"backend": "torch", "torch": torch.__version__, "transformers": transformers.__version__,
             "vocab_size": int(logits.shape[-1]), "text": tokenizer.decode(seq),
-            "generated_text": tokenizer.decode(seq[len(ids):]), "prompt_text": prompt}
+            "generated_text": tokenizer.decode(seq[len(ids):]), "prompt_text": prompt,
+            "prompt_ids_from": prompt_ids_from}
     return seq, logits.float().numpy(), trace, info, len(ids)
 
 

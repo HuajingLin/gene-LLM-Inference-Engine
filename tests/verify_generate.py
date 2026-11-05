@@ -11,7 +11,10 @@ Checks (using the prompt/steps/tokens/text stored in the golden file from tools/
       number and a NumPy oracle does the temperature/top-p draw; it must pick the same token
   4. --no-echo prints only the generated part; --quiet silences the statistics line
   5. --steps limits the number of positions
-  6. error handling: bad files/options, negative temperature, prompt longer than the context
+  6. error handling: bad files/options, negative temperature, prompt longer than the context,
+     --bos (a Hugging Face option) rejected for llama2.c models
+  7. stop behavior on small random models (searched until one samples BOS or EOS): generation must end right
+     after that token, which is the last entry of the generated ids and prints nothing; NumPy re-derives it
 
 Usage:
   python tests/verify_generate.py --exe build/gi_generate \
@@ -31,8 +34,9 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))                # verify_sampler
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))  # ref, llama2c_io
+from llama2c_io import Tokenizer as RefTokenizer  # noqa: E402
 from llama2c_io import read_checkpoint  # noqa: E402
-from ref import Model  # noqa: E402
+from ref import Model, generate_greedy  # noqa: E402
 from verify_sampler import oracle_sample, py_uniforms  # noqa: E402
 
 
@@ -157,6 +161,8 @@ def main() -> int:
         ("unknown option", rc_of(*base, "--bogus"), 2),
         ("missing --model", rc_of("--tokenizer", args.tokenizer), 2),
         ("non-numeric --steps", rc_of(*base, "--steps", "abc"), 2),
+        ("--bos with a llama2.c model", rc_of(*base, "--bos"), 2),
+        ("llama2.c model without --tokenizer", rc_of("--model", args.model), 2),
     ]
     for label, got, want in checks:
         if got != want:
@@ -164,6 +170,39 @@ def main() -> int:
     too_long = subprocess.run([args.exe, *base, "--prompt", "a " * 3000, "--quiet"], capture_output=True)
     if too_long.returncode != 1 or b"does not fit" not in too_long.stderr:
         failures.append("a prompt longer than the context was not rejected cleanly")
+
+    # ---- 7. BOS/EOS end a generation -----------------------------------------------------------------------------------
+    make_dummy = Path(__file__).resolve().parent.parent / "tools" / "make_dummy.py"
+    seen = {1: 0, 2: 0}
+    with tempfile.TemporaryDirectory() as tmp_s:
+        for seed in range(400):
+            if seen[1] >= 1 and seen[2] >= 1:
+                break
+            d = Path(tmp_s) / f"d{seed}"
+            subprocess.run([sys.executable, str(make_dummy), "--out", str(d), "--seed", str(seed), "--seq-len", "48"],
+                           check=True, capture_output=True)
+            ck = read_checkpoint(d / "model.bin")
+            ref_tok = RefTokenizer(d / "tokenizer.bin", ck.config.vocab_size)
+            _, gen_ref, text_ref, _ = generate_greedy(Model(ck), ref_tok, "ab", 48)
+            if not gen_ref or gen_ref[-1] not in (1, 2) or seen[gen_ref[-1]] >= 2:
+                continue
+            seen[gen_ref[-1]] += 1
+            p = subprocess.run([args.exe, "--model", str(d / "model.bin"), "--tokenizer", str(d / "tokenizer.bin"),
+                                "--prompt", "ab", "--steps", "48", "--temperature", "0", "--dump-tokens",
+                                str(d / "ids.txt")], capture_output=True)
+            lines = (d / "ids.txt").read_text().split("\n")
+            g = [int(x) for x in lines[1].split()]
+            label = f"dummy seed {seed} (ends with token {gen_ref[-1]})"
+            if p.returncode != 0 or g != gen_ref:
+                failures.append(f"{label}: generated ids {g} != reference {gen_ref}")
+            if b"ended by an end token" not in p.stderr:
+                failures.append(f"{label}: the statistics line does not mention the end token")
+            if p.stdout.decode("utf-8", errors="replace") != "ab" + text_ref:
+                failures.append(f"{label}: stdout is not the prompt + the text before the end token")
+    if not (seen[1] and seen[2]):
+        failures.append(f"scenario broken: no random model ended with both BOS and EOS (found {seen})")
+    else:
+        print(f"stop behavior: generation ended right after BOS in {seen[1]} and after EOS in {seen[2]} random model(s), as in the reference")
 
     if failures:
         print("FAIL")

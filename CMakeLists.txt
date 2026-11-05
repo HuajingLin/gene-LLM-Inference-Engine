@@ -19,6 +19,9 @@ add_library(geneinfer STATIC
   src/loader/safetensors.cpp
   src/util/json.cpp
   src/tokenizer/tokenizer.cpp
+  src/tokenizer/unicode.cpp
+  src/tokenizer/hf_tokenizer.cpp
+  src/tokenizer/text_tokenizer.cpp
   src/kernels/kernels.cpp
   src/model/transformer.cpp
   src/sampler/sampler.cpp
@@ -57,7 +60,13 @@ target_link_libraries(gi_json_check PRIVATE geneinfer)
 add_executable(gi_dtype_check tools/dtype_check_main.cpp)
 target_link_libraries(gi_dtype_check PRIVATE geneinfer)
 
-foreach(tgt geneinfer gi_inspect gi_tokenize gi_kernel_check gi_forward gi_generate gi_sampler_check gi_bench gi_json_check gi_dtype_check)
+add_executable(gi_hf_tokenize tools/hf_tokenize_main.cpp)
+target_link_libraries(gi_hf_tokenize PRIVATE geneinfer)
+
+add_executable(gi_unicode_check tools/unicode_check_main.cpp)
+target_link_libraries(gi_unicode_check PRIVATE geneinfer)
+
+foreach(tgt geneinfer gi_inspect gi_tokenize gi_kernel_check gi_forward gi_generate gi_sampler_check gi_bench gi_json_check gi_dtype_check gi_hf_tokenize gi_unicode_check)
   if(MSVC)
     target_compile_options(${tgt} PRIVATE /W4 /utf-8)
     target_compile_definitions(${tgt} PRIVATE _CRT_SECURE_NO_WARNINGS)

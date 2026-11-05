@@ -50,7 +50,12 @@ public:
 
     // Building (used by the parser).
     void push_back(JsonValue v);                 // arrays
-    void set(const std::string& key, JsonValue v);  // objects; replaces an existing key
+    void set(const std::string& key, JsonValue v);  // objects; replaces an existing key (linear search)
+    // For callers that track duplicate keys themselves (the parser does, with a hash map, so that
+    // objects with tens of thousands of keys, such as a tokenizer vocabulary, stay fast):
+    void add_member(std::string key, JsonValue v);          // objects; does NOT check for duplicates
+    void replace_member(std::size_t index, JsonValue v);    // objects; replaces the value of member `index`
+    std::size_t member_count() const { return members_.size(); }
 
 private:
     Type type_ = Type::Null;

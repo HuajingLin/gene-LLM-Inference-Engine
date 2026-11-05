@@ -24,3 +24,7 @@ golden_hf/
 
 # build artifacts
 build/
+
+src/tokenizer/text_tokenizer.h
+src/tokenizer/text_tokenizer.cpp
+tests/verify_generate_hf.py

@@ -7,7 +7,7 @@
 
 namespace geneinfer {
 
-GenerateResult generate(Transformer& model, const Tokenizer& tokenizer, Sampler& sampler,
+GenerateResult generate(Transformer& model, const TextTokenizer& tokenizer, Sampler& sampler,
                         const std::vector<int>& prompt_tokens, int max_positions,
                         const PieceCallback& on_piece) {
     using Clock = std::chrono::steady_clock;
@@ -51,8 +51,8 @@ GenerateResult generate(Transformer& model, const Tokenizer& tokenizer, Sampler&
         }
         ++pos;
 
-        if (next == Tokenizer::kBos || next == Tokenizer::kEos) {
-            result.stopped_by_terminator = true;
+        if (needs_logits && tokenizer.is_end_token(next)) {  // never for prompt tokens still being fed
+            result.stopped_by_end_token = true;
             break;
         }
         if (pos >= n_prompt) {  // `next` is a generated token
