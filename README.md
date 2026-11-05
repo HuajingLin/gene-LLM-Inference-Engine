@@ -74,7 +74,7 @@ geneInfer/
 │   ├── make_dummy_hf.py        # M7: generating random numbers for model
 │   ├── json_check_main.cpp     # M7: gi_json_check
 │   ├── dtype_check_main.cpp    # M7: gi_dtype_check
-│   ├── hf_golden.py            # M8
+│   ├── hf_golden.py            # M8: takes the prompt ids from the tokenizers library
 │   ├── env_check.py            # M8
 │   ├── hf_tokenize_main.cpp    # M9: gi_hf_tokenize
 │   ├── unicode_check_main.cpp  # M9: gi_unicode_check

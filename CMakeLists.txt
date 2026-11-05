@@ -21,7 +21,7 @@ add_library(geneinfer STATIC
   src/tokenizer/tokenizer.cpp
   src/tokenizer/unicode.cpp
   src/tokenizer/hf_tokenizer.cpp
-  src/tokenizer/text_tokenizer.cpp
+  src/tokenizer/text_tokenizer.cpp 
   src/kernels/kernels.cpp
   src/model/transformer.cpp
   src/sampler/sampler.cpp
