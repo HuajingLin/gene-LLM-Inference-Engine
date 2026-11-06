@@ -19,6 +19,7 @@ $ python3 tests/verify_forward.py --exe build/gi_forward \
 ## Project Structure
 Stage 1: M1 ~ M6
 Stage 2: M7 ~ ..
+Stage 3a: SIMD matvec
 ```
 geneInfer/
 ├── CMakeLists.txt
@@ -38,7 +39,10 @@ geneInfer/
 │   │   └── text_tokenizer.h / .cpp # M10
 │   │
 │   ├── kernels/
-│   │   └── kernels.h / .cpp        # M3: operators
+│   │   ├── kernels.h / .cpp        # M3: operators
+│   │   ├── kernel_table.h / .cpp   # Stage 3a
+│   │   ├── kernels_avx2.cpp        # Stage 3a
+│   │   └── kernels_avx512.cpp      # Stage 3a
 │   │
 │   ├── model/
 │   │   └── transformer.h / .cpp    # M4
@@ -101,5 +105,6 @@ geneInfer/
 │    └── verify_generate_hf.py  # M10
 │
 └── bench/
-     └── bench_main.cpp         # M6: gi_bench
+     ├── bench_main.cpp         # M6: gi_bench
+     └── kernel_bench_main.cpp  # Stage 3a: gi_kernel_bench
 ```

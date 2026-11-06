@@ -6,8 +6,13 @@ Oracles:
   matvec, silu, dot, axpy, mul, add -> float64 NumPy (so the check also measures float32 rounding)
 
 Error metric: max|got - want| / max(1, max|want|), required to be < 1e-5.
-The sizes deliberately include 1, primes and non-multiples of 8/16/32: later SIMD
-versions must still pass the same cases (loop remainders are a classic bug source).
+The sizes deliberately include 1, primes and non-multiples of 8/16/32/64: the SIMD versions must pass the
+same cases (loop remainders are a classic bug source).
+
+The whole suite runs once per instruction set the CPU supports (GI_ISA=scalar/avx2/avx512; the program is asked
+which one is really active, so a silent fallback to scalar code cannot pass for SIMD) and for several
+input addresses (GI_OFFSET: arrays that start 0, 1, 3 or 5 floats into their allocation, so unaligned loads
+and stores are exercised; the program also checks that no kernel writes outside its output array).
 
 Usage:
   python tests/verify_kernels.py --exe build/gi_kernel_check
@@ -15,6 +20,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -25,7 +31,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))
 from ref import apply_rope, rmsnorm, softmax  # noqa: E402
 
 TOL = 1e-5
-SIZES = [1, 2, 3, 7, 8, 15, 16, 17, 31, 32, 33, 100, 288, 768]
+SIZES = [1, 2, 3, 7, 8, 9, 15, 16, 17, 31, 32, 33, 47, 48, 63, 64, 65, 100, 127, 129, 288, 576, 768, 1536]
+ENV: dict[str, str] = {}      # GI_ISA / GI_OFFSET for the runs of the current suite
 
 
 def f32(a) -> np.ndarray:
@@ -34,7 +41,7 @@ def f32(a) -> np.ndarray:
 
 def run(exe: str, args: list, *arrays: np.ndarray) -> np.ndarray:
     data = b"".join(f32(a).tobytes() for a in arrays)
-    p = subprocess.run([exe, *map(str, args)], input=data, capture_output=True)
+    p = subprocess.run([exe, *map(str, args)], input=data, capture_output=True, env={**os.environ, **ENV})
     if p.returncode != 0:
         raise RuntimeError(f"{args}: {p.stderr.decode(errors='replace').strip()}")
     return np.frombuffer(p.stdout, dtype="<f4")
@@ -49,13 +56,8 @@ def err(got: np.ndarray, want: np.ndarray) -> float:
     return float(np.max(np.abs(got.astype(np.float64) - want)) / max(1.0, np.max(np.abs(want))))
 
 
-def main() -> int:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--exe", required=True, help="path to gi_kernel_check")
-    ap.add_argument("--seed", type=int, default=7)
-    args = ap.parse_args()
-    exe = args.exe
-    rng = np.random.default_rng(args.seed)
+def suite(exe: str, seed: int):
+    rng = np.random.default_rng(seed)
 
     results: dict[str, tuple[int, float, str]] = {}  # op -> (cases, worst error, worst case)
     failures: list[str] = []
@@ -70,7 +72,9 @@ def main() -> int:
 
     # ---- matvec: non-square shapes catch transposed indexing ------------------------
     shapes = [(1, 1), (1, 17), (17, 1), (7, 13), (13, 7), (33, 65), (100, 3), (288, 288),
-              (768, 288), (288, 768), (32000, 288)]  # the last three are real model shapes
+              (768, 288), (288, 768), (32000, 288),      # llama2.c model shapes
+              (4, 16), (4, 31), (4, 32), (5, 33), (6, 64), (7, 65), (9, 129), (11, 127), (3, 100), (8, 48),
+              (576, 576), (192, 576), (1536, 576), (576, 1536), (2048, 1024), (4099, 576)]   # SmolLM2 / Qwen3 shapes
     for rows, cols in shapes:
         W = rng.standard_normal((rows, cols)).astype(np.float32)
         x = rng.standard_normal(cols).astype(np.float32)
@@ -175,23 +179,67 @@ def main() -> int:
     pair_norm = lambda a: np.sqrt(a[0::2].astype(np.float64) ** 2 + a[1::2].astype(np.float64) ** 2)
     record("rope", "preserves norm", err(pair_norm(out), pair_norm(v)))
 
+    return results, failures
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--exe", required=True, help="path to gi_kernel_check")
+    ap.add_argument("--seed", type=int, default=7)
+    ap.add_argument("--offsets", default="0,1,3,5", help="GI_OFFSET values to run")
+    args = ap.parse_args()
+
+    info = subprocess.run([args.exe, "isa"], capture_output=True, text=True, env={**os.environ}).stdout
+    supported = info.split("supported=")[1].split()[0].split(",")
+    print(f"instruction sets supported here: {', '.join(supported)}")
+    all_failures: list[str] = []
+    total = 0
+    last_results = {}
+    for isa in supported:
+        for offset in [int(o) for o in args.offsets.split(",")]:
+            ENV.clear()
+            ENV.update({"GI_ISA": isa, "GI_OFFSET": str(offset)})
+            got = subprocess.run([args.exe, "isa"], capture_output=True, text=True, env={**os.environ, **ENV}).stdout
+            if f"active={isa} " not in got:
+                all_failures.append(f"[{isa}] the program did not switch to {isa}: {got.strip()!r}")
+                continue
+            ops = got.split("simd_ops=")[1].strip()
+            want_ops = "" if isa == "scalar" else "matvec,rmsnorm,dot,axpy,mul,add"
+            if ops != want_ops:
+                all_failures.append(f"[{isa}] kernels running SIMD code: {ops!r}, expected {want_ops!r} "
+                                    f"(a silent fallback to the scalar version would pass the value checks)")
+            try:
+                results, failures = suite(args.exe, args.seed)
+            except RuntimeError as e:      # the program refused or crashed on some case
+                all_failures.append(f"[{isa} offset {offset}] {e}")
+                print(f"  isa={isa:<7} offset={offset}: aborted ({e})")
+                continue
+            n = sum(c for c, _, _ in results.values())
+            total += n
+            worst = max(w for _, w, _ in results.values())
+            print(f"  isa={isa:<7} offset={offset}: {n} cases, worst error {worst:.2e}" + ("  FAIL" if failures else ""))
+            all_failures += [f"[{isa} offset {offset}] {f}" for f in failures]
+            last_results = results
+    ENV.clear()
+
     # ---- invalid arguments must be rejected, not crash ----------------------------------
     for bad in (["rope", 10, 0, 4], ["rope", 8, 0, 3], ["softmax", 0], ["matvec", 0, 5],
                 ["rope", 8, 0, 4, "abc"], ["rope", 8, 0, 4, "1"], ["rope", 8, 0, 4, "10000", "diagonal"]):
-        p = subprocess.run([exe, *map(str, bad)], input=b"", capture_output=True)
-        if p.returncode == 0:
-            failures.append(f"invalid arguments {bad} were accepted")
+        p = subprocess.run([args.exe, *map(str, bad)], input=b"", capture_output=True)
+        if p.returncode == 0 or p.returncode < 0:
+            all_failures.append(f"invalid arguments {bad} were accepted")
 
+    results = last_results
     width = max(len(op) for op in results)
     print(f"{'op':<{width}}  cases  worst error   worst case")
     for op, (n, worst, wcase) in results.items():
         print(f"{op:<{width}}  {n:>5}  {worst:>11.2e}   {wcase}")
-    if failures:
+    if all_failures:
         print("FAIL")
-        for f in failures:
+        for f in all_failures[:40]:
             print("  -", f)
         return 1
-    print(f"PASS  ({sum(n for n, _, _ in results.values())} cases, tolerance {TOL:.0e})")
+    print(f"PASS  ({total} cases over {len(supported)} instruction sets, tolerance {TOL:.0e})")
     return 0
 
 

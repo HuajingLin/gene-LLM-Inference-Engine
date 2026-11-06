@@ -28,6 +28,14 @@ add_library(geneinfer STATIC
   src/runtime/generator.cpp
   src/util/process_memory.cpp
 )
+# SIMD kernels: x86-64 with GCC/Clang only (other targets run the scalar kernels). Each SIMD file is compiled
+# with its own instruction-set flags; the CPU is checked at run time before one of them is used.
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$" AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  target_sources(geneinfer PRIVATE src/kernels/kernels_avx2.cpp src/kernels/kernels_avx512.cpp)
+  set_source_files_properties(src/kernels/kernels_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma")
+  set_source_files_properties(src/kernels/kernels_avx512.cpp PROPERTIES COMPILE_OPTIONS "-mavx512f;-mavx512vl;-mavx2;-mfma")
+  target_compile_definitions(geneinfer PUBLIC GI_HAVE_X86_SIMD=1)
+endif()
 target_include_directories(geneinfer PUBLIC src)
 if(WIN32)
   target_link_libraries(geneinfer PUBLIC psapi)
@@ -53,6 +61,9 @@ target_link_libraries(gi_sampler_check PRIVATE geneinfer)
 
 add_executable(gi_bench bench/bench_main.cpp)
 target_link_libraries(gi_bench PRIVATE geneinfer)
+
+add_executable(gi_kernel_bench bench/kernel_bench_main.cpp)
+target_link_libraries(gi_kernel_bench PRIVATE geneinfer)
 
 add_executable(gi_json_check tools/json_check_main.cpp)
 target_link_libraries(gi_json_check PRIVATE geneinfer)

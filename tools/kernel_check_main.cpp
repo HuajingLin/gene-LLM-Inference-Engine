@@ -9,10 +9,13 @@
 //   gi_kernel_check axpy    <n> <alpha>            stdin: y[n], x[n]                  -> y + alpha*x
 //   gi_kernel_check mul     <n>                    stdin: a[n], b[n]                  -> a*b
 //   gi_kernel_check add     <n>                    stdin: a[n], b[n]                  -> a+b
+//   gi_kernel_check isa                            -> text: "active=<isa> supported=<list>"
 //   gi_kernel_check rope    <n> <pos> <head_size> [theta] [interleaved|half_split]
 //                                                  stdin: v[n]                        -> out[n]
 //
-// All data is raw little-endian float32.
+// All data is raw little-endian float32. The instruction set follows the environment variable GI_ISA
+// (scalar, avx2, avx512; default: the best the CPU has). GI_OFFSET=k (0..15) shifts every input and output
+// array by k floats inside its allocation, so that SIMD loads and stores are tested at unaligned addresses.
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
@@ -25,11 +28,46 @@
 #  include <io.h>
 #endif
 
+#include "kernels/kernel_table.h"
 #include "kernels/kernels.h"
 
 namespace k = geneinfer::kernels;
 
 namespace {
+
+// A float array that starts `offset` floats after the beginning of its allocation (see GI_OFFSET).
+class Buf {
+public:
+    Buf(std::size_t count, std::size_t offset) : store_(count + offset + 16, -777.0f), off_(offset), n_(count) {}
+    float* data() { return store_.data() + off_; }
+    const float* data() const { return store_.data() + off_; }
+    std::vector<float> values() const { return std::vector<float>(data(), data() + n_); }
+    // The guard values around the array must be untouched after a kernel ran.
+    bool guards_intact() const {
+        for (std::size_t i = 0; i < off_; ++i) if (store_[i] != -777.0f) return false;
+        for (std::size_t i = off_ + n_; i < store_.size(); ++i) if (store_[i] != -777.0f) return false;
+        return true;
+    }
+
+private:
+    std::vector<float> store_;
+    std::size_t off_, n_;
+};
+
+std::size_t g_offset = 0;
+
+Buf read_buf(std::size_t count) {
+    Buf b(count, g_offset);
+    const std::size_t got = std::fread(b.data(), sizeof(float), count, stdin);
+    if (got != count) {
+        throw std::runtime_error("expected " + std::to_string(count) + " floats on stdin, got " + std::to_string(got));
+    }
+    return b;
+}
+
+void check_guards(const Buf& b, const char* what) {
+    if (!b.guards_intact()) throw std::runtime_error(std::string("kernel wrote outside its array: ") + what);
+}
 
 std::vector<float> read_floats(std::size_t count) {
     std::vector<float> data(count);
@@ -65,7 +103,29 @@ int usage() {
 }  // namespace
 
 int main(int argc, char** argv) {
+    if (argc == 2 && std::string(argv[1]) == "isa") {
+        std::string list;
+        for (const k::Isa i : {k::Isa::Scalar, k::Isa::Avx2, k::Isa::Avx512}) {
+            if (k::isa_supported(i)) list += (list.empty() ? "" : ",") + std::string(k::isa_name(i));
+        }
+        // which operations really run other code than the scalar reference
+        const k::KernelTable cur = k::current_table(), ref = k::scalar_table();
+        std::string simd;
+        auto note = [&](bool differs, const char* name) { if (differs) simd += (simd.empty() ? "" : ",") + std::string(name); };
+        note(cur.matvec != ref.matvec, "matvec");
+        note(cur.rmsnorm != ref.rmsnorm, "rmsnorm");
+        note(cur.dot != ref.dot, "dot");
+        note(cur.axpy != ref.axpy, "axpy");
+        note(cur.mul != ref.mul, "mul");
+        note(cur.add != ref.add, "add");
+        std::printf("active=%s supported=%s simd_ops=%s\n", k::isa_name(k::active_isa()), list.c_str(), simd.c_str());
+        return 0;
+    }
     if (argc < 3) return usage();
+    if (const char* off = std::getenv("GI_OFFSET")) {
+        g_offset = static_cast<std::size_t>(std::atoi(off));
+        if (g_offset > 15) { std::fprintf(stderr, "error: GI_OFFSET must be 0..15\n"); return 2; }
+    }
 
 #ifdef _WIN32
     _setmode(_fileno(stdin), _O_BINARY);
@@ -78,19 +138,21 @@ int main(int argc, char** argv) {
         if (op == "matvec" && argc == 4) {
             const int rows = arg_int(argv, 2, "rows"), cols = arg_int(argv, 3, "cols");
             if (rows <= 0 || cols <= 0) throw std::runtime_error("rows and cols must be positive");
-            const auto W = read_floats(static_cast<std::size_t>(rows) * cols);
-            const auto x = read_floats(static_cast<std::size_t>(cols));
-            std::vector<float> out(static_cast<std::size_t>(rows));
+            const Buf W = read_buf(static_cast<std::size_t>(rows) * cols);
+            const Buf x = read_buf(static_cast<std::size_t>(cols));
+            Buf out(static_cast<std::size_t>(rows), g_offset);
             k::matvec(out.data(), W.data(), x.data(), rows, cols);
-            write_floats(out);
+            check_guards(out, "matvec");
+            write_floats(out.values());
         } else if (op == "rmsnorm" && argc == 3) {
             const int n = arg_int(argv, 2, "n");
             if (n <= 0) throw std::runtime_error("n must be positive");
-            const auto x = read_floats(static_cast<std::size_t>(n));
-            const auto w = read_floats(static_cast<std::size_t>(n));
-            std::vector<float> out(static_cast<std::size_t>(n));
+            const Buf x = read_buf(static_cast<std::size_t>(n));
+            const Buf w = read_buf(static_cast<std::size_t>(n));
+            Buf out(static_cast<std::size_t>(n), g_offset);
             k::rmsnorm(out.data(), x.data(), w.data(), n);
-            write_floats(out);
+            check_guards(out, "rmsnorm");
+            write_floats(out.values());
         } else if ((op == "softmax" || op == "silu") && argc == 3) {
             const int n = arg_int(argv, 2, "n");
             if (n <= 0) throw std::runtime_error("n must be positive");
@@ -101,8 +163,8 @@ int main(int argc, char** argv) {
         } else if (op == "dot" && argc == 3) {
             const int n = arg_int(argv, 2, "n");
             if (n <= 0) throw std::runtime_error("n must be positive");
-            const auto a = read_floats(static_cast<std::size_t>(n));
-            const auto b = read_floats(static_cast<std::size_t>(n));
+            const Buf a = read_buf(static_cast<std::size_t>(n));
+            const Buf b = read_buf(static_cast<std::size_t>(n));
             write_floats({k::dot(a.data(), b.data(), n)});
         } else if (op == "axpy" && argc == 4) {
             const int n = arg_int(argv, 2, "n");
@@ -110,18 +172,20 @@ int main(int argc, char** argv) {
             char* end = nullptr;
             const float alpha = std::strtof(argv[3], &end);
             if (end == argv[3] || *end != '\0') throw std::runtime_error("invalid alpha");
-            auto y = read_floats(static_cast<std::size_t>(n));
-            const auto x = read_floats(static_cast<std::size_t>(n));
+            Buf y = read_buf(static_cast<std::size_t>(n));
+            const Buf x = read_buf(static_cast<std::size_t>(n));
             k::axpy(y.data(), alpha, x.data(), n);
-            write_floats(y);
+            check_guards(y, "axpy");
+            write_floats(y.values());
         } else if ((op == "mul" || op == "add") && argc == 3) {
             const int n = arg_int(argv, 2, "n");
             if (n <= 0) throw std::runtime_error("n must be positive");
-            auto a = read_floats(static_cast<std::size_t>(n));
-            const auto b = read_floats(static_cast<std::size_t>(n));
+            Buf a = read_buf(static_cast<std::size_t>(n));
+            const Buf b = read_buf(static_cast<std::size_t>(n));
             if (op == "mul") k::mul(a.data(), b.data(), n);
             else k::add(a.data(), b.data(), n);
-            write_floats(a);
+            check_guards(a, "mul/add");
+            write_floats(a.values());
         } else if (op == "rope" && argc >= 5 && argc <= 7) {
             const int n = arg_int(argv, 2, "n"), pos = arg_int(argv, 3, "pos");
             const int head_size = arg_int(argv, 4, "head_size");

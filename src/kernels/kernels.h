@@ -1,9 +1,10 @@
 // kernels.h - the numeric building blocks of a Llama-style forward pass.
 //
-// This is the "naive" baseline: plain scalar loops, written for clarity and
-// correctness. Later stages (multithreading, SIMD, quantization) replace the
-// implementations in kernels.cpp but keep these signatures, so the model code
-// and the tests do not change.
+// Every kernel has a plain scalar implementation (the reference, written for clarity) and, on x86-64,
+// AVX2+FMA and AVX-512 versions. The best one the CPU supports is chosen at startup; the choice can be
+// forced with the environment variable GI_ISA=scalar|avx2|avx512 or with set_isa(). The signatures never
+// change, so the model code and the tests do not depend on the instruction set. The SIMD versions sum in a
+// different order than the scalar loops, so results agree to float32 rounding, not bit for bit.
 //
 // Conventions:
 //   - all data is float32, contiguous
@@ -16,6 +17,16 @@
 
 namespace geneinfer {
 namespace kernels {
+
+enum class Isa { Scalar, Avx2, Avx512 };
+
+const char* isa_name(Isa isa);       // "scalar", "avx2", "avx512"
+bool isa_supported(Isa isa);         // compiled in AND supported by this CPU/OS (Scalar: always)
+Isa best_isa();                      // fastest supported
+Isa active_isa();                    // what the kernels below use right now
+// Switches the kernels; returns false (and changes nothing) if `isa` is not supported. Not thread-safe:
+// call it before any other thread uses the kernels.
+bool set_isa(Isa isa);
 
 // out[r] = sum_c W[r * cols + c] * x[c],  r = 0..rows-1.
 // `out` must not overlap W or x. This is the hot spot of decoding.

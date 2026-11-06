@@ -8,6 +8,7 @@
 //   --runs N            measured runs (default 5)
 //   --max-seq-len N     cap the context length / KV cache (default: the model's)
 //   --warmup N          unmeasured runs first, to fault in the memory-mapped weights (default 1)
+//   --isa NAME          force the instruction set of the kernels: scalar, avx2 or avx512 (default: the best one)
 //   --label TEXT        free-text tag stored in the report (e.g. "scalar baseline")
 //   --json FILE         also write the report as JSON
 //
@@ -32,6 +33,7 @@
 #include <string>
 #include <vector>
 
+#include "kernels/kernels.h"
 #include "loader/checkpoint.h"
 #include "model/transformer.h"
 #include "sampler/sampler.h"
@@ -46,7 +48,7 @@ namespace {
     std::fprintf(stderr, "error: %s\n", msg.c_str());
     std::fprintf(stderr,
                  "usage: gi_bench --model M [--prompt-tokens N] [--decode-tokens N] [--runs N]\n"
-                 "                [--warmup N] [--max-seq-len N] [--label TEXT] [--json FILE]\n");
+                 "                [--warmup N] [--max-seq-len N] [--isa NAME] [--label TEXT] [--json FILE]\n");
     std::exit(2);
 }
 
@@ -91,7 +93,7 @@ std::string compiler_string() {
 }  // namespace
 
 int main(int argc, char** argv) {
-    std::string model_path, label, json_path;
+    std::string model_path, label, json_path, isa_name_arg;
     int prompt_tokens = 32, decode_tokens = 128, runs = 5, warmup = 1, max_seq_len = 0;
 
     for (int i = 1; i < argc; ++i) {
@@ -106,11 +108,21 @@ int main(int argc, char** argv) {
         else if (flag == "--runs") runs = static_cast<int>(parse_int(flag, value()));
         else if (flag == "--warmup") warmup = static_cast<int>(parse_int(flag, value()));
         else if (flag == "--max-seq-len") max_seq_len = static_cast<int>(parse_int(flag, value()));
+        else if (flag == "--isa") isa_name_arg = value();
         else if (flag == "--label") label = value();
         else if (flag == "--json") json_path = value();
         else usage_error("unknown option " + flag);
     }
     if (model_path.empty()) usage_error("--model is required");
+    if (!isa_name_arg.empty()) {
+        bool known = false;
+        for (const geneinfer::kernels::Isa i : {geneinfer::kernels::Isa::Scalar, geneinfer::kernels::Isa::Avx2, geneinfer::kernels::Isa::Avx512}) {
+            if (isa_name_arg != geneinfer::kernels::isa_name(i)) continue;
+            known = true;
+            if (!geneinfer::kernels::set_isa(i)) usage_error("--isa " + isa_name_arg + " is not supported on this machine");
+        }
+        if (!known) usage_error("--isa must be scalar, avx2 or avx512");
+    }
     if (prompt_tokens < 1 || decode_tokens < 1 || runs < 1 || warmup < 0) {
         usage_error("--prompt-tokens, --decode-tokens and --runs must be >= 1, --warmup >= 0");
     }
@@ -203,8 +215,9 @@ int main(int argc, char** argv) {
 #endif
 
         std::printf("model: %s%s%s\n", model_path.c_str(), label.empty() ? "" : "   label: ", label.c_str());
-        std::printf("  dim %d, layers %d, heads %d/%d, vocab %d, context %d | %s | %s\n", cfg.dim,
-                    cfg.n_layers, cfg.n_heads, cfg.n_kv_heads, cfg.vocab_size, ctx, compiler_string().c_str(), build);
+        std::printf("  dim %d, layers %d, heads %d/%d, vocab %d, context %d | %s | %s | kernels: %s\n", cfg.dim,
+                    cfg.n_layers, cfg.n_heads, cfg.n_kv_heads, cfg.vocab_size, ctx, compiler_string().c_str(), build,
+                    geneinfer::kernels::isa_name(geneinfer::kernels::active_isa()));
         std::printf("workload: %d prompt + %d decode positions, %d measured runs (+%d warmup)\n\n",
                     n_prompt, n_decode, runs, warmup);
         std::printf("speed\n");
@@ -230,7 +243,7 @@ int main(int argc, char** argv) {
             if (!f) throw std::runtime_error("cannot write " + json_path);
             std::fprintf(f,
                 "{\n"
-                "  \"label\": \"%s\",\n  \"model\": \"%s\",\n  \"compiler\": \"%s\",\n  \"optimized_build\": %s,\n"
+                "  \"isa\": \"%s\",\n  \"label\": \"%s\",\n  \"model\": \"%s\",\n  \"compiler\": \"%s\",\n  \"optimized_build\": %s,\n"
                 "  \"dim\": %d,\n  \"n_layers\": %d,\n  \"n_heads\": %d,\n  \"n_kv_heads\": %d,\n  \"vocab_size\": %d,\n  \"context\": %d,\n"
                 "  \"prompt_tokens\": %d,\n  \"decode_tokens\": %d,\n  \"runs\": %d,\n  \"warmup\": %d,\n"
                 "  \"prefill_tokens_per_s\": %.3f,\n  \"decode_tokens_per_s\": %.3f,\n"
@@ -239,6 +252,7 @@ int main(int argc, char** argv) {
                 "  \"file_bytes\": %zu,\n  \"kv_cache_bytes\": %zu,\n  \"scratch_bytes\": %zu,\n"
                 "  \"rss_before_load_bytes\": %zu,\n  \"rss_after_load_bytes\": %zu,\n  \"peak_rss_bytes\": %zu\n"
                 "}\n",
+                geneinfer::kernels::isa_name(geneinfer::kernels::active_isa()),
                 json_escape(label).c_str(), json_escape(model_path).c_str(), json_escape(compiler_string()).c_str(),
 #ifdef NDEBUG
                 "true",
