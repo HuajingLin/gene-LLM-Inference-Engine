@@ -5,21 +5,30 @@ Lightweight LLM Inference Engine
 + Stage 1: stories15M
 - Stage 2: SmolLM2-135M
 ```
-[Project Wiki](https://github.com/HuajingLin/gene-LLM-Inference-Engine/wiki/M7.-Load-model-SmolLM2%E2%80%90135M)
+[Project Wiki](https://github.com/HuajingLin/gene-LLM-Inference-Engine/wiki/Stage-3a.-SIMD-matvec)
 
 ## run
-```
+```diff
 cmake -S . -B build
 cmake --build build --config Release
 
-$ python3 tests/verify_forward.py --exe build/gi_forward \
-    --model models/stories15M/stories15M.bin --golden ref_out/ref.json
+# End-to-end performance testing (one run for each of the three instruction sets) model Transformer, Sampler
+$ for isa in scalar avx2 avx512; do ./build/gi_bench --model models/SmolLM2-135M --isa $isa --label $isa; done
 ```
 
-## Project Structure
+## Main Stages
 Stage 1: M1 ~ M6
 Stage 2: M7 ~ ..
-Stage 3a: SIMD matvec
+Stage 3a: Performance Optimization: SIMD matvec
+                       scalar		avx2		avx512
+decode			       7.6 tok/s	23.4 tok/s	23.0 tok/s
+prefil				   9.9 tok/s	30.7 tok/s	29.8 tok/s
+effective bandwidth	   4.2 GB/s	    12.7 GB/s	12.5 GB/s
+
+- SIMD makes computation about three times faster, approaching the upper limit of memory bandwidth.
+- It’s almost identical to AVX2. This indicates that the process has become memory-bound; further increasing computational speed is pointless, as time is simply spent waiting for data to be fetched from memory.
+
+## Project Structure
 ```
 geneInfer/
 ├── CMakeLists.txt
