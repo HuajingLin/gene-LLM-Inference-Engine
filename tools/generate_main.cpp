@@ -9,6 +9,7 @@
 // Options:
 //   --prompt TEXT        text to continue (default: empty, i.e. start from BOS)
 //   --steps N            maximum number of positions including the prompt (default: model context)
+//   --threads N          threads sharing the matrix products (default: GI_THREADS or 1; same output)
 //   --max-seq-len N      cap the context length, i.e. the KV cache memory (default: the model's)
 //   --temperature F      0 = greedy (default 0.8)
 //   --top-k N            keep only the N most likely tokens (default 0 = off)
@@ -45,7 +46,7 @@ namespace {
 [[noreturn]] void usage_error(const std::string& msg) {
     std::fprintf(stderr, "error: %s\n", msg.c_str());
     std::fprintf(stderr,
-                 "usage: gi_generate --model M [--tokenizer T] [--prompt TEXT] [--steps N] [--max-seq-len N]\n"
+                 "usage: gi_generate --model M [--tokenizer T] [--prompt TEXT] [--steps N] [--max-seq-len N] [--threads N]\n"
                  "                   [--temperature F] [--top-k N] [--top-p F] [--seed N]\n"
                  "                   [--bos] [--no-echo] [--quiet] [--dump-tokens FILE]\n"
                  "  M is a llama2.c .bin file (then --tokenizer is required) or a Hugging Face model directory.\n");
@@ -77,7 +78,7 @@ std::uint64_t parse_seed(const std::string& v) {
 
 int main(int argc, char** argv) {
     std::string model_path, tokenizer_path, prompt, dump_path;
-    int steps = 0, max_seq_len = 0;
+    int steps = 0, max_seq_len = 0, n_threads = 0;
     bool echo = true, quiet = false, seed_given = false, bos = false;
     SamplerConfig scfg;
     scfg.temperature = 0.8f;
@@ -94,6 +95,7 @@ int main(int argc, char** argv) {
         else if (flag == "--prompt") prompt = value();
         else if (flag == "--steps") steps = static_cast<int>(parse_int(flag, value()));
         else if (flag == "--max-seq-len") max_seq_len = static_cast<int>(parse_int(flag, value()));
+        else if (flag == "--threads") n_threads = static_cast<int>(parse_int(flag, value()));
         else if (flag == "--temperature") scfg.temperature = static_cast<float>(parse_double(flag, value()));
         else if (flag == "--top-k") scfg.top_k = static_cast<int>(parse_int(flag, value()));
         else if (flag == "--top-p") scfg.top_p = static_cast<float>(parse_double(flag, value()));
@@ -128,7 +130,7 @@ int main(int argc, char** argv) {
                                      " tokens but the model only " + std::to_string(ck.config().vocab_size) +
                                      ": they do not belong together");
         }
-        Transformer model(ck, max_seq_len);
+        Transformer model(ck, max_seq_len, n_threads);
         Sampler sampler(scfg, ck.config().vocab_size);
 
         const std::vector<int> ids = tok.encode_prompt(prompt);

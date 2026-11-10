@@ -6,9 +6,10 @@ Lightweight LLM Inference Engine
 + Stage 1: stories15M
 + Stage 2: SmolLM2-135M
 + Stage 3a: SmolLM2-135M
++ Stage 3b: SmolLM2-135M
 - Stage 3b: SmolLM2-135M
 ```
-[Project Wiki](https://github.com/HuajingLin/gene-LLM-Inference-Engine/wiki/Stage-3a.-SIMD-matvec)
+[Project Wiki](https://github.com/HuajingLin/gene-LLM-Inference-Engine/wiki/Stage-3c)
 
 ## run
 ```diff
@@ -21,8 +22,10 @@ $ for isa in scalar avx2 avx512; do ./build/gi_bench --model models/SmolLM2-135M
 
 ## Main Stages
 ### Stage 1: M1 ~ M6   
-### Stage 2: M7 ~ ..   
+### Stage 2: M7 ~ M10   
 ### Stage 3a: Performance Optimization: SIMD matvec   
+### Stage 3b: Weights are stored in bf16 format  
+### Stage 3c: Multithreading 
 ```diff
                         scalar      avx2        avx512
 decode                  7.6 tok/s   23.4 tok/s  23.0 tok/s
@@ -40,6 +43,14 @@ prefill     34.2 tok/s      56.0 tok/s
 peak RSS    866 MiB         352 MiB
 ```
 All the checks pass, and the speedup is real: decode went from 37.7 to 23.1 ms per token (26.5 to 42.1 tok/s), with logits bit-identical to the float32-expanded weights and 24/24 greedy tokens matching PyTorch.
+
+### Stage 3c: Multithreading 
+```diff
+# threads: 4
+| label | prefill tok/s | decode tok/s | median ms/token | GFLOP/s | peak RSS MiB |
+|-------|---------------|--------------|-----------------|---------|--------------|
+| —     | 77.6          | 59.3         | 16.634          | 16.17   | 352.6        |
+```
 
 ## Project Structure
 ```
@@ -77,7 +88,8 @@ geneInfer/
 │   │
 │   ├── util/
 │   │   ├── process_memory.h / .cpp # M6
-│   │   └── json.h / .cpp           # M7 JSON Parser
+│   │   ├── json.h / .cpp           # M7 JSON Parser
+│   │   └── jthread_pool.h / .cpp   # Stage 3c
 │   │
 │   └── common/
 │       └── rope_style.h            # M8
@@ -109,8 +121,9 @@ geneInfer/
 │   ├── make_dummy_hf_tokenizer.py  # M9 
 │   ├── hf_tokenizer_golden.py      # M9 HF Golden Data
 │   ├── gen_unicode_tables.py       # M9
-│   └── hf_tokenizer_probe.p        # M9
-│   
+│   ├── hf_tokenizer_probe.p        # M9
+│   └── pool_check_main.cpp         # stage 3c
+│
 ├── tests/
 │    ├── verify_loader.py       # M1: Verification: C++ Output vs. NumPy Element-wise Comparison
 │    ├── verify_tokenizer.py    # M2: Comparison with Python reference implementation
@@ -124,7 +137,8 @@ geneInfer/
 │    ├── verify_hf_loader.py    # M7
 │    ├── verify_hf_tokenizer.py # M9
 │    ├── verify_unicode.py      # M9
-│    └── verify_generate_hf.py  # M10
+│    ├── verify_generate_hf.py  # M10
+│    └── verify_threads.py      # stage 3c
 │
 └── bench/
      ├── bench_main.cpp         # M6: gi_bench

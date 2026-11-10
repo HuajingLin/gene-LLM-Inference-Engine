@@ -18,6 +18,7 @@ add_library(geneinfer STATIC
   src/loader/dtype.cpp
   src/loader/safetensors.cpp
   src/util/json.cpp
+  src/util/thread_pool.cpp
   src/tokenizer/tokenizer.cpp
   src/tokenizer/unicode.cpp
   src/tokenizer/hf_tokenizer.cpp
@@ -36,6 +37,8 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$" AND CMAKE_CXX_COMPILE
   set_source_files_properties(src/kernels/kernels_avx512.cpp PROPERTIES COMPILE_OPTIONS "-mavx512f;-mavx512vl;-mavx2;-mfma")
   target_compile_definitions(geneinfer PUBLIC GI_HAVE_X86_SIMD=1)
 endif()
+find_package(Threads REQUIRED)
+target_link_libraries(geneinfer PUBLIC Threads::Threads)
 target_include_directories(geneinfer PUBLIC src)
 if(WIN32)
   target_link_libraries(geneinfer PUBLIC psapi)
@@ -65,6 +68,9 @@ target_link_libraries(gi_bench PRIVATE geneinfer)
 add_executable(gi_kernel_bench bench/kernel_bench_main.cpp)
 target_link_libraries(gi_kernel_bench PRIVATE geneinfer)
 
+add_executable(gi_pool_check tools/pool_check_main.cpp)
+target_link_libraries(gi_pool_check PRIVATE geneinfer)
+
 add_executable(gi_json_check tools/json_check_main.cpp)
 target_link_libraries(gi_json_check PRIVATE geneinfer)
 
@@ -77,7 +83,7 @@ target_link_libraries(gi_hf_tokenize PRIVATE geneinfer)
 add_executable(gi_unicode_check tools/unicode_check_main.cpp)
 target_link_libraries(gi_unicode_check PRIVATE geneinfer)
 
-foreach(tgt geneinfer gi_inspect gi_tokenize gi_kernel_check gi_forward gi_generate gi_sampler_check gi_bench gi_json_check gi_dtype_check gi_hf_tokenize gi_unicode_check)
+foreach(tgt geneinfer gi_inspect gi_tokenize gi_kernel_check gi_forward gi_generate gi_sampler_check gi_bench gi_kernel_bench gi_pool_check gi_json_check gi_dtype_check gi_hf_tokenize gi_unicode_check)
   if(MSVC)
     target_compile_options(${tgt} PRIVATE /W4 /utf-8)
     target_compile_definitions(${tgt} PRIVATE _CRT_SECURE_NO_WARNINGS)

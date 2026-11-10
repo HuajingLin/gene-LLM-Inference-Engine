@@ -8,7 +8,9 @@
 //   --runs N            measured runs (default 5)
 //   --max-seq-len N     cap the context length / KV cache (default: the model's)
 //   --warmup N          unmeasured runs first, to fault in the memory-mapped weights (default 1)
+//   --threads N         threads sharing the matrix products (default: GI_THREADS or 1)
 //   --isa NAME          force the instruction set of the kernels: scalar, avx2 or avx512 (default: the best one)
+//   --profile           after the timed runs, one more decode pass reports where the time of a token goes
 //   --label TEXT        free-text tag stored in the report (e.g. "scalar baseline")
 //   --json FILE         also write the report as JSON
 //
@@ -48,7 +50,7 @@ namespace {
     std::fprintf(stderr, "error: %s\n", msg.c_str());
     std::fprintf(stderr,
                  "usage: gi_bench --model M [--prompt-tokens N] [--decode-tokens N] [--runs N]\n"
-                 "                [--warmup N] [--max-seq-len N] [--isa NAME] [--label TEXT] [--json FILE]\n");
+                 "                [--warmup N] [--max-seq-len N] [--isa NAME] [--threads N] [--profile] [--label TEXT] [--json FILE]\n");
     std::exit(2);
 }
 
@@ -94,7 +96,8 @@ std::string compiler_string() {
 
 int main(int argc, char** argv) {
     std::string model_path, label, json_path, isa_name_arg;
-    int prompt_tokens = 32, decode_tokens = 128, runs = 5, warmup = 1, max_seq_len = 0;
+    bool profile = false;
+    int prompt_tokens = 32, decode_tokens = 128, runs = 5, warmup = 1, max_seq_len = 0, n_threads = 0;
 
     for (int i = 1; i < argc; ++i) {
         const std::string flag = argv[i];
@@ -109,6 +112,8 @@ int main(int argc, char** argv) {
         else if (flag == "--warmup") warmup = static_cast<int>(parse_int(flag, value()));
         else if (flag == "--max-seq-len") max_seq_len = static_cast<int>(parse_int(flag, value()));
         else if (flag == "--isa") isa_name_arg = value();
+        else if (flag == "--threads") n_threads = static_cast<int>(parse_int(flag, value()));
+        else if (flag == "--profile") profile = true;
         else if (flag == "--label") label = value();
         else if (flag == "--json") json_path = value();
         else usage_error("unknown option " + flag);
@@ -133,7 +138,7 @@ int main(int argc, char** argv) {
         const Config& cfg = ck.config();
         const std::size_t rss_after_load = current_rss_bytes();
 
-        Transformer model(ck, max_seq_len);
+        Transformer model(ck, max_seq_len, n_threads);
         SamplerConfig greedy;
         greedy.temperature = 0.0f;
         Sampler sampler(greedy, cfg.vocab_size);
@@ -190,19 +195,35 @@ int main(int argc, char** argv) {
         const double ms_min = *std::min_element(decode_step_ms.begin(), decode_step_ms.end());
         const double ms_max = *std::max_element(decode_step_ms.begin(), decode_step_ms.end());
 
+        // ---- optional profile: one more decode pass with the section timers attached ----
+        ForwardProfile prof;
+        if (profile) {
+            for (int pos = 0; pos < n_prompt; ++pos) {
+                model.forward(prompt[static_cast<std::size_t>(pos)], pos, pos == n_prompt - 1);
+            }
+            model.set_profile(&prof);
+            int token = 1;
+            for (int step = 0; step < n_decode; ++step) {
+                token = sampler.sample(model.forward(token, n_prompt + step));
+            }
+            model.set_profile(nullptr);
+        }
+
         // Bytes of weights read per decoded token (everything except the unused RoPE tables;
         // an unshared embedding table contributes a single row).
-        std::size_t weight_bytes = 0;
+        std::size_t weight_bytes = 0, weight_count = 0;
         for (const TensorView& t : ck.tensors()) {
             if (t.name.rfind("freq_cis", 0) == 0) continue;
             if ((t.name == "token_embedding" || t.name == "model.embed_tokens.weight") && !cfg.shared_classifier) {
                 weight_bytes += static_cast<std::size_t>(cfg.dim) * t.element_bytes();   // one row is looked up
+                weight_count += static_cast<std::size_t>(cfg.dim);
             } else {
                 weight_bytes += t.numel * t.element_bytes();
+                weight_count += t.numel;
             }
         }
         const double gbps = static_cast<double>(weight_bytes) / (ms_median / 1000.0) / 1e9;
-        const double gflops = 2.0 * (static_cast<double>(weight_bytes) / 4.0) / (ms_median / 1000.0) / 1e9;
+        const double gflops = 2.0 * static_cast<double>(weight_count) / (ms_median / 1000.0) / 1e9;   // 2 flops per weight
 
         const std::size_t kv_bytes = model.kv_cache_bytes();
         const std::size_t scratch = model.scratch_bytes();
@@ -215,9 +236,9 @@ int main(int argc, char** argv) {
 #endif
 
         std::printf("model: %s%s%s\n", model_path.c_str(), label.empty() ? "" : "   label: ", label.c_str());
-        std::printf("  dim %d, layers %d, heads %d/%d, vocab %d, context %d | %s | %s | kernels: %s\n", cfg.dim,
+        std::printf("  dim %d, layers %d, heads %d/%d, vocab %d, context %d | %s | %s | kernels: %s | threads: %d\n", cfg.dim,
                     cfg.n_layers, cfg.n_heads, cfg.n_kv_heads, cfg.vocab_size, ctx, compiler_string().c_str(), build,
-                    geneinfer::kernels::isa_name(geneinfer::kernels::active_isa()));
+                    geneinfer::kernels::isa_name(geneinfer::kernels::active_isa()), model.threads());
         std::printf("  weights in memory: %s\n", ck.has_bf16_weights() ? "bfloat16 matrices (widened in the kernels)" : "float32");
         std::printf("workload: %d prompt + %d decode positions, %d measured runs (+%d warmup)\n\n",
                     n_prompt, n_decode, runs, warmup);
@@ -228,6 +249,23 @@ int main(int argc, char** argv) {
                     ms_median, ms_p95, ms_min, ms_max);
         std::printf("  weights read per token  %10.1f MiB  ->  %.2f GB/s, %.2f GFLOP/s (at median latency)\n",
                     mib(weight_bytes), gbps, gflops);
+        if (profile && prof.forward_calls > 0) {
+            double total = 0.0, matvec_total = 0.0;
+            for (int i = 0; i < ForwardProfile::kSections; ++i) {
+                total += prof.seconds[i];
+                if (ForwardProfile::is_matvec(i)) matvec_total += prof.seconds[i];
+            }
+            const double calls = static_cast<double>(prof.forward_calls);
+            std::printf("profile (one extra decode pass, %ld tokens, per-token averages)\n", prof.forward_calls);
+            for (int i = 0; i < ForwardProfile::kSections; ++i) {
+                std::printf("  %-34s %8.3f ms %5.1f %%%s\n", ForwardProfile::name(i), 1000.0 * prof.seconds[i] / calls,
+                            100.0 * prof.seconds[i] / total, ForwardProfile::is_matvec(i) ? "   (weights streamed)" : "");
+            }
+            std::printf("  %-34s %8.3f ms\n", "total", 1000.0 * total / calls);
+            std::printf("  weight matrix products %.3f ms (%.1f %%), everything else %.3f ms (%.1f %%)\n",
+                        1000.0 * matvec_total / calls, 100.0 * matvec_total / total,
+                        1000.0 * (total - matvec_total) / calls, 100.0 * (total - matvec_total) / total);
+        }
         std::printf("memory\n");
         std::printf("  weights file (mmap)     %10.1f MiB\n", mib(ck.file_size()));
         std::printf("  KV cache                %10.1f MiB\n", mib(kv_bytes));
@@ -244,7 +282,7 @@ int main(int argc, char** argv) {
             if (!f) throw std::runtime_error("cannot write " + json_path);
             std::fprintf(f,
                 "{\n"
-                "  \"isa\": \"%s\",\n  \"bf16_weights\": %s,\n  \"label\": \"%s\",\n  \"model\": \"%s\",\n  \"compiler\": \"%s\",\n  \"optimized_build\": %s,\n"
+                "  \"isa\": \"%s\",\n  \"threads\": %d,\n  \"bf16_weights\": %s,\n  \"label\": \"%s\",\n  \"model\": \"%s\",\n  \"compiler\": \"%s\",\n  \"optimized_build\": %s,\n"
                 "  \"dim\": %d,\n  \"n_layers\": %d,\n  \"n_heads\": %d,\n  \"n_kv_heads\": %d,\n  \"vocab_size\": %d,\n  \"context\": %d,\n"
                 "  \"prompt_tokens\": %d,\n  \"decode_tokens\": %d,\n  \"runs\": %d,\n  \"warmup\": %d,\n"
                 "  \"prefill_tokens_per_s\": %.3f,\n  \"decode_tokens_per_s\": %.3f,\n"
@@ -253,7 +291,7 @@ int main(int argc, char** argv) {
                 "  \"file_bytes\": %zu,\n  \"kv_cache_bytes\": %zu,\n  \"scratch_bytes\": %zu,\n"
                 "  \"rss_before_load_bytes\": %zu,\n  \"rss_after_load_bytes\": %zu,\n  \"peak_rss_bytes\": %zu\n"
                 "}\n",
-                geneinfer::kernels::isa_name(geneinfer::kernels::active_isa()), ck.has_bf16_weights() ? "true" : "false",
+                geneinfer::kernels::isa_name(geneinfer::kernels::active_isa()), model.threads(), ck.has_bf16_weights() ? "true" : "false",
                 json_escape(label).c_str(), json_escape(model_path).c_str(), json_escape(compiler_string()).c_str(),
 #ifdef NDEBUG
                 "true",

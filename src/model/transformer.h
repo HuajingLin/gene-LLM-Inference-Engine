@@ -13,10 +13,13 @@
 // overwritten before they are read).
 #pragma once
 
+#include <chrono>
+#include <memory>
 #include <functional>
 #include <vector>
 
 #include "loader/checkpoint.h"
+#include "util/thread_pool.h"
 
 namespace geneinfer {
 
@@ -28,13 +31,33 @@ namespace geneinfer {
 //   "final_norm" (dim)   after the final RMSNorm, right before the classifier
 using TraceFn = std::function<void(const char* tag, int layer, const float* data, int size)>;
 
+// Optional per-section timing of forward(): attach one with Transformer::set_profile(). Each section is the
+// time between two checkpoints of the forward pass, so the sections add up to the whole call. Costs one clock
+// read per section (a few microseconds per token); without a profile attached there is no cost but a branch.
+struct ForwardProfile {
+    enum Section { Embed, Norm, QkvProj, Rope, Attention, OutProj, FfnGateUp, Activation, FfnDown, Residual,
+                   Classifier, kSections };
+    static const char* name(int s);
+    static bool is_matvec(int s) { return s == QkvProj || s == OutProj || s == FfnGateUp || s == FfnDown || s == Classifier; }
+
+    double seconds[kSections] = {};
+    long forward_calls = 0;
+    std::chrono::steady_clock::time_point last;
+};
+
 class Transformer {
 public:
     // The weights are not copied: they point into the checkpoint's memory mapping, so the
     // Checkpoint object must stay alive as long as this Transformer is used.
     // `max_seq_len` caps the context length (and therefore the KV cache memory);
     // 0 means "use the model's seq_len". Throws std::invalid_argument if it exceeds it.
-    explicit Transformer(const Checkpoint& checkpoint, int max_seq_len = 0);
+    //
+    // `n_threads` is the number of threads that share the weight-matrix products (the calling thread counts):
+    // 1 = no extra threads, 0 = use the environment variable GI_THREADS (default 1). The results do not depend
+    // on the number of threads: every output element is computed by the same instructions in the same order.
+    explicit Transformer(const Checkpoint& checkpoint, int max_seq_len = 0, int n_threads = 0);
+    ~Transformer();
+    int threads() const;
 
     // Processes `token` at position `pos` and returns the logits (vocab_size floats) that
     // predict the next token. The returned pointer stays valid until the next forward() call.
@@ -53,8 +76,20 @@ public:
     std::size_t scratch_bytes() const;   // activation buffers, attention scores, logits
 
     void set_trace(TraceFn fn) { trace_ = std::move(fn); }
+    void set_profile(ForwardProfile* profile) { profile_ = profile; }   // nullptr switches it off
 
 private:
+    struct MatvecJob {
+        float* out;
+        Mat W;
+        const float* x;
+        int rows, cols;
+    };
+    void run_matvecs(const MatvecJob* jobs, int n);
+
+    std::unique_ptr<ThreadPool> pool_;      // null when running on one thread
+    long par_min_weights_ = 32768;          // a product with fewer weights per thread is not split
+    ForwardProfile* profile_ = nullptr;
     Config cfg_;
     Weights w_;
     int ctx_len_;
