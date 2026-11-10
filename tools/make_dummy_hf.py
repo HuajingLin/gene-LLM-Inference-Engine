@@ -69,6 +69,8 @@ def main() -> None:
                          "so greedy decoding keeps sampling ids the tokenizer does not know")
     ap.add_argument("--eos-id", type=lambda t: [int(x) for x in t.split(",")], default=[0],
                     help="eos_token_id for config.json; a comma list writes the list form")
+    ap.add_argument("--header-pad", type=int, default=0,
+                    help="extra spaces after the safetensors JSON header: makes all tensor data start at odd addresses")
     ap.add_argument("--max-pos", type=int, default=64)
     ap.add_argument("--rope-theta", type=float, default=100000.0)
     ap.add_argument("--eps", type=float, default=1e-5)
@@ -111,7 +113,7 @@ def main() -> None:
     tensors = [tensors[i] for i in order]
 
     (out / "config.json").write_text(json.dumps(cfg, indent=2), encoding="utf-8")
-    write_safetensors(out / "model.safetensors", tensors, metadata={"format": "pt"})
+    write_safetensors(out / "model.safetensors", tensors, metadata={"format": "pt"}, header_extra_pad=args.header_pad)
     total = sum(len(t[3]) for t in tensors)
     print(f"wrote {out}/config.json and model.safetensors ({total / 1e6:.2f} MB of {args.dtype} weights, "
           f"{len(tensors)} tensors)")

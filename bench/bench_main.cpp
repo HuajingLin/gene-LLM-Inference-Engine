@@ -195,10 +195,10 @@ int main(int argc, char** argv) {
         std::size_t weight_bytes = 0;
         for (const TensorView& t : ck.tensors()) {
             if (t.name.rfind("freq_cis", 0) == 0) continue;
-            if (t.name == "token_embedding" && !cfg.shared_classifier) {
-                weight_bytes += static_cast<std::size_t>(cfg.dim) * sizeof(float);
+            if ((t.name == "token_embedding" || t.name == "model.embed_tokens.weight") && !cfg.shared_classifier) {
+                weight_bytes += static_cast<std::size_t>(cfg.dim) * t.element_bytes();   // one row is looked up
             } else {
-                weight_bytes += t.numel * sizeof(float);
+                weight_bytes += t.numel * t.element_bytes();
             }
         }
         const double gbps = static_cast<double>(weight_bytes) / (ms_median / 1000.0) / 1e9;
@@ -218,6 +218,7 @@ int main(int argc, char** argv) {
         std::printf("  dim %d, layers %d, heads %d/%d, vocab %d, context %d | %s | %s | kernels: %s\n", cfg.dim,
                     cfg.n_layers, cfg.n_heads, cfg.n_kv_heads, cfg.vocab_size, ctx, compiler_string().c_str(), build,
                     geneinfer::kernels::isa_name(geneinfer::kernels::active_isa()));
+        std::printf("  weights in memory: %s\n", ck.has_bf16_weights() ? "bfloat16 matrices (widened in the kernels)" : "float32");
         std::printf("workload: %d prompt + %d decode positions, %d measured runs (+%d warmup)\n\n",
                     n_prompt, n_decode, runs, warmup);
         std::printf("speed\n");
@@ -243,7 +244,7 @@ int main(int argc, char** argv) {
             if (!f) throw std::runtime_error("cannot write " + json_path);
             std::fprintf(f,
                 "{\n"
-                "  \"isa\": \"%s\",\n  \"label\": \"%s\",\n  \"model\": \"%s\",\n  \"compiler\": \"%s\",\n  \"optimized_build\": %s,\n"
+                "  \"isa\": \"%s\",\n  \"bf16_weights\": %s,\n  \"label\": \"%s\",\n  \"model\": \"%s\",\n  \"compiler\": \"%s\",\n  \"optimized_build\": %s,\n"
                 "  \"dim\": %d,\n  \"n_layers\": %d,\n  \"n_heads\": %d,\n  \"n_kv_heads\": %d,\n  \"vocab_size\": %d,\n  \"context\": %d,\n"
                 "  \"prompt_tokens\": %d,\n  \"decode_tokens\": %d,\n  \"runs\": %d,\n  \"warmup\": %d,\n"
                 "  \"prefill_tokens_per_s\": %.3f,\n  \"decode_tokens_per_s\": %.3f,\n"
@@ -252,7 +253,7 @@ int main(int argc, char** argv) {
                 "  \"file_bytes\": %zu,\n  \"kv_cache_bytes\": %zu,\n  \"scratch_bytes\": %zu,\n"
                 "  \"rss_before_load_bytes\": %zu,\n  \"rss_after_load_bytes\": %zu,\n  \"peak_rss_bytes\": %zu\n"
                 "}\n",
-                geneinfer::kernels::isa_name(geneinfer::kernels::active_isa()),
+                geneinfer::kernels::isa_name(geneinfer::kernels::active_isa()), ck.has_bf16_weights() ? "true" : "false",
                 json_escape(label).c_str(), json_escape(model_path).c_str(), json_escape(compiler_string()).c_str(),
 #ifdef NDEBUG
                 "true",

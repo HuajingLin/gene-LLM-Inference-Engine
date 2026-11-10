@@ -1,12 +1,8 @@
 #!/usr/bin/env python3
-"""verify_loader.py — M1 Acceptance Test: Compare the output of the C++ loader (gi_inspect) against NumPy,
- element by element.
+"""verify_loader.py - M1 acceptance: compare the output of the C++ loader (gi_inspect) with NumPy, item by item.
 
-The comparison covers: configuration, as well as the byte offset, number of elements, shape, first 4 values, 
-and sum for each tensor.
-
-It also verifies that, when a classification head is shared, `wcls` and the embedding layer occupy the same 
-memory space.
+Compared: the config and, for every tensor, byte offset / element count / shape / first 4 values / sum,
+plus "with a shared classifier, wcls is the same memory as the embedding".
 
 Usage:
   python tests/verify_loader.py --exe build/gi_inspect --model models/stories15M.bin
@@ -27,7 +23,7 @@ from llama2c_io import read_checkpoint  # noqa: E402
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--exe", required=True, help="gi_inspect 可执行文件路径")
+    ap.add_argument("--exe", required=True, help="path to the gi_inspect executable")
     ap.add_argument("--model", required=True)
     args = ap.parse_args()
 
@@ -38,12 +34,15 @@ def main() -> int:
 
     cfg_out: dict[str, str] = {}
     tensors_out: dict[str, list[str]] = {}
+    roles_out: dict[tuple[int, str], tuple[str, int]] = {}
     for line in proc.stdout.splitlines():
         parts = line.split("\t")
         if parts[0] == "config":
             cfg_out[parts[1]] = parts[2]
         elif parts[0] == "tensor":
-            tensors_out[parts[1]] = parts[2:]  # offset, numel, shape, first4, sum
+            tensors_out[parts[1]] = parts[2:]  # offset, numel, shape, first4, sum, storage
+        elif parts[0] == "role":
+            roles_out[(int(parts[1]), parts[2])] = (parts[3], int(parts[4]))  # tensor name, element offset
 
     ck = read_checkpoint(args.model)
     c = ck.config
@@ -66,21 +65,35 @@ def main() -> int:
     for name in want_names:
         if name not in tensors_out:
             continue
-        offset, numel, shape, first4, total = tensors_out[name]
+        offset, numel, shape, first4, total, storage = tensors_out[name]
+        expect(f"{name}.storage", storage, "f32")   # llama2.c tensors are float32 and used in place
         arr = ck.tensors[name]
         expect(f"{name}.offset", offset, ck.offsets[name])
         expect(f"{name}.numel", numel, arr.size)
         expect(f"{name}.shape", shape, "[" + ",".join(map(str, arr.shape)) + "]")
 
         flat = np.asarray(arr).reshape(-1)
-        got4 = [np.float32(x) for x in first4.split(",")]  # %.9g allows for precise round-trip conversion of float32 values.
+        got4 = [np.float32(x) for x in first4.split(",")]  # %.9g lets a float32 round-trip exactly
         want4 = [np.float32(x) for x in flat[:4]]
-        if got4 != want4:  # so we require exact equality for float32 values
+        if got4 != want4:  # so we require exact equality as float32
             errors.append(f"{name}.first4: C++={got4}  NumPy={want4}")
 
         want_sum = float(flat.astype(np.float64).sum())
         if not math.isclose(float(total), want_sum, rel_tol=1e-7, abs_tol=1e-6):
             errors.append(f"{name}.sum: C++={total}  NumPy={want_sum!r}")
+
+    # Which file tensor feeds which slot of the weights structure (the layers are stored stacked:
+    # layer l starts l * (elements per layer) into the tensor).
+    per_layer = {n: int(np.prod(arr.shape[1:])) for n, arr in ck.tensors.items() if n in
+                 ("rms_att", "wq", "wk", "wv", "wo", "rms_ffn", "w1", "w2", "w3")}
+    want_roles = {(-1, "token_embedding"): ("token_embedding", 0), (-1, "rms_final"): ("rms_final", 0),
+                  (-1, "wcls"): ("token_embedding" if c.shared_classifier else "wcls", 0)}
+    for layer in range(c.n_layers):
+        for member, n_per in per_layer.items():
+            want_roles[(layer, member)] = (member, layer * n_per)
+    if roles_out != want_roles:
+        bad = [k for k in want_roles if roles_out.get(k) != want_roles[k]][:5]
+        errors.append(f"role mapping differs, e.g. {[(k, roles_out.get(k), want_roles[k]) for k in bad]}")
 
     if errors:
         print("FAIL")

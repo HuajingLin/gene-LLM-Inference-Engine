@@ -2,11 +2,14 @@
 // kernels.cpp owns the table and the CPU detection; kernels_avx2.cpp / kernels_avx512.cpp only fill it.
 #pragma once
 
+#include <cstdint>
+
 namespace geneinfer {
 namespace kernels {
 
 struct KernelTable {
     void (*matvec)(float* out, const float* W, const float* x, int rows, int cols);
+    void (*matvec_bf16)(float* out, const std::uint16_t* W, const float* x, int rows, int cols);
     void (*rmsnorm)(float* out, const float* x, const float* weight, int n, float eps);
     float (*dot)(const float* a, const float* b, int n);
     void (*axpy)(float* y, float alpha, const float* x, int n);

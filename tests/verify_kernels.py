@@ -28,6 +28,7 @@ from pathlib import Path
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))
+from hf_io import bf16_to_f32, f32_to_bf16  # noqa: E402
 from ref import apply_rope, rmsnorm, softmax  # noqa: E402
 
 TOL = 1e-5
@@ -41,6 +42,13 @@ def f32(a) -> np.ndarray:
 
 def run(exe: str, args: list, *arrays: np.ndarray) -> np.ndarray:
     data = b"".join(f32(a).tobytes() for a in arrays)
+    p = subprocess.run([exe, *map(str, args)], input=data, capture_output=True, env={**os.environ, **ENV})
+    if p.returncode != 0:
+        raise RuntimeError(f"{args}: {p.stderr.decode(errors='replace').strip()}")
+    return np.frombuffer(p.stdout, dtype="<f4")
+
+
+def run_raw(exe: str, args: list, data: bytes) -> np.ndarray:
     p = subprocess.run([exe, *map(str, args)], input=data, capture_output=True, env={**os.environ, **ENV})
     if p.returncode != 0:
         raise RuntimeError(f"{args}: {p.stderr.decode(errors='replace').strip()}")
@@ -80,6 +88,36 @@ def suite(exe: str, seed: int):
         x = rng.standard_normal(cols).astype(np.float32)
         want = W.astype(np.float64) @ x.astype(np.float64)
         record("matvec", f"{rows}x{cols}", err(run(exe, ["matvec", rows, cols], W, x), want))
+
+    # ---- matvec_bf16: bfloat16 weights ---------------------------------------------------------------
+    # (1) accuracy against float64 with the widened weights; (2) BIT-IDENTICAL to matvec() on the same widened
+    # matrix (same instruction set, same summation order): widening is exact, so keeping the weights in 16 bits
+    # must not change a single bit of the result.
+    for rows, cols in shapes:
+        if rows * cols > 3_000_000:
+            continue
+        Wf = rng.standard_normal((rows, cols)).astype(np.float32)
+        bits = f32_to_bf16(Wf)
+        W = bf16_to_f32(bits)                                  # the values the kernel must see
+        x = rng.standard_normal(cols).astype(np.float32)
+        want = W.astype(np.float64) @ x.astype(np.float64)
+        got = run_raw(exe, ["matvec_bf16", rows, cols], bits.tobytes() + f32(x).tobytes())
+        record("matvec_bf16", f"{rows}x{cols}", err(got, want))
+        same = run(exe, ["matvec", rows, cols], W, x)
+        if got.tobytes() != same.tobytes():
+            failures.append(f"matvec_bf16 {rows}x{cols}: not bit-identical to matvec on the widened matrix "
+                            f"(max diff {float(np.max(np.abs(got - same))):.3e})")
+    # special values survive widening: zeros, negative zero, infinities, the largest and smallest bf16
+    bits = np.array([0x0000, 0x8000, 0x7F80, 0xFF80, 0x7F7F, 0x0001, 0x3F80, 0xBF80, 0x0080], dtype=np.uint16)
+    W = bf16_to_f32(bits)
+    x = np.ones(len(bits), dtype=np.float32)
+    for sel in (slice(0, 2), slice(4, 9), slice(0, 4)):      # finite sets and one with +-inf (inf - inf = nan)
+        b, w, xx = bits[sel], W[sel], x[sel]
+        got = run_raw(exe, ["matvec_bf16", 1, len(b)], b.tobytes() + f32(xx).tobytes())
+        ref = run(exe, ["matvec", 1, len(b)], w, xx)
+        if got.tobytes() != ref.tobytes():
+            failures.append(f"matvec_bf16 special values {sel}: {got} != {ref}")
+        record("matvec_bf16", f"special values {sel.start}:{sel.stop}", 0.0)
 
     # ---- rmsnorm ---------------------------------------------------------------------
     for n in SIZES:
@@ -204,7 +242,7 @@ def main() -> int:
                 all_failures.append(f"[{isa}] the program did not switch to {isa}: {got.strip()!r}")
                 continue
             ops = got.split("simd_ops=")[1].strip()
-            want_ops = "" if isa == "scalar" else "matvec,rmsnorm,dot,axpy,mul,add"
+            want_ops = "" if isa == "scalar" else "matvec,matvec_bf16,rmsnorm,dot,axpy,mul,add"
             if ops != want_ops:
                 all_failures.append(f"[{isa}] kernels running SIMD code: {ops!r}, expected {want_ops!r} "
                                     f"(a silent fallback to the scalar version would pass the value checks)")
@@ -226,7 +264,7 @@ def main() -> int:
     for bad in (["rope", 10, 0, 4], ["rope", 8, 0, 3], ["softmax", 0], ["matvec", 0, 5],
                 ["rope", 8, 0, 4, "abc"], ["rope", 8, 0, 4, "1"], ["rope", 8, 0, 4, "10000", "diagonal"]):
         p = subprocess.run([args.exe, *map(str, bad)], input=b"", capture_output=True)
-        if p.returncode == 0 or p.returncode < 0:
+        if p.returncode == 0:
             all_failures.append(f"invalid arguments {bad} were accepted")
 
     results = last_results

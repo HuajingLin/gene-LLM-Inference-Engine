@@ -2,14 +2,17 @@
 //
 //   gi_kernel_bench [--seconds S] [--shapes ROWSxCOLS,ROWSxCOLS,...]
 //
-// For every supported instruction set and every shape it times matvec on a weight matrix and prints the best
-// of several repetitions as GFLOP/s (2 flops per weight) and GB/s of weights streamed. Shapes whose matrix is
+// For every supported instruction set and every shape it times matvec on a float32 weight matrix and on the
+// same matrix stored as bfloat16 (half the bytes), and prints the best of several repetitions as GFLOP/s
+// (2 flops per weight) and GB/s of weights streamed. Shapes whose matrix is
 // much larger than the CPU caches measure memory bandwidth (decoding is limited by it); small shapes measure
 // the compute limit. Default shapes are those of SmolLM2-135M: q/o projections, MLP, and the output
 // head (113 MB of weights).
 #include <algorithm>
 #include <chrono>
+#include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <cstdlib>
 #include <string>
 #include <vector>
@@ -55,7 +58,7 @@ int main(int argc, char** argv) {
     const std::vector<Shape> shapes = parse_shapes(shapes_arg);
     if (shapes.empty() || !(seconds > 0.0)) { std::fprintf(stderr, "error: bad arguments\n"); return 2; }
 
-    std::printf("%-8s %-12s %10s %10s %12s %10s\n", "isa", "shape", "MiB", "GFLOP/s", "GB/s", "us/call");
+    std::printf("%-8s %-6s %-12s %10s %10s %12s %10s\n", "isa", "type", "shape", "MiB", "GFLOP/s", "GB/s", "us/call");
     for (const Shape& s : shapes) {
         std::vector<float> W(static_cast<std::size_t>(s.rows) * s.cols), x(static_cast<std::size_t>(s.cols)),
             out(static_cast<std::size_t>(s.rows));
@@ -66,22 +69,34 @@ int main(int argc, char** argv) {
         };
         for (float& v : W) v = rnd();
         for (float& v : x) v = rnd();
-        const double bytes = static_cast<double>(W.size()) * sizeof(float);
+        std::vector<std::uint16_t> Wb(W.size());   // the same values rounded to bfloat16
+        for (std::size_t i = 0; i < W.size(); ++i) {
+            std::uint32_t u;
+            std::memcpy(&u, &W[i], sizeof u);
+            Wb[i] = static_cast<std::uint16_t>(u >> 16);
+        }
         for (const k::Isa isa : {k::Isa::Scalar, k::Isa::Avx2, k::Isa::Avx512}) {
             if (!k::set_isa(isa)) continue;
-            k::matvec(out.data(), W.data(), x.data(), s.rows, s.cols);   // warm up (page faults, caches)
-            double best = 1e30;
-            const auto begin = std::chrono::steady_clock::now();
-            while (std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count() < seconds) {
-                const auto t0 = std::chrono::steady_clock::now();
-                k::matvec(out.data(), W.data(), x.data(), s.rows, s.cols);
-                best = std::min(best, std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+            for (const bool bf16 : {false, true}) {
+                auto call = [&]() {
+                    if (bf16) k::matvec_bf16(out.data(), Wb.data(), x.data(), s.rows, s.cols);
+                    else k::matvec(out.data(), W.data(), x.data(), s.rows, s.cols);
+                };
+                call();   // warm up (page faults, caches)
+                double best = 1e30;
+                const auto begin = std::chrono::steady_clock::now();
+                while (std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count() < seconds) {
+                    const auto t0 = std::chrono::steady_clock::now();
+                    call();
+                    best = std::min(best, std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+                }
+                volatile float sink = out[0];
+                (void)sink;
+                const double bytes = static_cast<double>(W.size()) * (bf16 ? 2.0 : 4.0);
+                std::printf("%-8s %-6s %-12s %10.2f %10.2f %12.2f %10.1f\n", k::isa_name(isa), bf16 ? "bf16" : "f32",
+                            (std::to_string(s.rows) + "x" + std::to_string(s.cols)).c_str(), bytes / 1048576.0,
+                            2.0 * static_cast<double>(W.size()) / best / 1e9, bytes / best / 1e9, best * 1e6);
             }
-            volatile float sink = out[0];
-            (void)sink;
-            std::printf("%-8s %-12s %10.2f %10.2f %12.2f %10.1f\n", k::isa_name(isa),
-                        (std::to_string(s.rows) + "x" + std::to_string(s.cols)).c_str(), bytes / 1048576.0,
-                        2.0 * static_cast<double>(W.size()) / best / 1e9, bytes / best / 1e9, best * 1e6);
         }
     }
     return 0;

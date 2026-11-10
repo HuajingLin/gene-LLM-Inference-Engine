@@ -1,11 +1,13 @@
 #include "loader/checkpoint.h"
 
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <sstream>
 #include <stdexcept>
 
+#include "loader/dtype.h"
 #include "loader/safetensors.h"
 
 namespace geneinfer {
@@ -49,9 +51,40 @@ std::size_t Checkpoint::file_size() const {
     return safetensors_ ? safetensors_->file_size() : file_.size();
 }
 
-Checkpoint Checkpoint::load(const std::string& path) {
+LoadOptions LoadOptions::from_environment() {
+    LoadOptions o;
+    if (const char* env = std::getenv("GI_WEIGHTS")) {
+        if (std::strcmp(env, "f32") == 0) o.keep_bf16 = false;
+        else if (std::strcmp(env, "native") != 0) {
+            std::fprintf(stderr, "warning: GI_WEIGHTS=%s is not 'f32' or 'native'; using native\n", env);
+        }
+    }
+    return o;
+}
+
+float TensorView::value(std::size_t i) const {
+    if (bf16) return bf16_to_f32(bf16[i]);
+    return data[i];
+}
+
+bool Checkpoint::has_bf16_weights() const {
+    for (const TensorView& t : tensors_) {
+        if (t.storage == Storage::BF16) return true;
+    }
+    return false;
+}
+
+std::size_t Checkpoint::owned_bytes() const {
+    std::size_t n = 0;
+    for (const auto& v : converted_) n += v.size() * sizeof(float);
+    return n;
+}
+
+Checkpoint Checkpoint::load(const std::string& path) { return load(path, LoadOptions::from_environment()); }
+
+Checkpoint Checkpoint::load(const std::string& path, const LoadOptions& options) {
     std::error_code ec;
-    if (std::filesystem::is_directory(std::filesystem::path(path), ec)) return load_hf(path);
+    if (std::filesystem::is_directory(std::filesystem::path(path), ec)) return load_hf(path, options);
     return load_llama2c(path);
 }
 

@@ -29,6 +29,25 @@ void matvec_scalar(float* out, const float* W, const float* x, int rows, int col
     }
 }
 
+inline float widen(std::uint16_t b) {
+    const std::uint32_t u = static_cast<std::uint32_t>(b) << 16;
+    float f;
+    std::memcpy(&f, &u, sizeof f);
+    return f;
+}
+
+void matvec_bf16_scalar(float* out, const std::uint16_t* W, const float* x, int rows, int cols) {
+    assert(rows > 0 && cols > 0);
+    for (int r = 0; r < rows; ++r) {
+        const std::uint16_t* row = W + static_cast<std::size_t>(r) * static_cast<std::size_t>(cols);
+        float acc = 0.0f;
+        for (int c = 0; c < cols; ++c) {
+            acc += widen(row[c]) * x[c];
+        }
+        out[r] = acc;
+    }
+}
+
 void rmsnorm_scalar(float* out, const float* x, const float* weight, int n, float eps) {
     assert(n > 0);
     float sum_sq = 0.0f;
@@ -51,13 +70,15 @@ void softmax(float* x, int n) {
         if (x[i] > max_val) max_val = x[i];
     }
     // Subtracting the max keeps exp() in a safe range (largest argument is 0).
-    float sum = 0.0f;
+    // The sum is accumulated in double: a float32 running sum over thousands of terms loses several digits.
+    double sum = 0.0;
     for (int i = 0; i < n; ++i) {
         x[i] = std::exp(x[i] - max_val);
-        sum += x[i];
+        sum += static_cast<double>(x[i]);
     }
+    const float fsum = static_cast<float>(sum);
     for (int i = 0; i < n; ++i) {
-        x[i] /= sum;
+        x[i] /= fsum;
     }
 }
 
@@ -128,7 +149,7 @@ void rope(float* v, int n, int pos, int head_size, float theta, RopeStyle style)
 namespace {
 
 KernelTable make_scalar_table() {
-    return KernelTable{matvec_scalar, rmsnorm_scalar, dot_scalar, axpy_scalar, mul_scalar, add_scalar};
+    return KernelTable{matvec_scalar, matvec_bf16_scalar, rmsnorm_scalar, dot_scalar, axpy_scalar, mul_scalar, add_scalar};
 }
 
 bool cpu_has(Isa isa) {
@@ -221,6 +242,13 @@ bool set_isa(Isa isa) {
 void matvec(float* out, const float* W, const float* x, int rows, int cols) {
     assert(rows > 0 && cols > 0);
     state().table.matvec(out, W, x, rows, cols);
+}
+void matvec_bf16(float* out, const std::uint16_t* W, const float* x, int rows, int cols) {
+    assert(rows > 0 && cols > 0);
+    state().table.matvec_bf16(out, W, x, rows, cols);
+}
+void widen_bf16(float* dst, const std::uint16_t* src, int n) {
+    for (int i = 0; i < n; ++i) dst[i] = widen(src[i]);
 }
 void rmsnorm(float* out, const float* x, const float* weight, int n, float eps) {
     assert(n > 0);

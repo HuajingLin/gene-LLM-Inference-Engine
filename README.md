@@ -2,8 +2,10 @@
 Lightweight LLM Inference Engine
 
 ```diff
+# Models used
 + Stage 1: stories15M
-- Stage 2: SmolLM2-135M
++ Stage 2: SmolLM2-135M
+- Stage 3a: SmolLM2-135M
 ```
 [Project Wiki](https://github.com/HuajingLin/gene-LLM-Inference-Engine/wiki/Stage-3a.-SIMD-matvec)
 
@@ -28,6 +30,15 @@ effective bandwidth     4.2 GB/s    12.7 GB/s   12.5 GB/s
 ```
 - SIMD makes computation about three times faster, approaching the upper limit of memory bandwidth.
 - It’s almost identical to AVX2. This indicates that the process has become memory-bound; further increasing computational speed is pointless, as time is simply spent waiting for data to be fetched from memory.
+
+Stage 3b: Weights are stored in bf16 format.
+```
+            f32 weights     bf16 native
+decode      26.5 tok/s      42.1 tok/s
+prefill     34.2 tok/s      56.0 tok/s
+peak RSS    866 MiB         352 MiB
+``
+
 
 ## Project Structure
 ```

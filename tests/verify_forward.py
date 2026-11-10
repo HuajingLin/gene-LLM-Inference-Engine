@@ -27,6 +27,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import os
 import json
 import subprocess
 import sys
@@ -57,6 +58,8 @@ SUITE = {
     "head_dim 64, 9/3 heads (SmolLM2 shape)": ["--dim", "72", "--heads", "9", "--kv-heads", "3", "--head-dim", "8", "--hidden", "96"],
     "minimal config (default eps and theta)": ["--minimal-config"],
     "single layer": ["--layers", "1"],
+    "bf16 untied, dim 36 / hidden 70 (SIMD loop tails)": ["--dtype", "bf16", "--untied", "--dim", "36", "--heads", "4", "--kv-heads", "2", "--head-dim", "10", "--hidden", "70"],
+    "bf16, 8/2 heads, dim 64": ["--dtype", "bf16", "--dim", "64", "--heads", "8", "--kv-heads", "2", "--hidden", "176"],
     "extra tensors in the file": ["--extras", "--untied"],
 }
 
@@ -73,10 +76,10 @@ def load_reference(model_path: str):
     return read_hf_model(model_path) if Path(model_path).is_dir() else read_checkpoint(model_path)
 
 
-def run_cpp(exe: str, model_path: str, seq: list[int], vocab: int):
+def run_cpp(exe: str, model_path: str, seq: list[int], vocab: int, env_extra: dict | None = None):
     with tempfile.TemporaryDirectory() as tmp:
         p = subprocess.run([exe, model_path, tmp, "--max-seq-len", str(len(seq)), *map(str, seq)],
-                           capture_output=True, text=True)
+                           capture_output=True, text=True, env={**os.environ, **(env_extra or {})})
         if p.returncode != 0:
             raise RuntimeError(f"gi_forward exited with {p.returncode}: {p.stderr.strip()}")
         logits = np.fromfile(Path(tmp) / "logits.f32", dtype="<f4")
@@ -84,6 +87,20 @@ def run_cpp(exe: str, model_path: str, seq: list[int], vocab: int):
             raise RuntimeError(f"logits.f32 has {logits.size} floats, expected {len(seq) * vocab}")
         trace = {f.stem: np.fromfile(f, dtype="<f4") for f in Path(tmp).glob("*.f32") if f.stem != "logits"}
     return logits.reshape(len(seq), vocab), trace, p.stdout.strip()
+
+
+def identical_to_f32_weights(exe: str, model_path: str, seq: list[int], vocab: int, native_logits, native_trace,
+                             failures: list[str], label: str) -> None:
+    """bfloat16 weights kept as bfloat16 (default) and expanded to float32 at load time (GI_WEIGHTS=f32) must give
+    BIT-IDENTICAL logits and activations: widening is exact and the kernels add in the same order."""
+    f32_logits, f32_trace, _ = run_cpp(exe, model_path, seq, vocab, {"GI_WEIGHTS": "f32"})
+    if f32_logits.tobytes() != native_logits.tobytes():
+        failures.append(f"{label}: logits with bf16-native weights differ from float32-expanded weights "
+                        f"(max diff {float(np.max(np.abs(f32_logits - native_logits))):.3e})")
+    for key in sorted(set(f32_trace) | set(native_trace)):
+        if key not in f32_trace or key not in native_trace or f32_trace[key].tobytes() != native_trace[key].tobytes():
+            failures.append(f"{label}: activation '{key}' differs between bf16-native and float32-expanded weights")
+            break
 
 
 def run_numpy(ckpt, seq: list[int]):
@@ -126,18 +143,28 @@ def compare(label: str, got_logits, got_trace, want_logits, want_trace, tol: flo
     return worst
 
 
-def check_greedy(cpp_logits, seq, n_prompt, failures, label="C++"):
+def greedy_stats(logits, seq, n_prompt):
+    """How many of the tokens seq[n_prompt:] are the argmax of the logits of the position before them.
+
+    Returns (checked, mismatches, near_ties, details); a mismatch whose logit gap is below 1e-3 is a
+    near-tie (float rounding), not an error."""
     mismatches = near_ties = checked = 0
+    details = []
     for pos in range(n_prompt - 1, len(seq) - 1):   # position pos predicts seq[pos + 1]
         checked += 1
-        top, want = int(np.argmax(cpp_logits[pos])), seq[pos + 1]
+        top, want = int(np.argmax(logits[pos])), seq[pos + 1]
         if top != want:
-            gap = float(cpp_logits[pos][top] - cpp_logits[pos][want])
+            gap = float(logits[pos][top] - logits[pos][want])
             if gap < 1e-3:
-                near_ties += 1      # a float rounding tie, not a bug
+                near_ties += 1
             else:
                 mismatches += 1
-                failures.append(f"{label}: greedy token at position {pos}: got {top}, expected {want} (logit gap {gap:.3f})")
+                details.append(f"position {pos}: got {top}, expected {want} (logit gap {gap:.3f})")
+    return checked, mismatches, near_ties, details
+
+
+def report_greedy(label, stats):
+    checked, mismatches, near_ties, _ = stats
     print(f"greedy continuation ({label}): {checked - mismatches - near_ties}/{checked} tokens identical"
           + (f", {near_ties} near-ties" if near_ties else ""))
 
@@ -163,6 +190,7 @@ def run_dummy_suite(args) -> int:
                 continue
             ref_logits, ref_trace = run_numpy(ckpt, seq)
             worst = compare(label, cpp_logits, cpp_trace, ref_logits, ref_trace, args.tol, local, verbose=False)
+            identical_to_f32_weights(args.exe, str(d), seq, ckpt.config.vocab_size, cpp_logits, cpp_trace, local, "bf16 identity")
             failures += [f"[{label}] {m}" for m in local]
             rows.append((label, n, worst))
     print(f"{'model variant':<46} {'positions':>9} {'worst error':>12}")
@@ -173,7 +201,7 @@ def run_dummy_suite(args) -> int:
         for f in failures[:15]:
             print("  -", f)
         return 1
-    print(f"\nPASS  ({len(rows)} model variants, C++ matches the NumPy reference at every position and layer)")
+    print(f"\nPASS  ({len(rows)} model variants, C++ matches the NumPy reference at every position and layer; bf16-native weights are bit-identical to float32-expanded ones)")
     return 0
 
 
@@ -242,14 +270,38 @@ def main() -> int:
 
     failures: list[str] = []
     compare("C++ vs NumPy", cpp_logits, cpp_trace, ref_logits, ref_trace, args.tol, failures, verbose=True)
+    if Path(args.model).is_dir():
+        identical_to_f32_weights(args.exe, args.model, seq, cfg.vocab_size, cpp_logits, cpp_trace, failures, "bf16 identity")
+        print("bf16-native vs float32-expanded weights: " + ("bit-identical" if not any("identity" in f for f in failures) else "DIFFERENT"))
 
-    if ref is not None:   # llama2.c golden file
+    if ref is not None:   # llama2.c golden file; the NumPy reference acts as the referee
         first = np.fromfile(Path(args.golden).parent / ref["first_logits_file"], dtype="<f4")
-        e = err(cpp_logits[ref["first_logits_position"]], first)
-        print(f"first_logits.f32 (position {ref['first_logits_position']}): {e:.2e}")
-        if not e < args.tol:
-            failures.append(f"C++ logits differ from first_logits.f32: {e:.2e}")
-        check_greedy(cpp_logits, seq, n_prompt, failures)
+        pos0 = ref["first_logits_position"]
+        e_cpp, e_np = err(cpp_logits[pos0], first), err(ref_logits[pos0], first)
+        print(f"first_logits.f32 (position {pos0}): C++ {e_cpp:.2e}, NumPy {e_np:.2e}")
+        g_cpp = greedy_stats(cpp_logits, seq, n_prompt)
+        g_np = greedy_stats(ref_logits, seq, n_prompt)
+        report_greedy("C++", g_cpp)
+        report_greedy("NumPy", g_np)
+
+        golden_bad = (not e_np < args.tol) or g_np[1] > 0
+        if golden_bad:
+            # Even the NumPy reference disagrees with the golden file, so the file does not describe this
+            # model: it is stale or was produced from something else. The C++ engine is not the suspect.
+            failures.append(
+                "the golden file does not match this model - the NumPy reference disagrees with it as well, "
+                "so this is not a C++ problem. Regenerate it:  python tools/ref.py --model <model.bin> "
+                "--tokenizer <tokenizer.bin> --prompt \"...\" --steps N --out ref_out")
+            print(f"  golden file says: model={ref.get('model')!r}, prompt={ref.get('prompt')!r}, "
+                  f"steps={ref.get('steps')}, vocab_size={ref.get('vocab_size')}")
+            print(f"  its first generated tokens: {ref['generated_tokens'][:8]}  "
+                  f"(NumPy would pick {[int(np.argmax(ref_logits[p])) for p in range(n_prompt - 1, min(n_prompt + 7, n - 1))]} "
+                  f"for the same history)")
+        else:
+            if not e_cpp < args.tol:
+                failures.append(f"C++ logits differ from first_logits.f32 while NumPy agrees: {e_cpp:.2e}")
+            for d in g_cpp[3][:10]:
+                failures.append(f"C++ greedy token at {d}")
 
     if hf is not None:    # Hugging Face golden directory
         hf_dir = Path(args.hf_golden)
@@ -266,7 +318,10 @@ def main() -> int:
         compare(f"NumPy vs {who}", ref_logits, ref_trace, hf_logits, hf_trace, args.tol_hf, failures,
                 verbose=False, skip_missing_ok=True)
         if hf.get("greedy_continuation") and n > n_prompt:
-            check_greedy(cpp_logits, seq, n_prompt, failures)
+            stats = greedy_stats(cpp_logits, seq, n_prompt)
+            report_greedy("C++", stats)
+            for d in stats[3][:10]:
+                failures.append(f"C++ greedy token at {d}")
 
     if failures:
         print("\nFAIL")

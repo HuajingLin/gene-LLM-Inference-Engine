@@ -48,11 +48,20 @@ VARIANTS = {
     "extra tensors, untied": ["--extras", "--untied", "--dtype", "bf16"],
     "default config values": ["--minimal-config"],
     "single layer, multi-query": ["--layers", "1", "--kv-heads", "1"],
+    "bf16 data at odd addresses (falls back to float32)": ["--dtype", "bf16", "--header-pad", "1"],
 }
 
 
 def run(exe, *args):
     return subprocess.run([exe, *map(str, args)], capture_output=True, text=True)
+
+
+def expected_storage(tensor, shape, f32_weights: bool) -> str:
+    """bfloat16 MATRICES stay bfloat16 in memory when their data is 2-byte aligned (file offsets are mapped at a
+    page boundary, so the offset parity is the address parity); norm vectors, F16 and F32 tensors are float32."""
+    if f32_weights or tensor.dtype_name != "BF16" or len(shape) != 2 or tensor.begin % 2 != 0:
+        return "f32"
+    return "bf16"
 
 
 def parse_report(text: str):
@@ -68,9 +77,9 @@ def parse_report(text: str):
     return cfg, tensors, roles
 
 
-def check_model(exe: str, directory: Path) -> list[str]:
+def check_model(exe: str, directory: Path, f32_weights: bool = False) -> list[str]:
     errors: list[str] = []
-    p = run(exe, directory)
+    p = run(exe, directory, *(["--f32-weights"] if f32_weights else []))
     if p.returncode != 0:
         return [f"gi_inspect failed: {p.stderr.strip()}"]
     cfg_out, tensors_out, roles_out = parse_report(p.stdout)
@@ -108,12 +117,25 @@ def check_model(exe: str, directory: Path) -> list[str]:
 
     st = read_safetensors(st_path)
     layout = llama_tensor_layout(cfg)
+    # memory the loader allocated itself = float32 copies of exactly the tensors reported as stored "f32" that
+    # the file does not already hold as aligned float32 (zero-copy); bfloat16 matrices kept as bf16 cost nothing
+    want_owned = 0
+    for name, shape in layout:
+        t = st[name]
+        if expected_storage(t, shape, f32_weights) == "f32" and not (t.dtype_name == "F32" and t.begin % 4 == 0):
+            want_owned += 4 * int(np.prod(shape))
+    if cfg_out.get("owned_bytes") != str(want_owned):
+        errors.append(f"owned memory: C++ {cfg_out.get('owned_bytes')} bytes, expected {want_owned} "
+                      f"(a float32 copy of a bfloat16 matrix would show up here)")
     if [t[0] for t in tensors_out] != [n for n, _ in layout]:
         errors.append("tensor names/order differ from the expected Llama layout")
         return errors
-    for (name, shape), (_, offset, numel, shape_s, first4, total) in zip(layout, tensors_out):
+    for (name, shape), (_, offset, numel, shape_s, first4, total, storage) in zip(layout, tensors_out):
         t = st[name]
         arr = t.as_float32().reshape(-1)
+        if storage != expected_storage(t, shape, f32_weights):
+            errors.append(f"{name}: stored as {storage}, expected {expected_storage(t, shape, f32_weights)} "
+                          f"(file dtype {t.dtype_name}, shape {shape})")
         if offset != str(t.begin):
             errors.append(f"{name}: offset C++ {offset}, file {t.begin}")
         if numel != str(arr.size):
@@ -211,7 +233,7 @@ def main() -> int:
     args = ap.parse_args()
 
     if args.model:
-        errors = check_model(args.exe, Path(args.model))
+        errors = check_model(args.exe, Path(args.model)) + check_model(args.exe, Path(args.model), f32_weights=True)
         if errors:
             print("FAIL")
             for e in errors:
@@ -229,8 +251,9 @@ def main() -> int:
         for label, flags in VARIANTS.items():
             d = tmp / ("m_" + str(abs(hash(label))))
             subprocess.run([sys.executable, MAKE, "--out", str(d), *flags], check=True, capture_output=True)
-            for e in check_model(args.exe, d):
-                failures.append(f"[{label}] {e}")
+            for f32_weights in (False, True):
+                for e in check_model(args.exe, d, f32_weights):
+                    failures.append(f"[{label}{', --f32-weights' if f32_weights else ''}] {e}")
 
         good = tmp / "good"
         subprocess.run([sys.executable, MAKE, "--out", str(good), "--dtype", "bf16"], check=True, capture_output=True)
@@ -266,7 +289,7 @@ def main() -> int:
         if len(failures) > 20:
             print(f"  ... and {len(failures) - 20} more")
         return 1
-    print(f"PASS  ({len(VARIANTS)} model variants checked tensor by tensor, {n_bad + 2} corrupted inputs rejected)")
+    print(f"PASS  ({len(VARIANTS)} model variants x 2 weight modes checked tensor by tensor, {n_bad + 2} corrupted inputs rejected)")
     return 0
 
 

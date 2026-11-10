@@ -5,9 +5,13 @@
 //   * a directory     -> Hugging Face model directory with config.json and model.safetensors
 //                        (Llama architecture; weights may be F32, F16 or BF16)
 //
-// All weight matrices are row-major with shape [out_features, in_features], i.e. y = W * x,
-// and are exposed as float32 whatever the file stores. Float32 data in a file is used in place
-// (memory-mapped, no copy); F16/BF16 tensors are converted into memory owned by the Checkpoint.
+// All weight matrices are row-major with shape [out_features, in_features], i.e. y = W * x.
+// Float32 data in a file is used in place (memory-mapped, no copy). bfloat16 matrices are ALSO used in
+// place, as 16-bit values: they are widened to float32 inside the kernels (an exact 16-bit shift), which
+// halves the memory traffic of decoding and the RAM the weights need. Set the environment variable
+// GI_WEIGHTS=f32 (or LoadOptions::keep_bf16 = false) to expand them to float32 at load time instead; both
+// ways give bit-identical results. F16 tensors, and the small norm vectors of any file, are converted to
+// float32 into memory owned by the Checkpoint.
 #pragma once
 
 #include <cstddef>
@@ -22,6 +26,29 @@
 namespace geneinfer {
 
 class SafetensorsFile;
+
+// How a weight tensor is stored in memory.
+enum class Storage { F32, BF16 };
+
+// A read-only view of a weight matrix, either float32 or bfloat16 (the upper 16 bits of a float32).
+struct Mat {
+    const float* f32 = nullptr;
+    const std::uint16_t* bf16 = nullptr;
+
+    Mat() = default;
+    Mat(const float* p) : f32(p) {}              // NOLINT: implicit on purpose, llama2.c data is plain float
+    Mat(const std::uint16_t* p) : bf16(p) {}     // NOLINT
+    bool is_bf16() const { return bf16 != nullptr; }
+    const void* address() const { return bf16 ? static_cast<const void*>(bf16) : static_cast<const void*>(f32); }
+    friend bool operator==(const Mat& a, const Mat& b) { return a.address() == b.address() && a.is_bf16() == b.is_bf16(); }
+    friend bool operator!=(const Mat& a, const Mat& b) { return !(a == b); }
+};
+
+struct LoadOptions {
+    bool keep_bf16 = true;   // keep bfloat16 matrices as bfloat16 (see above)
+    // Defaults, with GI_WEIGHTS=f32 in the environment switching keep_bf16 off.
+    static LoadOptions from_environment();
+};
 
 struct Config {
     int dim = 0;          // hidden size (d_model)
@@ -47,28 +74,33 @@ struct Config {
 // Weights of one transformer layer. All pointers are read-only.
 struct LayerWeights {
     const float* rms_att = nullptr;  // [dim]               input_layernorm
-    const float* wq = nullptr;       // [attn_dim, dim]
-    const float* wk = nullptr;       // [kv_dim, dim]
-    const float* wv = nullptr;       // [kv_dim, dim]
-    const float* wo = nullptr;       // [dim, attn_dim]
+    Mat wq;       // [attn_dim, dim]
+    Mat wk;       // [kv_dim, dim]
+    Mat wv;       // [kv_dim, dim]
+    Mat wo;       // [dim, attn_dim]
     const float* rms_ffn = nullptr;  // [dim]               post_attention_layernorm
-    const float* w1 = nullptr;       // [hidden, dim]       gate projection
-    const float* w2 = nullptr;       // [dim, hidden]       down projection
-    const float* w3 = nullptr;       // [hidden, dim]       up projection
+    Mat w1;       // [hidden, dim]       gate projection
+    Mat w2;       // [dim, hidden]       down projection
+    Mat w3;       // [hidden, dim]       up projection
 };
 
 struct Weights {
-    const float* token_embedding = nullptr;  // [vocab, dim]
+    Mat token_embedding;                     // [vocab, dim]
     std::vector<LayerWeights> layers;        // n_layers entries
     const float* rms_final = nullptr;        // [dim]
-    const float* wcls = nullptr;             // [vocab, dim] (== token_embedding when shared)
+    Mat wcls;                                // [vocab, dim] (== token_embedding when shared)
 };
 
 // For debugging/verification: every tensor that was read, in loading order.
 struct TensorView {
     std::string name;
-    const float* data = nullptr;       // float32 values (converted if the file stores F16/BF16)
+    Storage storage = Storage::F32;
+    const float* data = nullptr;       // float32 values, when storage == F32 (converted if the file stores F16)
+    const std::uint16_t* bf16 = nullptr;  // bfloat16 values, when storage == BF16 (in the mapped file)
     std::size_t numel = 0;
+    std::size_t element_bytes() const { return storage == Storage::BF16 ? 2 : 4; }
+    const void* address() const { return bf16 ? static_cast<const void*>(bf16) : static_cast<const void*>(data); }
+    float value(std::size_t i) const;  // element i as float32 (exact for bfloat16)
     std::size_t byte_offset = 0;       // where the tensor's data starts in the file
     std::vector<std::int64_t> shape;
 };
@@ -81,17 +113,20 @@ public:
 
     // Throws std::runtime_error on failure (missing file, invalid or unsupported contents).
     static Checkpoint load(const std::string& path);
+    static Checkpoint load(const std::string& path, const LoadOptions& options);
 
     const Config& config() const { return cfg_; }
     const Weights& weights() const { return w_; }
     const std::vector<TensorView>& tensors() const { return tensors_; }
     std::size_t file_size() const;
+    bool has_bf16_weights() const;   // any matrix kept as bfloat16
+    std::size_t owned_bytes() const; // memory allocated for converted tensors (everything else is the file mapping)
 
 private:
     Checkpoint();
 
     static Checkpoint load_llama2c(const std::string& path);
-    static Checkpoint load_hf(const std::string& directory);
+    static Checkpoint load_hf(const std::string& directory, const LoadOptions& options);
 
     MappedFile file_;                              // llama2.c file mapping
     std::unique_ptr<SafetensorsFile> safetensors_;  // Hugging Face weights mapping

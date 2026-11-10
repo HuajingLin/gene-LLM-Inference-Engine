@@ -9,6 +9,7 @@
 //   gi_kernel_check axpy    <n> <alpha>            stdin: y[n], x[n]                  -> y + alpha*x
 //   gi_kernel_check mul     <n>                    stdin: a[n], b[n]                  -> a*b
 //   gi_kernel_check add     <n>                    stdin: a[n], b[n]                  -> a+b
+//   gi_kernel_check matvec_bf16 <rows> <cols>   stdin: W (bfloat16 bits), x (float32)
 //   gi_kernel_check isa                            -> text: "active=<isa> supported=<list>"
 //   gi_kernel_check rope    <n> <pos> <head_size> [theta] [interleaved|half_split]
 //                                                  stdin: v[n]                        -> out[n]
@@ -16,6 +17,7 @@
 // All data is raw little-endian float32. The instruction set follows the environment variable GI_ISA
 // (scalar, avx2, avx512; default: the best the CPU has). GI_OFFSET=k (0..15) shifts every input and output
 // array by k floats inside its allocation, so that SIMD loads and stores are tested at unaligned addresses.
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
@@ -52,6 +54,18 @@ public:
 private:
     std::vector<float> store_;
     std::size_t off_, n_;
+};
+
+// Same for 16-bit values (bfloat16 weights).
+class BufU16 {
+public:
+    BufU16(std::size_t count, std::size_t offset) : store_(count + offset + 16, 0x7777), off_(offset) {}
+    std::uint16_t* data() { return store_.data() + off_; }
+    const std::uint16_t* data() const { return store_.data() + off_; }
+
+private:
+    std::vector<std::uint16_t> store_;
+    std::size_t off_;
 };
 
 std::size_t g_offset = 0;
@@ -113,6 +127,7 @@ int main(int argc, char** argv) {
         std::string simd;
         auto note = [&](bool differs, const char* name) { if (differs) simd += (simd.empty() ? "" : ",") + std::string(name); };
         note(cur.matvec != ref.matvec, "matvec");
+        note(cur.matvec_bf16 != ref.matvec_bf16, "matvec_bf16");
         note(cur.rmsnorm != ref.rmsnorm, "rmsnorm");
         note(cur.dot != ref.dot, "dot");
         note(cur.axpy != ref.axpy, "axpy");
@@ -143,6 +158,20 @@ int main(int argc, char** argv) {
             Buf out(static_cast<std::size_t>(rows), g_offset);
             k::matvec(out.data(), W.data(), x.data(), rows, cols);
             check_guards(out, "matvec");
+            write_floats(out.values());
+        } else if (op == "matvec_bf16" && argc == 4) {
+            // stdin: W as raw 16-bit bfloat16 values [rows, cols], then x as float32 [cols]
+            const int rows = arg_int(argv, 2, "rows"), cols = arg_int(argv, 3, "cols");
+            if (rows <= 0 || cols <= 0) throw std::runtime_error("rows and cols must be positive");
+            const std::size_t count = static_cast<std::size_t>(rows) * cols;
+            BufU16 W(count, g_offset);
+            if (std::fread(W.data(), sizeof(std::uint16_t), count, stdin) != count) {
+                throw std::runtime_error("expected " + std::to_string(count) + " 16-bit values on stdin");
+            }
+            const Buf x = read_buf(static_cast<std::size_t>(cols));
+            Buf out(static_cast<std::size_t>(rows), g_offset);
+            k::matvec_bf16(out.data(), W.data(), x.data(), rows, cols);
+            check_guards(out, "matvec_bf16");
             write_floats(out.values());
         } else if (op == "rmsnorm" && argc == 3) {
             const int n = arg_int(argv, 2, "n");

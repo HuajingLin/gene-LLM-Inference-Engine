@@ -100,7 +100,7 @@ Config parse_config(const JsonValue& j) {
 
 }  // namespace
 
-Checkpoint Checkpoint::load_hf(const std::string& directory) {
+Checkpoint Checkpoint::load_hf(const std::string& directory, const LoadOptions& options) {
     const fs::path dir(directory);
     const fs::path config_path = dir / "config.json";
     const fs::path weights_path = dir / "model.safetensors";
@@ -132,9 +132,11 @@ Checkpoint Checkpoint::load_hf(const std::string& directory) {
     ck.converted_.reserve(static_cast<std::size_t>(c.n_layers) * 9 + 3);
     ck.tensors_.reserve(static_cast<std::size_t>(c.n_layers) * 9 + 3);
 
-    // Returns a float32 view of the tensor `name`, after checking existence, dtype and shape.
-    // Float32 data is used in place; F16/BF16 data is converted into memory owned by `ck`.
-    auto fetch = [&](const std::string& name, std::vector<std::int64_t> shape) -> const float* {
+    // Returns a view of the tensor `name`, after checking existence, dtype and shape.
+    // Float32 data is used in place. bfloat16 MATRICES (`matrix` = true) are used in place too, as 16-bit
+    // values, when options.keep_bf16 is set and the data is 2-byte aligned. Everything else (F16, bfloat16
+    // norm vectors, misaligned data) is converted into float32 memory owned by `ck`.
+    auto fetch = [&](const std::string& name, std::vector<std::int64_t> shape, bool matrix) -> Mat {
         const SafetensorsEntry* e = st.find(name);
         if (!e) fail("tensor '" + name + "' not found in model.safetensors");
         if (e->shape != shape) {
@@ -146,44 +148,50 @@ Checkpoint Checkpoint::load_hf(const std::string& directory) {
 
         const std::size_t numel = e->numel();
         const unsigned char* raw = st.data(*e);
-        const float* ptr = nullptr;
+        TensorView tv;
         if (e->dtype == DType::F32 && reinterpret_cast<std::uintptr_t>(raw) % alignof(float) == 0) {
-            ptr = reinterpret_cast<const float*>(raw);  // zero-copy
+            tv.data = reinterpret_cast<const float*>(raw);  // zero-copy
+        } else if (e->dtype == DType::BF16 && matrix && options.keep_bf16 &&
+                   reinterpret_cast<std::uintptr_t>(raw) % alignof(std::uint16_t) == 0) {
+            tv.storage = Storage::BF16;
+            tv.bf16 = reinterpret_cast<const std::uint16_t*>(raw);  // zero-copy, widened inside the kernels
         } else {
             ck.converted_.emplace_back(numel);
             convert_to_f32(e->dtype, raw, ck.converted_.back().data(), numel);
-            ptr = ck.converted_.back().data();
+            tv.data = ck.converted_.back().data();
         }
 
-        TensorView tv;
         tv.name = name;
-        tv.data = ptr;
         tv.numel = numel;
         tv.byte_offset = e->begin;
         tv.shape = std::move(shape);
         ck.tensors_.push_back(std::move(tv));
-        return ptr;
+        const TensorView& added = ck.tensors_.back();
+        return added.bf16 ? Mat(added.bf16) : Mat(added.data);
+    };
+    auto vec = [&](const std::string& name, std::vector<std::int64_t> shape) -> const float* {
+        return fetch(name, std::move(shape), false).f32;
     };
 
     Weights& w = ck.w_;
-    w.token_embedding = fetch("model.embed_tokens.weight", {V, D});
+    w.token_embedding = fetch("model.embed_tokens.weight", {V, D}, true);
 
     w.layers.resize(static_cast<std::size_t>(c.n_layers));
     for (int l = 0; l < c.n_layers; ++l) {
         const std::string p = "model.layers." + std::to_string(l) + ".";
         LayerWeights& lw = w.layers[static_cast<std::size_t>(l)];
-        lw.rms_att = fetch(p + "input_layernorm.weight", {D});
-        lw.wq = fetch(p + "self_attn.q_proj.weight", {A, D});
-        lw.wk = fetch(p + "self_attn.k_proj.weight", {KV, D});
-        lw.wv = fetch(p + "self_attn.v_proj.weight", {KV, D});
-        lw.wo = fetch(p + "self_attn.o_proj.weight", {D, A});
-        lw.rms_ffn = fetch(p + "post_attention_layernorm.weight", {D});
-        lw.w1 = fetch(p + "mlp.gate_proj.weight", {H, D});
-        lw.w3 = fetch(p + "mlp.up_proj.weight", {H, D});
-        lw.w2 = fetch(p + "mlp.down_proj.weight", {D, H});
+        lw.rms_att = vec(p + "input_layernorm.weight", {D});
+        lw.wq = fetch(p + "self_attn.q_proj.weight", {A, D}, true);
+        lw.wk = fetch(p + "self_attn.k_proj.weight", {KV, D}, true);
+        lw.wv = fetch(p + "self_attn.v_proj.weight", {KV, D}, true);
+        lw.wo = fetch(p + "self_attn.o_proj.weight", {D, A}, true);
+        lw.rms_ffn = vec(p + "post_attention_layernorm.weight", {D});
+        lw.w1 = fetch(p + "mlp.gate_proj.weight", {H, D}, true);
+        lw.w3 = fetch(p + "mlp.up_proj.weight", {H, D}, true);
+        lw.w2 = fetch(p + "mlp.down_proj.weight", {D, H}, true);
     }
-    w.rms_final = fetch("model.norm.weight", {D});
-    w.wcls = c.shared_classifier ? w.token_embedding : fetch("lm_head.weight", {V, D});
+    w.rms_final = vec("model.norm.weight", {D});
+    w.wcls = c.shared_classifier ? w.token_embedding : fetch("lm_head.weight", {V, D}, true);
 
     return ck;
 }

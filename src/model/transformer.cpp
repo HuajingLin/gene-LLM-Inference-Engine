@@ -15,6 +15,12 @@ namespace {
 
 inline std::size_t sz(int v) { return static_cast<std::size_t>(v); }
 
+// out = W * x for a float32 or bfloat16 weight matrix.
+inline void matvec(float* out, const Mat& W, const float* x, int rows, int cols) {
+    if (W.is_bf16()) kernels::matvec_bf16(out, W.bf16, x, rows, cols);
+    else kernels::matvec(out, W.f32, x, rows, cols);
+}
+
 }  // namespace
 
 Transformer::Transformer(const Checkpoint& checkpoint, int max_seq_len)
@@ -76,7 +82,11 @@ const float* Transformer::forward(int token, int pos, bool compute_logits) {
     float* ao = ao_.data();
 
     // 1. Token embedding: copy one row of the embedding table into the residual stream.
-    std::memcpy(x, w_.token_embedding + sz(token) * sz(dim), sz(dim) * sizeof(float));
+    if (w_.token_embedding.is_bf16()) {
+        kernels::widen_bf16(x, w_.token_embedding.bf16 + sz(token) * sz(dim), dim);
+    } else {
+        std::memcpy(x, w_.token_embedding.f32 + sz(token) * sz(dim), sz(dim) * sizeof(float));
+    }
     if (trace_) trace_("embedding", -1, x, dim);
 
     for (int l = 0; l < cfg_.n_layers; ++l) {
@@ -93,9 +103,9 @@ const float* Transformer::forward(int token, int pos, bool compute_logits) {
         // K and V of the current position are written directly into the cache.
         float* k = layer_keys + sz(pos) * sz(kv_dim);
         float* v = layer_values + sz(pos) * sz(kv_dim);
-        kernels::matvec(q, lw.wq, xb, attn_dim, dim);
-        kernels::matvec(k, lw.wk, xb, kv_dim, dim);
-        kernels::matvec(v, lw.wv, xb, kv_dim, dim);
+        matvec(q, lw.wq, xb, attn_dim, dim);
+        matvec(k, lw.wk, xb, kv_dim, dim);
+        matvec(v, lw.wv, xb, kv_dim, dim);
 
         // Rotary position embedding on q and k (v is not rotated).
         kernels::rope(q, attn_dim, pos, head_size, cfg_.rope_theta, cfg_.rope_style);
@@ -123,17 +133,17 @@ const float* Transformer::forward(int token, int pos, bool compute_logits) {
         }
 
         // Output projection, then add to the residual stream.
-        kernels::matvec(xb2, lw.wo, ao, dim, attn_dim);
+        matvec(xb2, lw.wo, ao, dim, attn_dim);
         kernels::add(x, xb2, dim);
         if (trace_) trace_("attn_out", l, x, dim);
 
         // ---------------- feed-forward block (SwiGLU) ----------------
         kernels::rmsnorm(xb, x, lw.rms_ffn, dim, eps);
-        kernels::matvec(hb, lw.w1, xb, hidden, dim);   // gate
-        kernels::matvec(hb2, lw.w3, xb, hidden, dim);  // up
+        matvec(hb, lw.w1, xb, hidden, dim);   // gate
+        matvec(hb2, lw.w3, xb, hidden, dim);  // up
         kernels::silu(hb, hidden);
         kernels::mul(hb, hb2, hidden);
-        kernels::matvec(xb, lw.w2, hb, dim, hidden);   // down
+        matvec(xb, lw.w2, hb, dim, hidden);   // down
         kernels::add(x, xb, dim);
         if (trace_) trace_("ffn_out", l, x, dim);
     }
@@ -142,7 +152,7 @@ const float* Transformer::forward(int token, int pos, bool compute_logits) {
     if (!compute_logits) return nullptr;
     kernels::rmsnorm(x, x, w_.rms_final, dim, eps);
     if (trace_) trace_("final_norm", -1, x, dim);
-    kernels::matvec(logits_.data(), w_.wcls, x, cfg_.vocab_size, dim);
+    matvec(logits_.data(), w_.wcls, x, cfg_.vocab_size, dim);
 
     return logits_.data();
 }

@@ -7,6 +7,7 @@
 
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
 
 #include "kernels/kernel_table.h"
 
@@ -81,6 +82,83 @@ void matvec_avx512(float* out, const float* W, const float* x, int rows, int col
     for (; r < rows; ++r) out[r] = dot_avx512(W + static_cast<std::size_t>(r) * stride, x, cols);
 }
 
+// ---- bfloat16 weights: widen on the fly; same structure and addition order as the float32 kernels ----
+inline __m512 load_bf16x16(const std::uint16_t* p) {
+    return _mm512_castsi512_ps(
+        _mm512_slli_epi32(_mm512_cvtepu16_epi32(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(p))), 16));
+}
+
+// The last 1..15 values: byte-granular masked loads would need AVX512BW, so copy them into a zero-padded
+// buffer first (once per row; negligible next to streaming the row).
+inline __m512 load_bf16x16_tail(const std::uint16_t* p, int remaining) {
+    alignas(32) std::uint16_t tmp[16] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+    for (int k = 0; k < remaining; ++k) tmp[k] = p[k];
+    return load_bf16x16(tmp);
+}
+
+float dot_bf16_avx512(const std::uint16_t* a, const float* b, int n) {
+    __m512 s0 = _mm512_setzero_ps(), s1 = s0, s2 = s0, s3 = s0;
+    int i = 0;
+    for (; i + 64 <= n; i += 64) {
+        s0 = _mm512_fmadd_ps(load_bf16x16(a + i), _mm512_loadu_ps(b + i), s0);
+        s1 = _mm512_fmadd_ps(load_bf16x16(a + i + 16), _mm512_loadu_ps(b + i + 16), s1);
+        s2 = _mm512_fmadd_ps(load_bf16x16(a + i + 32), _mm512_loadu_ps(b + i + 32), s2);
+        s3 = _mm512_fmadd_ps(load_bf16x16(a + i + 48), _mm512_loadu_ps(b + i + 48), s3);
+    }
+    for (; i + 16 <= n; i += 16) s0 = _mm512_fmadd_ps(load_bf16x16(a + i), _mm512_loadu_ps(b + i), s0);
+    if (i < n) {
+        const __mmask16 m = tail_mask(n - i);
+        s1 = _mm512_fmadd_ps(load_bf16x16_tail(a + i, n - i), _mm512_maskz_loadu_ps(m, b + i), s1);
+    }
+    return _mm512_reduce_add_ps(_mm512_add_ps(_mm512_add_ps(s0, s1), _mm512_add_ps(s2, s3)));
+}
+
+void matvec_bf16_avx512(float* out, const std::uint16_t* W, const float* x, int rows, int cols) {
+    const std::size_t stride = static_cast<std::size_t>(cols);
+    int r = 0;
+    for (; r + 4 <= rows; r += 4) {
+        const std::uint16_t* w0 = W + static_cast<std::size_t>(r) * stride;
+        const std::uint16_t* w1 = w0 + stride;
+        const std::uint16_t* w2 = w1 + stride;
+        const std::uint16_t* w3 = w2 + stride;
+        __m512 a00 = _mm512_setzero_ps(), a01 = a00, a10 = a00, a11 = a00;
+        __m512 a20 = a00, a21 = a00, a30 = a00, a31 = a00;
+        int c = 0;
+        for (; c + 32 <= cols; c += 32) {
+            const __m512 xa = _mm512_loadu_ps(x + c);
+            const __m512 xb = _mm512_loadu_ps(x + c + 16);
+            a00 = _mm512_fmadd_ps(load_bf16x16(w0 + c), xa, a00);
+            a01 = _mm512_fmadd_ps(load_bf16x16(w0 + c + 16), xb, a01);
+            a10 = _mm512_fmadd_ps(load_bf16x16(w1 + c), xa, a10);
+            a11 = _mm512_fmadd_ps(load_bf16x16(w1 + c + 16), xb, a11);
+            a20 = _mm512_fmadd_ps(load_bf16x16(w2 + c), xa, a20);
+            a21 = _mm512_fmadd_ps(load_bf16x16(w2 + c + 16), xb, a21);
+            a30 = _mm512_fmadd_ps(load_bf16x16(w3 + c), xa, a30);
+            a31 = _mm512_fmadd_ps(load_bf16x16(w3 + c + 16), xb, a31);
+        }
+        for (; c + 16 <= cols; c += 16) {
+            const __m512 xa = _mm512_loadu_ps(x + c);
+            a00 = _mm512_fmadd_ps(load_bf16x16(w0 + c), xa, a00);
+            a10 = _mm512_fmadd_ps(load_bf16x16(w1 + c), xa, a10);
+            a20 = _mm512_fmadd_ps(load_bf16x16(w2 + c), xa, a20);
+            a30 = _mm512_fmadd_ps(load_bf16x16(w3 + c), xa, a30);
+        }
+        if (c < cols) {
+            const __mmask16 m = tail_mask(cols - c);
+            const __m512 xa = _mm512_maskz_loadu_ps(m, x + c);
+            a01 = _mm512_fmadd_ps(load_bf16x16_tail(w0 + c, cols - c), xa, a01);
+            a11 = _mm512_fmadd_ps(load_bf16x16_tail(w1 + c, cols - c), xa, a11);
+            a21 = _mm512_fmadd_ps(load_bf16x16_tail(w2 + c, cols - c), xa, a21);
+            a31 = _mm512_fmadd_ps(load_bf16x16_tail(w3 + c, cols - c), xa, a31);
+        }
+        out[r] = _mm512_reduce_add_ps(_mm512_add_ps(a00, a01));
+        out[r + 1] = _mm512_reduce_add_ps(_mm512_add_ps(a10, a11));
+        out[r + 2] = _mm512_reduce_add_ps(_mm512_add_ps(a20, a21));
+        out[r + 3] = _mm512_reduce_add_ps(_mm512_add_ps(a30, a31));
+    }
+    for (; r < rows; ++r) out[r] = dot_bf16_avx512(W + static_cast<std::size_t>(r) * stride, x, cols);
+}
+
 void axpy_avx512(float* y, float alpha, const float* x, int n) {
     const __m512 va = _mm512_set1_ps(alpha);
     int i = 0;
@@ -130,6 +208,7 @@ void rmsnorm_avx512(float* out, const float* x, const float* weight, int n, floa
 
 void fill_avx512(KernelTable& t) {
     t.matvec = matvec_avx512;
+    t.matvec_bf16 = matvec_bf16_avx512;
     t.rmsnorm = rmsnorm_avx512;
     t.dot = dot_avx512;
     t.axpy = axpy_avx512;

@@ -13,6 +13,8 @@
 //   - no function allocates memory or throws; sizes are the caller's responsibility
 #pragma once
 
+#include <cstdint>
+
 #include "common/rope_style.h"
 
 namespace geneinfer {
@@ -31,6 +33,15 @@ bool set_isa(Isa isa);
 // out[r] = sum_c W[r * cols + c] * x[c],  r = 0..rows-1.
 // `out` must not overlap W or x. This is the hot spot of decoding.
 void matvec(float* out, const float* W, const float* x, int rows, int cols);
+
+// Same product with a bfloat16 weight matrix: W holds the upper 16 bits of float32 values, row-major
+// [rows, cols]. Widening to float32 is exact and the summation order is the same as in matvec(), so the result
+// is bit-identical to matvec() on the float32-expanded matrix (for the same instruction set). The weights
+// take half the memory bandwidth, which is what limits decoding.
+void matvec_bf16(float* out, const std::uint16_t* W, const float* x, int rows, int cols);
+
+// dst[i] = float32(src[i]) for bfloat16 values (one embedding-table row, say).
+void widen_bf16(float* dst, const std::uint16_t* src, int n);
 
 // RMSNorm: out[i] = weight[i] * x[i] / sqrt(mean(x^2) + eps).
 // `out` may be the same pointer as `x` (in-place is safe).
