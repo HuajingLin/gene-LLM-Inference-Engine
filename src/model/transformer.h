@@ -116,7 +116,7 @@ private:
 
     int max_batch_ = 64;
     std::vector<float> bx_, bxb_, bxb2_, bhb_, bhb2_, bq_, bao_;   // [max_batch, ...] activations of forward_batch
-    std::vector<float> batt_;                                       // [threads, ctx_len] attention scores
+    std::vector<float> batt_;                                       // [threads, ctx_len] attention scores (decode and batch)
     std::vector<float> rope_cos_, rope_sin_;                        // [rows, head_size / 2], filled on demand
     int rope_rows_ = 0;
 
@@ -135,7 +135,6 @@ private:
     std::vector<float> hb2_;    // [hidden]    FFN up
     std::vector<float> q_;      // [attn_dim]  query
     std::vector<float> ao_;     // [attn_dim]  attention output (all heads concatenated)
-    std::vector<float> att_;    // [n_heads, ctx_len] attention scores of the current token
     std::vector<float> logits_; // [vocab]
 
     // KV cache, layout [layer][position][kv_dim].

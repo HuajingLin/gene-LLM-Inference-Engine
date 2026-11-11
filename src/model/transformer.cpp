@@ -92,7 +92,6 @@ Transformer::Transformer(const Checkpoint& checkpoint, int max_seq_len, int n_th
     hb2_.resize(sz(cfg_.hidden_dim));
     q_.resize(sz(cfg_.attn_dim()));
     ao_.resize(sz(cfg_.attn_dim()));
-    att_.resize(sz(cfg_.n_heads) * sz(ctx_len_));
     logits_.resize(sz(cfg_.vocab_size));
     bx_.resize(sz(max_batch_) * sz(cfg_.dim));
     bxb_.resize(sz(max_batch_) * sz(cfg_.dim));
@@ -164,6 +163,47 @@ int rows_per_tile(const Mat& W, int cols) {
     const std::size_t row_bytes = W.is_q8() ? sz(cols) + 2 * sz(q8_groups(cols)) : sz(cols) * (W.is_bf16() ? 2 : 4);
     long rows = static_cast<long>(32768 / row_bytes) / 4 * 4;
     return rows < 4 ? 4 : static_cast<int>(rows);
+}
+
+}  // namespace
+
+namespace {
+
+// Attention for m consecutive tokens (positions p0 .. p0+m-1) over the KV cache of one layer. The work items are
+// (token, head) pairs dealt out round-robin to the threads (later tokens cost more); every item uses its thread's
+// own score row. A single-token decode step is the case m == 1. Each item runs the same operations in the same
+// order whatever the thread count, so the output does not depend on it.
+struct AttCtx {
+    const float* q;
+    float* ao;
+    const float* keys;
+    const float* values;
+    float* scratch;   // [threads, ctx_len]
+    int m, p0, n_heads, head_size, kv_mul, attn_dim, kv_dim, ctx_len;
+    float inv_scale;
+};
+
+void attention_body(void* p, int t, int nt) {
+    const AttCtx& c = *static_cast<const AttCtx*>(p);
+    float* scores = c.scratch + sz(t) * sz(c.ctx_len);
+    const int items = c.m * c.n_heads;
+    for (int item = t; item < items; item += nt) {
+        const int i = item / c.n_heads, h = item % c.n_heads;
+        const int pos = c.p0 + i;
+        const float* qh = c.q + sz(i) * sz(c.attn_dim) + sz(h) * sz(c.head_size);
+        const int kv_head = h / c.kv_mul;   // GQA: kv_mul query heads share one KV head
+        for (int tt = 0; tt <= pos; ++tt) {
+            const float* kt = c.keys + sz(tt) * sz(c.kv_dim) + sz(kv_head) * sz(c.head_size);
+            scores[tt] = kernels::dot(qh, kt, c.head_size) * c.inv_scale;
+        }
+        kernels::softmax(scores, pos + 1);
+        float* out = c.ao + sz(i) * sz(c.attn_dim) + sz(h) * sz(c.head_size);
+        std::fill(out, out + c.head_size, 0.0f);
+        for (int tt = 0; tt <= pos; ++tt) {
+            const float* vt = c.values + sz(tt) * sz(c.kv_dim) + sz(kv_head) * sz(c.head_size);
+            kernels::axpy(out, scores[tt], vt, c.head_size);
+        }
+    }
 }
 
 }  // namespace
@@ -289,39 +329,9 @@ void Transformer::batch_chunk(const int* tokens, int m, int p0, bool want_logits
 
         // Attention: item = (token, head). Token i sees positions 0 .. p0+i (the chunk's own K/V are all in the
         // cache already). Items are dealt out round-robin because later tokens cost more.
-        struct AttCtx {
-            const float* q;
-            float* ao;
-            const float* keys;
-            const float* values;
-            float* scratch;
-            int m, p0, n_heads, head_size, kv_mul, attn_dim, kv_dim, ctx_len;
-            float inv_scale;
-        } ac{Q, AO, layer_keys, layer_values, batt_.data(), m, p0, n_heads, head_size, kv_mul, attn_dim, kv_dim, ctx_len_, inv_scale};
-        auto attention = [](void* p, int t, int nt) {
-            const AttCtx& c = *static_cast<const AttCtx*>(p);
-            float* scores = c.scratch + sz(t) * sz(c.ctx_len);
-            const int items = c.m * c.n_heads;
-            for (int item = t; item < items; item += nt) {
-                const int i = item / c.n_heads, h = item % c.n_heads;
-                const int pos = c.p0 + i;
-                const float* qh = c.q + sz(i) * sz(c.attn_dim) + sz(h) * sz(c.head_size);
-                const int kv_head = h / c.kv_mul;
-                for (int tt = 0; tt <= pos; ++tt) {
-                    const float* kt = c.keys + sz(tt) * sz(c.kv_dim) + sz(kv_head) * sz(c.head_size);
-                    scores[tt] = kernels::dot(qh, kt, c.head_size) * c.inv_scale;
-                }
-                kernels::softmax(scores, pos + 1);
-                float* out = c.ao + sz(i) * sz(c.attn_dim) + sz(h) * sz(c.head_size);
-                std::fill(out, out + c.head_size, 0.0f);
-                for (int tt = 0; tt <= pos; ++tt) {
-                    const float* vt = c.values + sz(tt) * sz(c.kv_dim) + sz(kv_head) * sz(c.head_size);
-                    kernels::axpy(out, scores[tt], vt, c.head_size);
-                }
-            }
-        };
-        if (pool_) pool_->run(attention, &ac);
-        else attention(&ac, 0, 1);
+        const AttCtx ac{Q, AO, layer_keys, layer_values, batt_.data(), m, p0, n_heads, head_size, kv_mul, attn_dim, kv_dim, ctx_len_, inv_scale};
+        if (pool_) pool_->run(attention_body, const_cast<AttCtx*>(&ac));
+        else attention_body(const_cast<AttCtx*>(&ac), 0, 1);
         lap(profile_, ForwardProfile::Attention);
 
         const MatmulJob oproj = {XB2, lw.wo, AO, dim, attn_dim, sz(dim), sz(attn_dim)};
@@ -361,7 +371,7 @@ std::size_t Transformer::kv_cache_bytes() const {
 }
 
 std::size_t Transformer::scratch_bytes() const {
-    return (x_.size() + xb_.size() + xb2_.size() + hb_.size() + hb2_.size() + q_.size() + ao_.size() + att_.size() +
+    return (x_.size() + xb_.size() + xb2_.size() + hb_.size() + hb2_.size() + q_.size() + ao_.size() +
             logits_.size() + bx_.size() + bxb_.size() + bxb2_.size() + bhb_.size() + bhb2_.size() + bq_.size() +
             bao_.size() + batt_.size() + rope_cos_.size() + rope_sin_.size()) * sizeof(float);
 }
@@ -433,25 +443,15 @@ const float* Transformer::forward(int token, int pos, bool compute_logits) {
         kernels::rope_apply(k, kv_dim, rope_c, rope_s, head_size, cfg_.rope_style);
         lap(profile_, ForwardProfile::Rope);
 
-        // Each query head attends over all positions 0..pos of its (shared) KV head.
-        for (int h = 0; h < cfg_.n_heads; ++h) {
-            const float* qh = q + sz(h) * sz(head_size);
-            float* scores = att_.data() + sz(h) * sz(ctx_len_);
-            const int kv_head = h / kv_mul;  // GQA: kv_mul query heads share one KV head
-
-            for (int t = 0; t <= pos; ++t) {
-                const float* kt = layer_keys + sz(t) * sz(kv_dim) + sz(kv_head) * sz(head_size);
-                scores[t] = kernels::dot(qh, kt, head_size) * inv_scale;
-            }
-            kernels::softmax(scores, pos + 1);
-
-            // Weighted sum of the value vectors; the head's output goes into ao.
-            float* out = ao + sz(h) * sz(head_size);
-            std::fill(out, out + head_size, 0.0f);
-            for (int t = 0; t <= pos; ++t) {
-                const float* vt = layer_values + sz(t) * sz(kv_dim) + sz(kv_head) * sz(head_size);
-                kernels::axpy(out, scores[t], vt, head_size);
-            }
+        // Each query head attends over all positions 0..pos of its (shared) KV head; the heads are spread over
+        // the threads when there is enough work to pay for waking them.
+        {
+            const AttCtx ac{q, ao, layer_keys, layer_values, batt_.data(), 1, pos, cfg_.n_heads, head_size, kv_mul,
+                            attn_dim, kv_dim, ctx_len_, inv_scale};
+            const int nt = pool_ ? pool_->size() : 1;
+            const long work = static_cast<long>(cfg_.n_heads) * (pos + 1) * head_size * 2;   // multiply-adds
+            if (pool_ && work >= par_min_weights_ * nt) pool_->run(attention_body, const_cast<AttCtx*>(&ac));
+            else attention_body(const_cast<AttCtx*>(&ac), 0, 1);
         }
 
         lap(profile_, ForwardProfile::Attention);

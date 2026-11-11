@@ -89,10 +89,10 @@ def main() -> int:
 
         # ---- 2. memory formulas ------------------------------------------------------------
         kv = c.n_layers * ctx * c.kv_dim * 2 * 4
-        # x, xb, xb2 | q and the attention output | FFN gate and up | attention scores | logits
-        scratch = (3 * c.dim + 2 * c.attn_dim + 2 * c.hidden_dim + c.n_heads * ctx + c.vocab_size) * 4
-        # prompt batch (64 tokens by default): three dim, two hidden and two attention buffers, one score row per
-        # thread (one thread here), and the RoPE cos/sin tables of the positions visited (head_size/2 pairs each)
+        # x, xb, xb2 | q and the attention output | FFN gate and up | logits
+        scratch = (3 * c.dim + 2 * c.attn_dim + 2 * c.hidden_dim + c.vocab_size) * 4
+        # prompt batch (64 tokens by default): three dim, two hidden and two attention buffers, one attention score row per
+        # thread (one thread here; used by decode too), and the RoPE cos/sin tables of the positions visited (head_size/2 pairs each)
         batch = 64 * (3 * c.dim + 2 * c.hidden_dim + 2 * c.attn_dim) * 4 + ctx * 4
         rope_rows = n_prompt + n_decode
         scratch += batch + rope_rows * (c.attn_dim // c.n_heads) * 4

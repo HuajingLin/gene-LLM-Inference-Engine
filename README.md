@@ -61,8 +61,8 @@ per token  median 8.772 ms, so the sensitive-layer fix costs nothing in speed.
 
 ### Stage 3f: Batched prefill 
 ```diff
-Threads	Token-by-token	Batched	     Speedup
-1	     94.5 tok/s	155.3 tok/s	1.64x
+Threads	Token-by-token	     Batched	     Speedup
+1	     94.5 tok/s	     155.3 tok/s	1.64x
 2	     116.4 tok/s	270.8 tok/s	2.3x
 3	     140.5 tok/s	312.1 tok/s	2.2x
 4	     120.7 tok/s	333.9 tok/s	2.8x
