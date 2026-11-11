@@ -13,6 +13,7 @@
 //   gi_kernel_check matvec_q8 <rows> <cols>     stdin: W (int8), scales (bfloat16 bits, per 64 values of a row), x (float32)
 //   gi_kernel_check isa                            -> text: "active=<isa> supported=<list>"
 //   gi_kernel_check rope    <n> <pos> <head_size> [theta] [interleaved|half_split]
+//   gi_kernel_check rope_cached ...             same arguments; rotates through a precomputed cos/sin row
 //                                                  stdin: v[n]                        -> out[n]
 //
 // All data is raw little-endian float32. The instruction set follows the environment variable GI_ISA
@@ -248,7 +249,7 @@ int main(int argc, char** argv) {
             else k::add(a.data(), b.data(), n);
             check_guards(a, "mul/add");
             write_floats(a.values());
-        } else if (op == "rope" && argc >= 5 && argc <= 7) {
+        } else if ((op == "rope" || op == "rope_cached") && argc >= 5 && argc <= 7) {
             const int n = arg_int(argv, 2, "n"), pos = arg_int(argv, 3, "pos");
             const int head_size = arg_int(argv, 4, "head_size");
             float theta = 10000.0f;
@@ -267,7 +268,13 @@ int main(int argc, char** argv) {
                 throw std::runtime_error("rope needs n > 0, pos >= 0, even head_size dividing n");
             }
             auto v = read_floats(static_cast<std::size_t>(n));
-            k::rope(v.data(), n, pos, head_size, theta, style);
+            if (op == "rope") {
+                k::rope(v.data(), n, pos, head_size, theta, style);
+            } else {   // the same rotation through a precomputed cos/sin row
+                std::vector<float> c(static_cast<std::size_t>(head_size / 2)), s(c.size());
+                k::rope_table_row(c.data(), s.data(), pos, head_size, theta);
+                k::rope_apply(v.data(), n, c.data(), s.data(), head_size, style);
+            }
             write_floats(v);
         } else {
             return usage();

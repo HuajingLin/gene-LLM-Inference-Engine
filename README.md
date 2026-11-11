@@ -5,7 +5,7 @@ Lightweight LLM Inference Engine
 # Models used
 + Stage 1: stories15M
 + Stage 2: SmolLM2-135M
-- Stage 3a ~ 3e: SmolLM2-135M
+- Stage 3a ~ 3f: SmolLM2-135M
 ```
 
 ## run
@@ -22,6 +22,7 @@ cmake --build build --config Release
 - Stage 3c: Multithreading 
 - Stage 3d: int8 quantization
 - Stage 3e: GI_Q8_SKIP
+- Stage 3f: Batched prefill 
 
 ### Stage 3a: SIMD matvec
 ```diff
@@ -58,7 +59,14 @@ Accuracy is worse than I’d like. Mean KL is 1.2e-2 and the logit error is 3.4%
 ### Stage 3e: GI_Q8_SKIP
 per token  median 8.772 ms, so the sensitive-layer fix costs nothing in speed.
 
-
+### Stage 3f: Batched prefill 
+```diff
+Threads	Token-by-token	Batched	     Speedup
+1	     94.5 tok/s	155.3 tok/s	1.64x
+2	     116.4 tok/s	270.8 tok/s	2.3x
+3	     140.5 tok/s	312.1 tok/s	2.2x
+4	     120.7 tok/s	333.9 tok/s	2.8x
+```
 ## Project Structure
 ```
 geneInfer/
@@ -151,7 +159,8 @@ geneInfer/
 │    ├── verify_generate_hf.py  # M10
 │    ├── verify_threads.py      # stage 3c
 │    ├── verify_quantize.py     # stage 3d
-│    └── quant_accuracy.py      # stage 3d
+│    ├── quant_accuracy.py      # stage 3d
+│    └── verify_batch.py        # stage 3f
 │
 └── bench/
      ├── bench_main.cpp         # M6: gi_bench

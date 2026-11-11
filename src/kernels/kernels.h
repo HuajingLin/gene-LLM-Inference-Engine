@@ -84,5 +84,12 @@ void add(float* a, const float* b, int n);
 void rope(float* v, int n, int pos, int head_size, float theta = 10000.0f,
           RopeStyle style = RopeStyle::Interleaved);
 
+// rope() in two steps, so that the trigonometry can be done once per position instead of once per head, layer
+// and call. rope_table_row() computes cos and sin of the head_size/2 rotation angles of position `pos`;
+// rope_apply() rotates v with them. rope_apply(rope_table_row(pos)) gives exactly the bits of rope(pos).
+void rope_table_row(float* cos_out, float* sin_out, int pos, int head_size, float theta = 10000.0f);
+void rope_apply(float* v, int n, const float* cos_row, const float* sin_row, int head_size,
+                RopeStyle style = RopeStyle::Interleaved);
+
 }  // namespace kernels
 }  // namespace geneinfer

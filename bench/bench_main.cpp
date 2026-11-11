@@ -9,6 +9,7 @@
 //   --max-seq-len N     cap the context length / KV cache (default: the model's)
 //   --warmup N          unmeasured runs first, to fault in the memory-mapped weights (default 1)
 //   --weights KIND      weight storage: native (default), f32 or int8 (same as the GI_WEIGHTS environment variable)
+//   --sequential-prefill  process the prompt token by token instead of in one batch (for comparison)
 //   --threads N         threads sharing the matrix products (default: GI_THREADS or 1)
 //   --isa NAME          force the instruction set of the kernels: scalar, avx2 or avx512 (default: the best one)
 //   --profile           after the timed runs, one more decode pass reports where the time of a token goes
@@ -19,7 +20,7 @@
 // run does exactly the same work. Prompt + decode positions are clamped to the context length.
 //
 // What is measured:
-//   prefill  = forward passes over the prompt (logits only for the last position)
+//   prefill  = the prompt, processed as one batch (forward_batch; logits only for the last position)
 //   decode   = forward pass + greedy sampling per generated token, timed individually
 //   memory   = size of the weights file, KV cache, scratch buffers, resident set size
 //
@@ -51,7 +52,7 @@ namespace {
     std::fprintf(stderr, "error: %s\n", msg.c_str());
     std::fprintf(stderr,
                  "usage: gi_bench --model M [--prompt-tokens N] [--decode-tokens N] [--runs N]\n"
-                 "                [--warmup N] [--max-seq-len N] [--isa NAME] [--threads N] [--weights KIND] [--profile] [--label TEXT] [--json FILE]\n");
+                 "                [--warmup N] [--max-seq-len N] [--isa NAME] [--threads N] [--weights KIND] [--sequential-prefill] [--profile] [--label TEXT] [--json FILE]\n");
     std::exit(2);
 }
 
@@ -98,6 +99,7 @@ std::string compiler_string() {
 int main(int argc, char** argv) {
     std::string model_path, label, json_path, isa_name_arg;
     bool profile = false;
+    bool sequential_prefill = false;
     int prompt_tokens = 32, decode_tokens = 128, runs = 5, warmup = 1, max_seq_len = 0, n_threads = 0;
     std::string weights_arg;
 
@@ -108,6 +110,7 @@ int main(int argc, char** argv) {
             return argv[++i];
         };
         if (flag == "--model") model_path = value();
+        else if (flag == "--sequential-prefill") sequential_prefill = true;
         else if (flag == "--prompt-tokens") prompt_tokens = static_cast<int>(parse_int(flag, value()));
         else if (flag == "--decode-tokens") decode_tokens = static_cast<int>(parse_int(flag, value()));
         else if (flag == "--runs") runs = static_cast<int>(parse_int(flag, value()));
@@ -171,8 +174,12 @@ int main(int argc, char** argv) {
             // ---- prefill ----
             const auto t0 = Clock::now();
             const float* logits = nullptr;
-            for (int pos = 0; pos < n_prompt; ++pos) {
-                logits = model.forward(prompt[static_cast<std::size_t>(pos)], pos, pos == n_prompt - 1);
+            if (sequential_prefill) {
+                for (int pos = 0; pos < n_prompt; ++pos) {
+                    logits = model.forward(prompt[static_cast<std::size_t>(pos)], pos, pos == n_prompt - 1);
+                }
+            } else {
+                logits = model.forward_batch(prompt.data(), n_prompt, 0, true);
             }
             int token = sampler.sample(logits);
             const double prefill_ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
@@ -206,9 +213,7 @@ int main(int argc, char** argv) {
         // ---- optional profile: one more decode pass with the section timers attached ----
         ForwardProfile prof;
         if (profile) {
-            for (int pos = 0; pos < n_prompt; ++pos) {
-                model.forward(prompt[static_cast<std::size_t>(pos)], pos, pos == n_prompt - 1);
-            }
+            model.forward_batch(prompt.data(), n_prompt, 0, true);
             model.set_profile(&prof);
             int token = 1;
             for (int step = 0; step < n_decode; ++step) {

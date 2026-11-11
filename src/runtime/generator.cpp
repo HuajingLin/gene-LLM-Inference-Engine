@@ -27,6 +27,18 @@ GenerateResult generate(Transformer& model, const TextTokenizer& tokenizer, Samp
 
     int token = prompt_tokens[0];
     int pos = 0;
+
+    // Prompt processing in one batch: every prompt position except the last needs no logits, so all of them can
+    // go through forward_batch() together (same results as one by one, faster). The last prompt position, which
+    // yields the first sampled token, is handled by the loop below like any later position.
+    const int batched = std::min(n_prompt - 1, steps);
+    if (batched > 0) {
+        const auto start = Clock::now();
+        model.forward_batch(prompt_tokens.data(), batched, 0, false);
+        result.prefill_ms += std::chrono::duration<double, std::milli>(Clock::now() - start).count();
+        pos = batched;
+        token = prompt_tokens[static_cast<std::size_t>(pos)];
+    }
     while (pos < steps) {
         const auto start = Clock::now();
 

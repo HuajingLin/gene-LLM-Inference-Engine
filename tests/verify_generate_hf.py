@@ -41,7 +41,7 @@ from ref import Model  # noqa: E402
 from verify_sampler import oracle_sample, py_uniforms  # noqa: E402
 
 MAKE = HERE.parent / "tools" / "make_dummy_hf.py"
-PROMPTS = ["Once upon a time", "hello 12 world", "café 日本  x", "<|im_start|>user\nHi<|im_end|>", "  "]
+PROMPTS = ["Once upon a time", "hello 12 world", "caf\u00e9 \u65e5\u672c  x", "<|im_start|>user\nHi<|im_end|>", "  "]
 
 
 def make_model(out: Path, *flags) -> None:

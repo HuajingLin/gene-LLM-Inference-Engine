@@ -139,20 +139,25 @@ void add_scalar(float* a, const float* b, int n) {
 
 }  // namespace
 
-void rope(float* v, int n, int pos, int head_size, float theta, RopeStyle style) {
+void rope_table_row(float* cos_out, float* sin_out, int pos, int head_size, float theta) {
+    assert(head_size > 0 && head_size % 2 == 0);
+    const int half = head_size / 2;
+    for (int k = 0; k < half; ++k) {
+        // Angles are computed in double precision: for large `pos` a float angle would lose several digits.
+        const double freq = 1.0 / std::pow(static_cast<double>(theta), 2.0 * static_cast<double>(k) / head_size);
+        const double angle = static_cast<double>(pos) * freq;
+        cos_out[k] = static_cast<float>(std::cos(angle));
+        sin_out[k] = static_cast<float>(std::sin(angle));
+    }
+}
+
+void rope_apply(float* v, int n, const float* cos_row, const float* sin_row, int head_size, RopeStyle style) {
     assert(head_size > 0 && head_size % 2 == 0 && n % head_size == 0);
     const int half = head_size / 2;
     for (int base = 0; base < n; base += head_size) {
         for (int k = 0; k < half; ++k) {
-            // Angles are computed in double precision: for large `pos` a float angle
-            // would lose several digits. (A precomputed cos/sin table will replace
-            // this later; the pow/cos/sin calls per element are deliberately simple.)
-            const double freq = 1.0 / std::pow(static_cast<double>(theta),
-                                               2.0 * static_cast<double>(k) / head_size);
-            const double angle = static_cast<double>(pos) * freq;
-            const float c = static_cast<float>(std::cos(angle));
-            const float s = static_cast<float>(std::sin(angle));
-
+            const float c = cos_row[k];
+            const float s = sin_row[k];
             float* a = (style == RopeStyle::Interleaved) ? v + base + 2 * k : v + base + k;
             float* b = (style == RopeStyle::Interleaved) ? a + 1 : v + base + k + half;
             const float a0 = *a;
@@ -161,6 +166,15 @@ void rope(float* v, int n, int pos, int head_size, float theta, RopeStyle style)
             *b = a0 * s + b0 * c;
         }
     }
+}
+
+void rope(float* v, int n, int pos, int head_size, float theta, RopeStyle style) {
+    assert(head_size > 0 && head_size % 2 == 0 && n % head_size == 0);
+    constexpr int kMaxHalf = 1024;                     // head_size up to 2048
+    assert(head_size / 2 <= kMaxHalf);
+    float c[kMaxHalf], s[kMaxHalf];
+    rope_table_row(c, s, pos, head_size, theta);
+    rope_apply(v, n, c, s, head_size, style);
 }
 
 

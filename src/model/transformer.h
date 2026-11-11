@@ -55,9 +55,14 @@ public:
     // `n_threads` is the number of threads that share the weight-matrix products (the calling thread counts):
     // 1 = no extra threads, 0 = use the environment variable GI_THREADS (default 1). The results do not depend
     // on the number of threads: every output element is computed by the same instructions in the same order.
-    explicit Transformer(const Checkpoint& checkpoint, int max_seq_len = 0, int n_threads = 0);
+    //
+    // `max_batch` is the most tokens forward_batch() processes together (longer inputs are cut into pieces of
+    // this size): 0 = the environment variable GI_BATCH (default 64). It only sets the size of the activation
+    // buffers and of the cache-sized tiles; results do not depend on it.
+    explicit Transformer(const Checkpoint& checkpoint, int max_seq_len = 0, int n_threads = 0, int max_batch = 0);
     ~Transformer();
     int threads() const;
+    int max_batch() const { return max_batch_; }
 
     // Processes `token` at position `pos` and returns the logits (vocab_size floats) that
     // predict the next token. The returned pointer stays valid until the next forward() call.
@@ -67,6 +72,16 @@ public:
     // compute_logits = false for those: the final norm and the (large) classifier matrix
     // product are skipped and nullptr is returned. The KV cache is updated either way.
     const float* forward(int token, int pos, bool compute_logits = true);
+
+    // Processes n tokens at the consecutive positions pos0 .. pos0+n-1 in one go (prompt processing, "prefill")
+    // and returns the logits of the LAST token if compute_logits is true, otherwise nullptr. The KV cache ends up
+    // exactly as if forward() had been called for each token, and so does everything computed from it: the
+    // result is BIT-IDENTICAL to the token-by-token calls. It is faster because the weights are read from memory
+    // once per tile of rows and then reused from cache for all n tokens, instead of once per token; decoding is
+    // limited by memory bandwidth, prefill with batching by arithmetic.
+    // pos0 may be > 0 when earlier positions are already in the cache. While a trace callback is set, the tokens
+    // are processed one by one so that the trace sees every token (same results, no speedup).
+    const float* forward_batch(const int* tokens, int n, int pos0, bool compute_logits = true);
 
     const Config& config() const { return cfg_; }
     int max_seq_len() const { return ctx_len_; }
@@ -86,6 +101,24 @@ private:
         int rows, cols;
     };
     void run_matvecs(const MatvecJob* jobs, int n);
+
+    // out[t * out_stride ..] = W * x[t * x_stride ..] for t = 0 .. ntok-1 (several tokens at once, see forward_batch).
+    struct MatmulJob {
+        float* out;
+        Mat W;
+        const float* x;
+        int rows, cols;
+        std::size_t out_stride, x_stride;
+    };
+    void run_matmuls(const MatmulJob* jobs, int n, int ntok);
+    void batch_chunk(const int* tokens, int m, int pos0, bool compute_logits);
+    void ensure_rope(int pos);   // cos/sin rows for positions 0..pos
+
+    int max_batch_ = 64;
+    std::vector<float> bx_, bxb_, bxb2_, bhb_, bhb2_, bq_, bao_;   // [max_batch, ...] activations of forward_batch
+    std::vector<float> batt_;                                       // [threads, ctx_len] attention scores
+    std::vector<float> rope_cos_, rope_sin_;                        // [rows, head_size / 2], filled on demand
+    int rope_rows_ = 0;
 
     std::unique_ptr<ThreadPool> pool_;      // null when running on one thread
     long par_min_weights_ = 32768;          // a product with fewer weights per thread is not split

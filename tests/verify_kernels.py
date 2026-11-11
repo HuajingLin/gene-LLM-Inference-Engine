@@ -226,6 +226,15 @@ def suite(exe: str, seed: int):
                 record("rope", f"{style} theta={theta:g} n={n} head={hs} pos={pos}",
                        err(run(exe, ["rope", n, pos, hs, repr(theta), style], v),
                            apply_rope(v.copy(), pos, hs, theta, style)))
+    # rope through a precomputed cos/sin row must give EXACTLY the bits of rope()
+    for style in ("interleaved", "half_split"):
+        for theta in (10000.0, 500000.0):
+            for n, hs, pos in ((8, 4, 0), (64, 8, 17), (576, 64, 100), (576, 64, 8191), (128, 128, 2047), (96, 48, 31999)):
+                v = rng.standard_normal(n).astype(np.float32)
+                direct = run(exe, ["rope", n, pos, hs, repr(theta), style], v)
+                cached = run(exe, ["rope_cached", n, pos, hs, repr(theta), style], v)
+                if direct.tobytes() != cached.tobytes():
+                    failures.append(f"rope_cached differs from rope ({style} theta={theta:g} n={n} head={hs} pos={pos})")
     # The half_split style written exactly the way Hugging Face's Llama code states it (cos/sin duplicated
     # over both halves, q * cos + rotate_half(q) * sin), in float64: an independent formulation of the
     # semantics, not a copy of the implementation under test.
