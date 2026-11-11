@@ -28,7 +28,7 @@ void write_bytes(const fs::path& path, const void* data, std::size_t bytes) {
 }
 
 void dump(const fs::path& dir, const std::string& name, const Mat& m, int rows, int cols) {
-    if (!m.is_q8()) throw std::runtime_error(name + " is not quantized");
+    if (!m.is_q8()) return;   // kept in its original format (GI_Q8_SKIP)
     write_bytes(dir / (name + ".q"), m.q8, static_cast<std::size_t>(rows) * static_cast<std::size_t>(cols));
     write_bytes(dir / (name + ".s"), m.q8_scale,
                 static_cast<std::size_t>(rows) * static_cast<std::size_t>(q8_groups(cols)) * sizeof(std::uint16_t));

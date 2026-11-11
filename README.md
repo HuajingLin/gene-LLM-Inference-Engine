@@ -5,28 +5,24 @@ Lightweight LLM Inference Engine
 # Models used
 + Stage 1: stories15M
 + Stage 2: SmolLM2-135M
-+ Stage 3a: SmolLM2-135M
-+ Stage 3b: SmolLM2-135M
-+ Stage 3c: SmolLM2-135M
-- Stage 3d: SmolLM2-135M
+- Stage 3a ~ 3d: SmolLM2-135M
 ```
 
 ## run
 ```diff
 cmake -S . -B build
 cmake --build build --config Release
-
-# End-to-end performance testing (one run for each of the three instruction sets) model Transformer, Sampler
-$ for isa in scalar avx2 avx512; do ./build/gi_bench --model models/SmolLM2-135M --isa $isa --label $isa; done
 ```
 
 ## Main Stages
-### Stage 1: M1 ~ M6   
-### Stage 2: M7 ~ M10   
-### Stage 3a: Performance Optimization: SIMD matvec   
-### Stage 3b: Weights are stored in bf16 format  
-### Stage 3c: Multithreading 
-### Stage 3d: int8 quantization
+- Stage 1: M1 ~ M6   
+- Stage 2: M7 ~ M10   
+- Stage 3a: Performance Optimization, SIMD matvec   
+- Stage 3b: Weights are stored in bf16 format  
+- Stage 3c: Multithreading 
+- Stage 3d: int8 quantization
+
+### Stage 3a: SIMD matvec
 ```diff
                         scalar      avx2        avx512
 decode                  7.6 tok/s   23.4 tok/s  23.0 tok/s
@@ -55,7 +51,7 @@ All the checks pass, and the speedup is real: decode went from 37.7 to 23.1 ms p
 ```
 ### Stage 3d: int8 quantization
 Speed: int8 gives 9.4–9.7 ms/token with 2–3 threads, about 105 tok/s. That is 1.75x faster than the best bf16 run (16.4 ms). The kernels and the thread bit-identity check passed.   
-Accuracy is worse than I’d like. Mean KL is 1.2e-2 and the logit error is 3.4%. 
+Accuracy is worse than I’d like. Mean KL is 1.2e-2 and the logit error is 3.4%.    
 [Project Wiki](https://github.com/HuajingLin/gene-LLM-Inference-Engine/wiki/Stage-3d)
 
 
@@ -132,7 +128,8 @@ geneInfer/
 │   ├── gen_unicode_tables.py       # M9
 │   ├── hf_tokenizer_probe.p        # M9
 │   ├── pool_check_main.cpp         # stage 3c
-│   └── quant_dump_main.cpp         # stage 3d
+│   ├── quant_dump_main.cpp         # stage 3d
+│   └── quant_stats.py              # stage 3e
 │
 ├── tests/
 │    ├── verify_loader.py       # M1: Verification: C++ Output vs. NumPy Element-wise Comparison

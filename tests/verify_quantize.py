@@ -101,6 +101,29 @@ def matrices(model_dir: Path):
     return out
 
 
+def expected_quantized(skip: str, n_layers: int) -> set[str]:
+    """names of the matrices that GI_Q8_SKIP=skip leaves quantized (independent of the C++ parser)"""
+    roles = {"wq", "wk", "wv", "wo", "w1", "w2", "w3", "wcls"}
+    kept_roles, first, last, kept_at = set(), 0, 0, set()
+    for tok in [t for t in skip.split(",") if t]:
+        if "@" in tok:
+            r, l = tok.split("@")
+            kept_at.add(f"layer{int(l)}_{r}")
+        elif tok in roles: kept_roles.add(tok)
+        elif tok.startswith("first"): first = int(tok[5:])
+        elif tok.startswith("last"): last = int(tok[4:])
+    out = set()
+    for l in range(n_layers):
+        if l < first or l >= n_layers - last:
+            continue
+        for r in ("wq", "wk", "wv", "wo", "w1", "w2", "w3"):
+            if r not in kept_roles and f"layer{l}_{r}" not in kept_at:
+                out.add(f"layer{l}_{r}")
+    if "wcls" not in kept_roles:
+        out.add("wcls")
+    return out
+
+
 def dump(exe_dir: Path, model_dir: Path, out: Path, env=None):
     p = run([str(exe_dir / "gi_quant_dump"), str(model_dir), str(out)], env)
     return p
@@ -215,65 +238,83 @@ def main() -> int:
                 failures.append(f"a model with an infinite weight was accepted for int8 (rc={p.returncode})")
             print("non-finite rejection done")
 
-        # 3. whole model against the dequantized float32 model
+        # 3. whole model against the dequantized float32 model, for several GI_Q8_SKIP settings (matrices that
+        #    stay in their original format; those are NOT replaced in the float32 reference)
         seq = [1, 5, 9, 2, 40, 7, 3, 11, 0, 6]
         for label, d in models.items():
-            with tempfile.TemporaryDirectory() as dd:
-                p = dump(b, d, Path(dd))
-                if p.returncode != 0:
-                    continue
-                cfg = read_hf_config(d)
-                dq = {}
-                for name, w, hf_name in matrices(d):
-                    rows, cols = w.shape
-                    q = np.fromfile(Path(dd) / f"{name}.q", dtype=np.int8).reshape(rows, cols)
-                    s = np.fromfile(Path(dd) / f"{name}.s", dtype="<u2").reshape(rows, -1)
-                    dq[name] = dequantize(q, s)
-                st = read_safetensors(d / "model.safetensors")
-                tensors = []
-                tied = bool(cfg.get("tie_word_embeddings", False))
-                # (a tied classifier was quantized as its own copy: the embedding table itself stays unquantized)
-                names = {hf: key for key, _, hf in matrices(d) if not (tied and key == "wcls")}
-                for name, t in st.items():
-                    if name in names:
-                        arr = dq[names[name]]
-                    else:
-                        arr = t.as_float32()
-                    tensors.append((name, "F32", tuple(arr.shape), np.ascontiguousarray(arr, dtype="<f4").tobytes()))
-                if tied:
-                    # the classifier was quantized separately from the embedding table: untie it in the float model
-                    tensors.append(("lm_head.weight", "F32", tuple(dq["wcls"].shape),
-                                    np.ascontiguousarray(dq["wcls"], dtype="<f4").tobytes()))
-                    cfg = dict(cfg, tie_word_embeddings=False)
-                ref_dir = tmp / ("deq_" + d.name)
-                ref_dir.mkdir()
-                write_safetensors(ref_dir / "model.safetensors", tensors)
-                (ref_dir / "config.json").write_text(json.dumps(cfg), encoding="utf-8")
-
-                for isa in ("scalar", "avx2", "avx512"):
-                    env = {"GI_ISA": isa}
-                    try:
-                        want = np.frombuffer(forward_logits(b / "gi_forward", ref_dir, seq, env), dtype="<f4")
-                    except RuntimeError as e:
-                        if "not supported" in str(e):
-                            continue
-                        failures.append(f"{label} {isa}: reference run failed: {e}")
+            last_layer = derived_config(read_hf_config(d))["n_layers"] - 1
+            for skip in ("", "wcls", "first1", "wq,w2,last1", f"w2@{last_layer},wo@0,w1@{last_layer}"):
+                genv = {"GI_Q8_SKIP": skip}
+                with tempfile.TemporaryDirectory() as dd:
+                    p = dump(b, d, Path(dd), genv)
+                    if p.returncode != 0:
+                        failures.append(f"{label} skip={skip!r}: gi_quant_dump failed: {p.stderr.decode(errors='replace')[:200]}")
                         continue
-                    base = None
-                    for t in (1, 2, 3, 4):
-                        env_i = {"GI_ISA": isa, "GI_WEIGHTS": "int8", "GI_THREADS": str(t), "GI_PAR_MIN": "1"}
-                        raw = forward_logits(b / "gi_forward", d, seq, env_i)
-                        if base is None:
-                            base = raw
-                            got = np.frombuffer(raw, dtype="<f4")
-                            denom = max(1.0, float(np.max(np.abs(want))))
-                            e = float(np.max(np.abs(got.astype(np.float64) - want.astype(np.float64)))) / denom
-                            if not e < 2e-5:
-                                failures.append(f"{label} {isa}: int8 logits differ from the dequantized float32 model "
-                                                f"(relative error {e:.2e})")
-                        elif raw != base:
-                            failures.append(f"{label} {isa}: int8 logits with {t} threads differ from 1 thread")
+                    cfg = read_hf_config(d)
+                    dq = {}
+                    have = {f.stem for f in Path(dd).glob("*.q")}
+                    want_set = expected_quantized(skip, derived_config(cfg)["n_layers"])
+                    if have != want_set:
+                        failures.append(f"{label} skip={skip!r}: quantized matrices differ from the expectation "
+                                        f"(extra {sorted(have - want_set)[:3]}, missing {sorted(want_set - have)[:3]})")
+                    for name, w, hf_name in matrices(d):
+                        rows, cols = w.shape
+                        if not (Path(dd) / f"{name}.q").exists():
+                            continue                      # kept in its original format
+                        q = np.fromfile(Path(dd) / f"{name}.q", dtype=np.int8).reshape(rows, cols)
+                        s_ = np.fromfile(Path(dd) / f"{name}.s", dtype="<u2").reshape(rows, -1)
+                        dq[name] = dequantize(q, s_)
+                    st = read_safetensors(d / "model.safetensors")
+                    tensors = []
+                    tied = bool(cfg.get("tie_word_embeddings", False))
+                    # (a tied classifier was quantized as its own copy: the embedding table itself stays unquantized)
+                    names = {hf: key for key, _, hf in matrices(d) if key in dq and not (tied and key == "wcls")}
+                    for name, t in st.items():
+                        arr = dq[names[name]] if name in names else t.as_float32()
+                        tensors.append((name, "F32", tuple(arr.shape), np.ascontiguousarray(arr, dtype="<f4").tobytes()))
+                    if tied and "wcls" in dq:
+                        tensors.append(("lm_head.weight", "F32", tuple(dq["wcls"].shape),
+                                        np.ascontiguousarray(dq["wcls"], dtype="<f4").tobytes()))
+                        cfg = dict(cfg, tie_word_embeddings=False)
+                    ref_dir = tmp / ("deq_" + d.name + "_" + (skip.replace(",", "_") or "all"))
+                    ref_dir.mkdir()
+                    write_safetensors(ref_dir / "model.safetensors", tensors)
+                    (ref_dir / "config.json").write_text(json.dumps(cfg), encoding="utf-8")
+
+                    for isa in ("scalar", "avx2", "avx512"):
+                        env = {"GI_ISA": isa}
+                        try:
+                            want = np.frombuffer(forward_logits(b / "gi_forward", ref_dir, seq, env), dtype="<f4")
+                        except RuntimeError as e:
+                            if "not supported" in str(e):
+                                continue
+                            failures.append(f"{label} {isa} skip={skip!r}: reference run failed: {e}")
+                            continue
+                        base = None
+                        for t in (1, 2, 3, 4):
+                            env_i = {"GI_ISA": isa, "GI_WEIGHTS": "int8", "GI_THREADS": str(t), "GI_PAR_MIN": "1",
+                                     "GI_Q8_SKIP": skip}
+                            raw = forward_logits(b / "gi_forward", d, seq, env_i)
+                            if base is None:
+                                base = raw
+                                got = np.frombuffer(raw, dtype="<f4")
+                                denom = max(1.0, float(np.max(np.abs(want))))
+                                e = float(np.max(np.abs(got.astype(np.float64) - want.astype(np.float64)))) / denom
+                                if not e < 2e-5:
+                                    failures.append(f"{label} {isa} skip={skip!r}: int8 logits differ from the dequantized "
+                                                    f"float32 model (relative error {e:.2e})")
+                            elif raw != base:
+                                failures.append(f"{label} {isa} skip={skip!r}: int8 logits with {t} threads differ from 1 thread")
             print(f"whole model: {label} done")
+
+        # 3b. a malformed skip list is rejected
+        if models:
+            d0 = next(iter(models.values()))
+            n0 = derived_config(read_hf_config(d0))["n_layers"]
+            for bad_skip in ("bogus", "first", "wq,,xx", "w2@", "wcls@1", "w2@99", "w2@-1", "w9@1", f"w2@{n0}"):
+                p = dump(b, d0, tmp / "bad_skip_out", {"GI_Q8_SKIP": bad_skip})
+                if p.returncode == 0 or b"GI_Q8_SKIP" not in p.stderr:
+                    failures.append(f"GI_Q8_SKIP={bad_skip!r} was accepted")
 
     if failures:
         print("FAIL")

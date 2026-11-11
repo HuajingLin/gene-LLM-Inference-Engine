@@ -2,9 +2,12 @@
 
 #include <cmath>
 #include <cstddef>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include "common/q8.h"
 
@@ -81,29 +84,106 @@ float dequantize_q8(const Q8Matrix& m, int cols, int row, int col) {
 }
 
 // ---- Checkpoint::quantize_matrices (lives here to keep checkpoint.cpp free of quantization details) ----
-void Checkpoint::quantize_matrices() {
+namespace {
+
+struct SkipSpec {
+    bool role[8] = {};   // wq wk wv wo w1 w2 w3 wcls
+    int first = 0, last = 0;
+    std::vector<std::pair<int, int>> at;   // (role index, layer): one matrix of one layer
+};
+
+constexpr const char* kRoles[8] = {"wq", "wk", "wv", "wo", "w1", "w2", "w3", "wcls"};
+
+SkipSpec parse_skip(const std::string& text) {
+    SkipSpec spec;
+    std::size_t pos = 0;
+    while (pos <= text.size()) {
+        std::size_t comma = text.find(',', pos);
+        if (comma == std::string::npos) comma = text.size();
+        const std::string tok = text.substr(pos, comma - pos);
+        pos = comma + 1;
+        if (tok.empty()) continue;
+        bool known = false;
+        const std::size_t at_pos = tok.find('@');
+        if (at_pos != std::string::npos) {   // <role>@<layer>
+            const std::string role = tok.substr(0, at_pos), num = tok.substr(at_pos + 1);
+            char* end = nullptr;
+            const long layer = std::strtol(num.c_str(), &end, 10);
+            for (int i = 0; i < 7; ++i) {   // wcls has no layer
+                if (role == kRoles[i] && !num.empty() && *end == '\0' && layer >= 0 && layer <= 100000) {
+                    spec.at.emplace_back(i, static_cast<int>(layer));
+                    known = true;
+                }
+            }
+        }
+        for (int i = 0; i < 8 && !known; ++i) {
+            if (tok == kRoles[i]) { spec.role[i] = true; known = true; }
+        }
+        if (!known && (tok.rfind("first", 0) == 0 || tok.rfind("last", 0) == 0)) {
+            const bool is_first = tok[0] == 'f';
+            const std::string num = tok.substr(is_first ? 5 : 4);
+            char* end = nullptr;
+            const long n = std::strtol(num.c_str(), &end, 10);
+            if (!num.empty() && *end == '\0' && n >= 0 && n <= 100000) {
+                (is_first ? spec.first : spec.last) = static_cast<int>(n);
+                known = true;
+            }
+        }
+        if (!known) {
+            throw std::invalid_argument("GI_Q8_SKIP: unknown entry '" + tok +
+                                        "' (expected wq wk wv wo w1 w2 w3 wcls, <role>@<layer>, first<N>, last<N>)");
+        }
+    }
+    return spec;
+}
+
+}  // namespace
+
+void Checkpoint::quantize_matrices(const std::string& skip_text) {
+    const SkipSpec skip = parse_skip(skip_text);
     const Config& c = cfg_;
     const std::size_t n_matrices = static_cast<std::size_t>(c.n_layers) * 7 + 1;
     q8_values_.reserve(n_matrices);   // the Mat views point into these vectors: no reallocation allowed
     q8_scales_.reserve(n_matrices);
+    matrix_bytes_ = 0;
 
-    auto convert = [&](Mat& m, int rows, int cols) {
+    for (const auto& entry : skip.at) {
+        if (entry.second >= c.n_layers) {
+            throw std::invalid_argument("GI_Q8_SKIP: layer " + std::to_string(entry.second) + " does not exist (the model has " +
+                                        std::to_string(c.n_layers) + " layers)");
+        }
+    }
+    auto at_layer = [&](int role, int layer) {
+        for (const auto& entry : skip.at) {
+            if (entry.first == role && entry.second == layer) return true;
+        }
+        return false;
+    };
+    auto convert = [&](Mat& m, int rows, int cols, bool keep) {
+        const std::size_t count = static_cast<std::size_t>(rows) * static_cast<std::size_t>(cols);
+        if (keep) {
+            matrix_bytes_ += count * (m.is_bf16() ? 2 : 4);
+            return;
+        }
         Q8Matrix q = quantize_q8(m, rows, cols);
+        matrix_bytes_ += q.q.size() + q.scale.size() * sizeof(std::uint16_t);
         q8_values_.push_back(std::move(q.q));
         q8_scales_.push_back(std::move(q.scale));
         m = Mat(q8_values_.back().data(), q8_scales_.back().data());
     };
     const int D = c.dim, H = c.hidden_dim, A = c.attn_dim(), KV = c.kv_dim();
-    for (LayerWeights& lw : w_.layers) {
-        convert(lw.wq, A, D);
-        convert(lw.wk, KV, D);
-        convert(lw.wv, KV, D);
-        convert(lw.wo, D, A);
-        convert(lw.w1, H, D);
-        convert(lw.w2, D, H);
-        convert(lw.w3, H, D);
+    for (int l = 0; l < c.n_layers; ++l) {
+        LayerWeights& lw = w_.layers[static_cast<std::size_t>(l)];
+        const bool layer_kept = l < skip.first || l >= c.n_layers - skip.last;
+        convert(lw.wq, A, D, layer_kept || skip.role[0] || at_layer(0, l));
+        convert(lw.wk, KV, D, layer_kept || skip.role[1] || at_layer(1, l));
+        convert(lw.wv, KV, D, layer_kept || skip.role[2] || at_layer(2, l));
+        convert(lw.wo, D, A, layer_kept || skip.role[3] || at_layer(3, l));
+        convert(lw.w1, H, D, layer_kept || skip.role[4] || at_layer(4, l));
+        convert(lw.w2, D, H, layer_kept || skip.role[5] || at_layer(5, l));
+        convert(lw.w3, H, D, layer_kept || skip.role[6] || at_layer(6, l));
     }
-    convert(w_.wcls, c.vocab_size, D);   // a tied classifier is quantized as its own copy; the embedding stays
+    convert(w_.wcls, c.vocab_size, D, skip.role[7]);   // a tied classifier is quantized as its own copy
     int8_ = true;
 }
 

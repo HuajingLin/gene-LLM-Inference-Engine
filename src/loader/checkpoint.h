@@ -60,8 +60,13 @@ struct LoadOptions {
     // token embedding table stays as it is: only one row of it is read per token. Costs a few hundred
     // milliseconds at load; the quantized copy is owned by the Checkpoint (see owned_bytes()).
     bool int8 = false;
+    // With int8: matrices that stay in their original format (for finding which ones are sensitive to
+    // quantization). A comma-separated list of: wq wk wv wo w1 w2 w3 wcls (that matrix in every layer / the
+    // classifier), <role>@<layer> (that matrix of one layer, e.g. w2@3), first<N> and last<N> (all matrices of the
+    // first / last N layers). Example: "wcls,last2,w2@3".
+    std::string q8_skip;
     // Defaults, with GI_WEIGHTS=f32 in the environment switching keep_bf16 off and GI_WEIGHTS=int8 switching
-    // int8 on.
+    // int8 on; GI_Q8_SKIP sets q8_skip.
     static LoadOptions from_environment();
 };
 
@@ -137,6 +142,8 @@ public:
     bool has_bf16_weights() const;   // any matrix kept as bfloat16
     std::size_t owned_bytes() const; // memory allocated for converted or quantized tensors (the rest is the file mapping)
     bool has_int8_weights() const { return int8_; }
+    // With int8 weights: bytes of the layer matrices and the classifier read per token, in their actual storage.
+    std::size_t matrix_bytes_per_token() const { return matrix_bytes_; }
 
 private:
     Checkpoint();
@@ -150,8 +157,9 @@ private:
     std::vector<std::vector<std::int8_t>> q8_values_;     // int8 matrices (LoadOptions::int8)
     std::vector<std::vector<std::uint16_t>> q8_scales_;   // their bfloat16 group scales
     bool int8_ = false;
+    std::size_t matrix_bytes_ = 0;
 
-    void quantize_matrices();
+    void quantize_matrices(const std::string& skip);
     Config cfg_;
     Weights w_;
     std::vector<TensorView> tensors_;

@@ -60,6 +60,7 @@ LoadOptions LoadOptions::from_environment() {
             std::fprintf(stderr, "warning: GI_WEIGHTS=%s is not 'f32', 'int8' or 'native'; using native\n", env);
         }
     }
+    if (const char* skip = std::getenv("GI_Q8_SKIP")) o.q8_skip = skip;
     return o;
 }
 
@@ -89,7 +90,7 @@ Checkpoint Checkpoint::load(const std::string& path, const LoadOptions& options)
     std::error_code ec;
     Checkpoint ck = std::filesystem::is_directory(std::filesystem::path(path), ec) ? load_hf(path, options)
                                                                                  : load_llama2c(path);
-    if (options.int8) ck.quantize_matrices();
+    if (options.int8) ck.quantize_matrices(options.q8_skip);
     return ck;
 }
 

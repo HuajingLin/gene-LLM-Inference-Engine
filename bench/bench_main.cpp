@@ -221,27 +221,23 @@ int main(int argc, char** argv) {
         // an unshared embedding table contributes a single row).
         std::size_t weight_bytes = 0, weight_count = 0;
         const bool int8 = ck.has_int8_weights();
-        auto q8_bytes = [](std::size_t rows, std::size_t cols) {   // int8 values + bfloat16 group scales
-            return rows * cols + 2 * rows * static_cast<std::size_t>((cols + 63) / 64);
-        };
         for (const TensorView& t : ck.tensors()) {
             if (t.name.rfind("freq_cis", 0) == 0) continue;
             const bool embedding = t.name == "token_embedding" || t.name == "model.embed_tokens.weight";
             if (embedding && (int8 || !cfg.shared_classifier)) {
                 weight_bytes += static_cast<std::size_t>(cfg.dim) * t.element_bytes();   // one row is looked up
                 weight_count += static_cast<std::size_t>(cfg.dim);
-                if (int8 && cfg.shared_classifier) {   // the classifier is a quantized copy of the table
-                    weight_bytes += q8_bytes(static_cast<std::size_t>(cfg.vocab_size), static_cast<std::size_t>(cfg.dim));
-                    weight_count += t.numel;
-                }
-            } else if (int8 && t.shape.size() >= 2 && t.name.rfind("rms", 0) != 0) {   // a quantized matrix
-                const std::size_t cols = static_cast<std::size_t>(t.shape.back());
-                weight_bytes += q8_bytes(t.numel / cols, cols);
+            } else if (int8 && t.shape.size() >= 2 && t.name.rfind("rms", 0) != 0) {
+                // a matrix: counted below from the loader (its storage may differ from the file)
                 weight_count += t.numel;
             } else {
                 weight_bytes += t.numel * t.element_bytes();
                 weight_count += t.numel;
             }
+        }
+        if (int8) {
+            weight_bytes += ck.matrix_bytes_per_token();
+            if (cfg.shared_classifier) weight_count += static_cast<std::size_t>(cfg.vocab_size) * static_cast<std::size_t>(cfg.dim);
         }
         const double gbps = static_cast<double>(weight_bytes) / (ms_median / 1000.0) / 1e9;
         const double gflops = 2.0 * static_cast<double>(weight_count) / (ms_median / 1000.0) / 1e9;   // 2 flops per weight
