@@ -40,6 +40,14 @@ void matvec(float* out, const float* W, const float* x, int rows, int cols);
 // take half the memory bandwidth, which is what limits decoding.
 void matvec_bf16(float* out, const std::uint16_t* W, const float* x, int rows, int cols);
 
+// Same product with an int8 weight matrix (see common/q8.h): W is [rows, cols] int8 and `scales` holds the bf16
+// scale of every group of 64 values of a row, [rows, ceil(cols / 64)]. Per group the products q * x are summed
+// in float32 and the group sum is multiplied by the group scale; the activations stay float32. Every row is
+// computed by the same instruction sequence wherever it sits in the matrix, so computing a matrix in pieces
+// (slices of rows, for threads) gives bit-identical results. The weights take about 1/4 of the bandwidth of
+// float32 and half of bfloat16.
+void matvec_q8(float* out, const std::int8_t* W, const std::uint16_t* scales, const float* x, int rows, int cols);
+
 // dst[i] = float32(src[i]) for bfloat16 values (one embedding-table row, say).
 void widen_bf16(float* dst, const std::uint16_t* src, int n);
 

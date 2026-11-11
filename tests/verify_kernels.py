@@ -119,6 +119,47 @@ def suite(exe: str, seed: int):
             failures.append(f"matvec_bf16 special values {sel}: {got} != {ref}")
         record("matvec_bf16", f"special values {sel.start}:{sel.stop}", 0.0)
 
+    # ---- matvec_q8: int8 weights with one bf16 scale per 64 values of a row ---------------------------
+    # (1) accuracy against float64 with the dequantized weights q * scale; (2) computing the matrix in two pieces
+    # (rows [0, k) and [k, rows)) gives BIT-IDENTICAL results to computing it at once: this is what row slicing
+    # for threads relies on; (3) extreme values (+-127, zero scales) and a full-range int8 matrix.
+    for rows, cols in shapes + [(5, 63), (5, 64), (5, 65), (3, 127), (3, 128), (3, 129), (7, 1), (2, 200), (9, 576)]:
+        if rows * cols > 3_000_000:
+            continue
+        groups = (cols + 63) // 64
+        q = rng.integers(-127, 128, size=(rows, cols)).astype(np.int8)
+        sc_f = (np.abs(rng.standard_normal((rows, groups))) * 0.02 + 1e-4).astype(np.float32)
+        sc_bits = f32_to_bf16(sc_f)
+        sc = bf16_to_f32(sc_bits)
+        x = rng.standard_normal(cols).astype(np.float32)
+        W = np.zeros((rows, cols), dtype=np.float64)
+        for g in range(groups):
+            W[:, g * 64:(g + 1) * 64] = q[:, g * 64:(g + 1) * 64].astype(np.float64) * sc[:, g:g + 1].astype(np.float64)
+        want = W @ x.astype(np.float64)
+        payload = q.tobytes() + sc_bits.tobytes() + f32(x).tobytes()
+        got = run_raw(exe, ["matvec_q8", rows, cols], payload)
+        record("matvec_q8", f"{rows}x{cols}", err(got, want))
+        if rows >= 2:
+            k = rows // 2 + (1 if rows > 3 else 0)
+            top = run_raw(exe, ["matvec_q8", k, cols], q[:k].tobytes() + sc_bits[:k].tobytes() + f32(x).tobytes())
+            bot = run_raw(exe, ["matvec_q8", rows - k, cols], q[k:].tobytes() + sc_bits[k:].tobytes() + f32(x).tobytes())
+            if np.concatenate([top, bot]).tobytes() != got.tobytes():
+                failures.append(f"matvec_q8 {rows}x{cols}: computing rows in two pieces differs from computing at once")
+    # all +-127 with a power-of-two scale: exact in float32, so the result must equal the float64 value exactly
+    for cols in (64, 100, 192):
+        q = np.where(np.arange(cols) % 2 == 0, 127, -127).astype(np.int8).reshape(1, cols)
+        sc_bits = f32_to_bf16(np.full((1, (cols + 63) // 64), 0.5, dtype=np.float32))
+        x = np.ones(cols, dtype=np.float32)
+        got = run_raw(exe, ["matvec_q8", 1, cols], q.tobytes() + sc_bits.tobytes() + f32(x).tobytes())
+        want = float(q.astype(np.float64).sum()) * 0.5
+        record("matvec_q8", f"alternating +-127 cols={cols}", abs(float(got[0]) - want))
+    # a zero scale zeroes its group, whatever the int8 values are
+    q = np.full((1, 128), 100, dtype=np.int8)
+    sc_bits = f32_to_bf16(np.array([[0.0, 1.0]], dtype=np.float32))
+    x = np.ones(128, dtype=np.float32)
+    got = run_raw(exe, ["matvec_q8", 1, 128], q.tobytes() + sc_bits.tobytes() + f32(x).tobytes())
+    record("matvec_q8", "zero scale", abs(float(got[0]) - 6400.0))
+
     # ---- rmsnorm ---------------------------------------------------------------------
     for n in SIZES:
         x = rng.standard_normal(n).astype(np.float32)
@@ -242,7 +283,7 @@ def main() -> int:
                 all_failures.append(f"[{isa}] the program did not switch to {isa}: {got.strip()!r}")
                 continue
             ops = got.split("simd_ops=")[1].strip()
-            want_ops = "" if isa == "scalar" else "matvec,matvec_bf16,rmsnorm,dot,axpy,mul,add"
+            want_ops = "" if isa == "scalar" else "matvec,matvec_bf16,matvec_q8,rmsnorm,dot,axpy,mul,add"
             if ops != want_ops:
                 all_failures.append(f"[{isa}] kernels running SIMD code: {ops!r}, expected {want_ops!r} "
                                     f"(a silent fallback to the scalar version would pass the value checks)")

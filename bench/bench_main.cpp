@@ -8,6 +8,7 @@
 //   --runs N            measured runs (default 5)
 //   --max-seq-len N     cap the context length / KV cache (default: the model's)
 //   --warmup N          unmeasured runs first, to fault in the memory-mapped weights (default 1)
+//   --weights KIND      weight storage: native (default), f32 or int8 (same as the GI_WEIGHTS environment variable)
 //   --threads N         threads sharing the matrix products (default: GI_THREADS or 1)
 //   --isa NAME          force the instruction set of the kernels: scalar, avx2 or avx512 (default: the best one)
 //   --profile           after the timed runs, one more decode pass reports where the time of a token goes
@@ -50,7 +51,7 @@ namespace {
     std::fprintf(stderr, "error: %s\n", msg.c_str());
     std::fprintf(stderr,
                  "usage: gi_bench --model M [--prompt-tokens N] [--decode-tokens N] [--runs N]\n"
-                 "                [--warmup N] [--max-seq-len N] [--isa NAME] [--threads N] [--profile] [--label TEXT] [--json FILE]\n");
+                 "                [--warmup N] [--max-seq-len N] [--isa NAME] [--threads N] [--weights KIND] [--profile] [--label TEXT] [--json FILE]\n");
     std::exit(2);
 }
 
@@ -98,6 +99,7 @@ int main(int argc, char** argv) {
     std::string model_path, label, json_path, isa_name_arg;
     bool profile = false;
     int prompt_tokens = 32, decode_tokens = 128, runs = 5, warmup = 1, max_seq_len = 0, n_threads = 0;
+    std::string weights_arg;
 
     for (int i = 1; i < argc; ++i) {
         const std::string flag = argv[i];
@@ -112,6 +114,7 @@ int main(int argc, char** argv) {
         else if (flag == "--warmup") warmup = static_cast<int>(parse_int(flag, value()));
         else if (flag == "--max-seq-len") max_seq_len = static_cast<int>(parse_int(flag, value()));
         else if (flag == "--isa") isa_name_arg = value();
+        else if (flag == "--weights") weights_arg = value();
         else if (flag == "--threads") n_threads = static_cast<int>(parse_int(flag, value()));
         else if (flag == "--profile") profile = true;
         else if (flag == "--label") label = value();
@@ -134,7 +137,12 @@ int main(int argc, char** argv) {
 
     try {
         const std::size_t rss_start = current_rss_bytes();
-        const Checkpoint ck = Checkpoint::load(model_path);
+        geneinfer::LoadOptions load_options = geneinfer::LoadOptions::from_environment();
+        if (weights_arg == "f32") { load_options.keep_bf16 = false; load_options.int8 = false; }
+        else if (weights_arg == "int8") { load_options.int8 = true; }
+        else if (weights_arg == "native") { load_options.keep_bf16 = true; load_options.int8 = false; }
+        else if (!weights_arg.empty()) usage_error("--weights must be native, f32 or int8");
+        const Checkpoint ck = Checkpoint::load(model_path, load_options);
         const Config& cfg = ck.config();
         const std::size_t rss_after_load = current_rss_bytes();
 
@@ -212,11 +220,24 @@ int main(int argc, char** argv) {
         // Bytes of weights read per decoded token (everything except the unused RoPE tables;
         // an unshared embedding table contributes a single row).
         std::size_t weight_bytes = 0, weight_count = 0;
+        const bool int8 = ck.has_int8_weights();
+        auto q8_bytes = [](std::size_t rows, std::size_t cols) {   // int8 values + bfloat16 group scales
+            return rows * cols + 2 * rows * static_cast<std::size_t>((cols + 63) / 64);
+        };
         for (const TensorView& t : ck.tensors()) {
             if (t.name.rfind("freq_cis", 0) == 0) continue;
-            if ((t.name == "token_embedding" || t.name == "model.embed_tokens.weight") && !cfg.shared_classifier) {
+            const bool embedding = t.name == "token_embedding" || t.name == "model.embed_tokens.weight";
+            if (embedding && (int8 || !cfg.shared_classifier)) {
                 weight_bytes += static_cast<std::size_t>(cfg.dim) * t.element_bytes();   // one row is looked up
                 weight_count += static_cast<std::size_t>(cfg.dim);
+                if (int8 && cfg.shared_classifier) {   // the classifier is a quantized copy of the table
+                    weight_bytes += q8_bytes(static_cast<std::size_t>(cfg.vocab_size), static_cast<std::size_t>(cfg.dim));
+                    weight_count += t.numel;
+                }
+            } else if (int8 && t.shape.size() >= 2 && t.name.rfind("rms", 0) != 0) {   // a quantized matrix
+                const std::size_t cols = static_cast<std::size_t>(t.shape.back());
+                weight_bytes += q8_bytes(t.numel / cols, cols);
+                weight_count += t.numel;
             } else {
                 weight_bytes += t.numel * t.element_bytes();
                 weight_count += t.numel;
@@ -239,7 +260,8 @@ int main(int argc, char** argv) {
         std::printf("  dim %d, layers %d, heads %d/%d, vocab %d, context %d | %s | %s | kernels: %s | threads: %d\n", cfg.dim,
                     cfg.n_layers, cfg.n_heads, cfg.n_kv_heads, cfg.vocab_size, ctx, compiler_string().c_str(), build,
                     geneinfer::kernels::isa_name(geneinfer::kernels::active_isa()), model.threads());
-        std::printf("  weights in memory: %s\n", ck.has_bf16_weights() ? "bfloat16 matrices (widened in the kernels)" : "float32");
+        std::printf("  weights in memory: %s\n", ck.has_int8_weights() ? "int8 matrices, bfloat16 scales per 64 values (quantized at load)"
+                                                  : ck.has_bf16_weights() ? "bfloat16 matrices (widened in the kernels)" : "float32");
         std::printf("workload: %d prompt + %d decode positions, %d measured runs (+%d warmup)\n\n",
                     n_prompt, n_decode, runs, warmup);
         std::printf("speed\n");
@@ -282,7 +304,7 @@ int main(int argc, char** argv) {
             if (!f) throw std::runtime_error("cannot write " + json_path);
             std::fprintf(f,
                 "{\n"
-                "  \"isa\": \"%s\",\n  \"threads\": %d,\n  \"bf16_weights\": %s,\n  \"label\": \"%s\",\n  \"model\": \"%s\",\n  \"compiler\": \"%s\",\n  \"optimized_build\": %s,\n"
+                "  \"isa\": \"%s\",\n  \"threads\": %d,\n  \"bf16_weights\": %s,\n  \"int8_weights\": %s,\n  \"label\": \"%s\",\n  \"model\": \"%s\",\n  \"compiler\": \"%s\",\n  \"optimized_build\": %s,\n"
                 "  \"dim\": %d,\n  \"n_layers\": %d,\n  \"n_heads\": %d,\n  \"n_kv_heads\": %d,\n  \"vocab_size\": %d,\n  \"context\": %d,\n"
                 "  \"prompt_tokens\": %d,\n  \"decode_tokens\": %d,\n  \"runs\": %d,\n  \"warmup\": %d,\n"
                 "  \"prefill_tokens_per_s\": %.3f,\n  \"decode_tokens_per_s\": %.3f,\n"
@@ -291,7 +313,7 @@ int main(int argc, char** argv) {
                 "  \"file_bytes\": %zu,\n  \"kv_cache_bytes\": %zu,\n  \"scratch_bytes\": %zu,\n"
                 "  \"rss_before_load_bytes\": %zu,\n  \"rss_after_load_bytes\": %zu,\n  \"peak_rss_bytes\": %zu\n"
                 "}\n",
-                geneinfer::kernels::isa_name(geneinfer::kernels::active_isa()), model.threads(), ck.has_bf16_weights() ? "true" : "false",
+                geneinfer::kernels::isa_name(geneinfer::kernels::active_isa()), model.threads(), ck.has_bf16_weights() ? "true" : "false", ck.has_int8_weights() ? "true" : "false",
                 json_escape(label).c_str(), json_escape(model_path).c_str(), json_escape(compiler_string()).c_str(),
 #ifdef NDEBUG
                 "true",

@@ -10,6 +10,7 @@
 //   gi_kernel_check mul     <n>                    stdin: a[n], b[n]                  -> a*b
 //   gi_kernel_check add     <n>                    stdin: a[n], b[n]                  -> a+b
 //   gi_kernel_check matvec_bf16 <rows> <cols>   stdin: W (bfloat16 bits), x (float32)
+//   gi_kernel_check matvec_q8 <rows> <cols>     stdin: W (int8), scales (bfloat16 bits, per 64 values of a row), x (float32)
 //   gi_kernel_check isa                            -> text: "active=<isa> supported=<list>"
 //   gi_kernel_check rope    <n> <pos> <head_size> [theta] [interleaved|half_split]
 //                                                  stdin: v[n]                        -> out[n]
@@ -65,6 +66,18 @@ public:
 
 private:
     std::vector<std::uint16_t> store_;
+    std::size_t off_;
+};
+
+// Same for 8-bit values (int8 weights).
+class BufI8 {
+public:
+    BufI8(std::size_t count, std::size_t offset) : store_(count + offset + 16, 0x77), off_(offset) {}
+    std::int8_t* data() { return store_.data() + off_; }
+    const std::int8_t* data() const { return store_.data() + off_; }
+
+private:
+    std::vector<std::int8_t> store_;
     std::size_t off_;
 };
 
@@ -128,6 +141,7 @@ int main(int argc, char** argv) {
         auto note = [&](bool differs, const char* name) { if (differs) simd += (simd.empty() ? "" : ",") + std::string(name); };
         note(cur.matvec != ref.matvec, "matvec");
         note(cur.matvec_bf16 != ref.matvec_bf16, "matvec_bf16");
+        note(cur.matvec_q8 != ref.matvec_q8, "matvec_q8");
         note(cur.rmsnorm != ref.rmsnorm, "rmsnorm");
         note(cur.dot != ref.dot, "dot");
         note(cur.axpy != ref.axpy, "axpy");
@@ -172,6 +186,25 @@ int main(int argc, char** argv) {
             Buf out(static_cast<std::size_t>(rows), g_offset);
             k::matvec_bf16(out.data(), W.data(), x.data(), rows, cols);
             check_guards(out, "matvec_bf16");
+            write_floats(out.values());
+        } else if (op == "matvec_q8" && argc == 4) {
+            // stdin: W as int8 [rows, cols], scales as 16-bit bfloat16 [rows, ceil(cols / 64)], x as float32 [cols]
+            const int rows = arg_int(argv, 2, "rows"), cols = arg_int(argv, 3, "cols");
+            if (rows <= 0 || cols <= 0) throw std::runtime_error("rows and cols must be positive");
+            const std::size_t count = static_cast<std::size_t>(rows) * cols;
+            const std::size_t n_scales = static_cast<std::size_t>(rows) * static_cast<std::size_t>((cols + 63) / 64);
+            BufI8 W(count, g_offset);
+            if (std::fread(W.data(), 1, count, stdin) != count) {
+                throw std::runtime_error("expected " + std::to_string(count) + " int8 values on stdin");
+            }
+            BufU16 S(n_scales, g_offset);
+            if (std::fread(S.data(), sizeof(std::uint16_t), n_scales, stdin) != n_scales) {
+                throw std::runtime_error("expected " + std::to_string(n_scales) + " 16-bit scales on stdin");
+            }
+            const Buf x = read_buf(static_cast<std::size_t>(cols));
+            Buf out(static_cast<std::size_t>(rows), g_offset);
+            k::matvec_q8(out.data(), W.data(), S.data(), x.data(), rows, cols);
+            check_guards(out, "matvec_q8");
             write_floats(out.values());
         } else if (op == "rmsnorm" && argc == 3) {
             const int n = arg_int(argv, 2, "n");

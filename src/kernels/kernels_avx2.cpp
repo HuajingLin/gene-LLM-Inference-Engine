@@ -193,6 +193,82 @@ void add_avx2(float* a, const float* b, int n) {
     for (; i < n; ++i) a[i] += b[i];
 }
 
+// ---- int8 weights, one bf16 scale per group of 64 values (see common/q8.h) ----
+// Per group: the products q * x go into four FMA chains (chunk j into chain j mod 4), the chains are added as
+// (c0 + c1) + (c2 + c3), the sum is multiplied by the group scale and added to one of two row accumulators (by
+// group parity). int8 -> float32 widening is exact. Every row runs exactly this sequence.
+inline __m256 load_q8x8(const std::int8_t* p) {
+    return _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(p))));
+}
+
+inline float scale_to_float(std::uint16_t b) {
+    const std::uint32_t u = static_cast<std::uint32_t>(b) << 16;
+    float f;
+    __builtin_memcpy(&f, &u, sizeof f);
+    return f;
+}
+
+float row_q8_avx2(const std::int8_t* q, const std::uint16_t* sc, const float* x, int cols) {
+    __m256 acc0 = _mm256_setzero_ps(), acc1 = acc0;
+    const int groups = (cols + 63) / 64;
+    for (int g = 0; g < groups; ++g) {
+        const int c0 = g * 64;
+        int n = cols - c0;
+        if (n > 64) n = 64;
+        __m256 s0 = _mm256_setzero_ps(), s1 = s0, s2 = s0, s3 = s0;
+        if (n == 64) {
+            s0 = _mm256_fmadd_ps(load_q8x8(q + c0), _mm256_loadu_ps(x + c0), s0);
+            s1 = _mm256_fmadd_ps(load_q8x8(q + c0 + 8), _mm256_loadu_ps(x + c0 + 8), s1);
+            s2 = _mm256_fmadd_ps(load_q8x8(q + c0 + 16), _mm256_loadu_ps(x + c0 + 16), s2);
+            s3 = _mm256_fmadd_ps(load_q8x8(q + c0 + 24), _mm256_loadu_ps(x + c0 + 24), s3);
+            s0 = _mm256_fmadd_ps(load_q8x8(q + c0 + 32), _mm256_loadu_ps(x + c0 + 32), s0);
+            s1 = _mm256_fmadd_ps(load_q8x8(q + c0 + 40), _mm256_loadu_ps(x + c0 + 40), s1);
+            s2 = _mm256_fmadd_ps(load_q8x8(q + c0 + 48), _mm256_loadu_ps(x + c0 + 48), s2);
+            s3 = _mm256_fmadd_ps(load_q8x8(q + c0 + 56), _mm256_loadu_ps(x + c0 + 56), s3);
+        } else {
+            int j = 0, c = c0;
+            const int end = c0 + n;
+            for (; c + 8 <= end; c += 8, ++j) {
+                const __m256 prod_q = load_q8x8(q + c);
+                const __m256 xv = _mm256_loadu_ps(x + c);
+                switch (j & 3) {
+                    case 0: s0 = _mm256_fmadd_ps(prod_q, xv, s0); break;
+                    case 1: s1 = _mm256_fmadd_ps(prod_q, xv, s1); break;
+                    case 2: s2 = _mm256_fmadd_ps(prod_q, xv, s2); break;
+                    default: s3 = _mm256_fmadd_ps(prod_q, xv, s3); break;
+                }
+            }
+            if (c < end) {   // 1..7 values left, zero-padded
+                const int rem = end - c;
+                alignas(16) std::int8_t qt[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+                alignas(32) float xt[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+                for (int k = 0; k < rem; ++k) { qt[k] = q[c + k]; xt[k] = x[c + k]; }
+                const __m256 prod = _mm256_mul_ps(load_q8x8(qt), _mm256_loadu_ps(xt));
+                switch (j & 3) {
+                    case 0: s0 = _mm256_add_ps(s0, prod); break;
+                    case 1: s1 = _mm256_add_ps(s1, prod); break;
+                    case 2: s2 = _mm256_add_ps(s2, prod); break;
+                    default: s3 = _mm256_add_ps(s3, prod); break;
+                }
+            }
+        }
+        const __m256 gs = _mm256_add_ps(_mm256_add_ps(s0, s1), _mm256_add_ps(s2, s3));
+        const __m256 s = _mm256_set1_ps(scale_to_float(sc[g]));
+        if (g & 1) acc1 = _mm256_fmadd_ps(gs, s, acc1);
+        else acc0 = _mm256_fmadd_ps(gs, s, acc0);
+    }
+    return hsum(_mm256_add_ps(acc0, acc1));
+}
+
+void matvec_q8_avx2(float* out, const std::int8_t* W, const std::uint16_t* scales, const float* x, int rows,
+                    int cols) {
+    const std::size_t stride = static_cast<std::size_t>(cols);
+    const std::size_t sstride = static_cast<std::size_t>((cols + 63) / 64);
+    for (int r = 0; r < rows; ++r) {
+        out[r] = row_q8_avx2(W + static_cast<std::size_t>(r) * stride, scales + static_cast<std::size_t>(r) * sstride, x, cols);
+    }
+}
+
 void rmsnorm_avx2(float* out, const float* x, const float* weight, int n, float eps) {
     const float sum_sq = dot_avx2(x, x, n);
     const float scale = 1.0f / std::sqrt(sum_sq / static_cast<float>(n) + eps);
@@ -209,6 +285,7 @@ void rmsnorm_avx2(float* out, const float* x, const float* weight, int n, float 
 void fill_avx2(KernelTable& t) {
     t.matvec = matvec_avx2;
     t.matvec_bf16 = matvec_bf16_avx2;
+    t.matvec_q8 = matvec_q8_avx2;
     t.rmsnorm = rmsnorm_avx2;
     t.dot = dot_avx2;
     t.axpy = axpy_avx2;

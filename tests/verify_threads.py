@@ -64,24 +64,24 @@ def main():
             if p.returncode != 0:
                 failures.append(f"{name}: make_dummy_hf failed: {p.stderr.decode(errors="replace").strip()[:200]}")
                 continue
-            for isa in ("scalar", "avx2", "avx512"):
+            for isa, wmode in [(i, w) for i in ("scalar", "avx2", "avx512") for w in ("native", "int8")]:
                 base = None
                 for par_min in ("1", None):
                     for t in range(1, args.max_threads + 1):
-                        env = {"GI_ISA": isa, "GI_THREADS": str(t)}
+                        env = {"GI_ISA": isa, "GI_THREADS": str(t), "GI_WEIGHTS": wmode}
                         if par_min: env["GI_PAR_MIN"] = par_min
                         try:
                             out = forward(str(b / "gi_forward"), str(d), seq, env)
                         except RuntimeError as e:
                             if "not supported" in str(e):
                                 break
-                            failures.append(f"{name} {isa} t={t}: {e}")
+                            failures.append(f"{name} {isa} {wmode} t={t}: {e}")
                             continue
                         if base is None:
                             base = out
                         elif out != base:
                             bad = [k for k in out if out[k] != base.get(k)]
-                            failures.append(f"{name} {isa} threads={t} par_min={par_min}: differs from 1 thread in {bad[:3]}")
+                            failures.append(f"{name} {isa} {wmode} threads={t} par_min={par_min}: differs from 1 thread in {bad[:3]}")
             print(f"forward identity: {name} done")
 
         # 3. generation identical across threads and ISAs (greedy and sampled with a fixed seed)
@@ -96,13 +96,15 @@ def main():
                 got = {}
                 for isa in ("scalar", "avx512"):
                     for t in (1, 2, 3, 5):
-                        q = run([str(b / "gi_generate"), "--model", str(d), "--prompt", "hello world", "--steps", "40",
-                                 "--quiet", "--threads", str(t), *mode], {"GI_PAR_MIN": "1", "GI_ISA": isa})
-                        got[(isa, t)] = (q.returncode, q.stdout)
+                        for wmode in ("native", "int8"):
+                            q = run([str(b / "gi_generate"), "--model", str(d), "--prompt", "hello world", "--steps", "40",
+                                     "--quiet", "--threads", str(t), "--weights", wmode, *mode],
+                                    {"GI_PAR_MIN": "1", "GI_ISA": isa})
+                            got[(isa + wmode, t)] = (q.returncode, q.stdout)
                 if any(v[0] != 0 for v in got.values()):
                     failures.append(f"gi_generate failed: {[(k, v[0]) for k, v in got.items() if v[0]]}")
                 else:
-                    for isa in ("scalar", "avx512"):
+                    for isa in [i + w for i in ("scalar", "avx512") for w in ("native", "int8")]:
                         if len({got[(isa, t)] for t in (1, 2, 3, 5)}) != 1:
                             failures.append(f"gi_generate output ({isa}) depends on --threads ({mode})")
             print("generate identity done")

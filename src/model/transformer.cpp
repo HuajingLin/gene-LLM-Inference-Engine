@@ -9,6 +9,7 @@
 #include <stdexcept>
 #include <string>
 
+#include "common/q8.h"
 #include "kernels/kernels.h"
 
 namespace geneinfer {
@@ -19,14 +20,18 @@ inline std::size_t sz(int v) { return static_cast<std::size_t>(v); }
 
 // out = W * x for a float32 or bfloat16 weight matrix.
 inline void matvec(float* out, const Mat& W, const float* x, int rows, int cols) {
-    if (W.is_bf16()) kernels::matvec_bf16(out, W.bf16, x, rows, cols);
+    if (W.is_q8()) kernels::matvec_q8(out, W.q8, W.q8_scale, x, rows, cols);
+    else if (W.is_bf16()) kernels::matvec_bf16(out, W.bf16, x, rows, cols);
     else kernels::matvec(out, W.f32, x, rows, cols);
 }
 
 // Rows [begin, end) of the product, written to out[begin..end).
 inline void matvec_rows(float* out, const Mat& W, const float* x, int begin, int end, int cols) {
     const std::size_t offset = static_cast<std::size_t>(begin) * static_cast<std::size_t>(cols);
-    if (W.is_bf16()) kernels::matvec_bf16(out + begin, W.bf16 + offset, x, end - begin, cols);
+    if (W.is_q8()) {
+        const std::size_t soffset = static_cast<std::size_t>(begin) * static_cast<std::size_t>(q8_groups(cols));
+        kernels::matvec_q8(out + begin, W.q8 + offset, W.q8_scale + soffset, x, end - begin, cols);
+    } else if (W.is_bf16()) kernels::matvec_bf16(out + begin, W.bf16 + offset, x, end - begin, cols);
     else kernels::matvec(out + begin, W.f32 + offset, x, end - begin, cols);
 }
 

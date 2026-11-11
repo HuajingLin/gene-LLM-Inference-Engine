@@ -55,8 +55,9 @@ LoadOptions LoadOptions::from_environment() {
     LoadOptions o;
     if (const char* env = std::getenv("GI_WEIGHTS")) {
         if (std::strcmp(env, "f32") == 0) o.keep_bf16 = false;
+        else if (std::strcmp(env, "int8") == 0) o.int8 = true;
         else if (std::strcmp(env, "native") != 0) {
-            std::fprintf(stderr, "warning: GI_WEIGHTS=%s is not 'f32' or 'native'; using native\n", env);
+            std::fprintf(stderr, "warning: GI_WEIGHTS=%s is not 'f32', 'int8' or 'native'; using native\n", env);
         }
     }
     return o;
@@ -77,6 +78,8 @@ bool Checkpoint::has_bf16_weights() const {
 std::size_t Checkpoint::owned_bytes() const {
     std::size_t n = 0;
     for (const auto& v : converted_) n += v.size() * sizeof(float);
+    for (const auto& v : q8_values_) n += v.size();
+    for (const auto& v : q8_scales_) n += v.size() * sizeof(std::uint16_t);
     return n;
 }
 
@@ -84,8 +87,10 @@ Checkpoint Checkpoint::load(const std::string& path) { return load(path, LoadOpt
 
 Checkpoint Checkpoint::load(const std::string& path, const LoadOptions& options) {
     std::error_code ec;
-    if (std::filesystem::is_directory(std::filesystem::path(path), ec)) return load_hf(path, options);
-    return load_llama2c(path);
+    Checkpoint ck = std::filesystem::is_directory(std::filesystem::path(path), ec) ? load_hf(path, options)
+                                                                                 : load_llama2c(path);
+    if (options.int8) ck.quantize_matrices();
+    return ck;
 }
 
 Checkpoint Checkpoint::load_llama2c(const std::string& path) {

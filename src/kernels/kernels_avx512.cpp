@@ -189,6 +189,68 @@ void add_avx512(float* a, const float* b, int n) {
     }
 }
 
+// ---- int8 weights, one bf16 scale per group of 64 values (see common/q8.h) ----
+// For every group the products q * x are summed (two interleaved FMA chains), then the group sum is multiplied
+// by the group scale and added to the row accumulator (again two chains, by group parity). The widening
+// int8 -> int32 -> float32 is exact. Every row runs exactly this sequence, so a matrix computed in pieces gives
+// the same bits. The activations are not quantized.
+inline __m512 load_q8x16(const std::int8_t* p) {
+    return _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i*>(p))));
+}
+
+inline float scale_to_float(std::uint16_t b) {
+    const std::uint32_t u = static_cast<std::uint32_t>(b) << 16;
+    float f;
+    __builtin_memcpy(&f, &u, sizeof f);
+    return f;
+}
+
+float row_q8_avx512(const std::int8_t* q, const std::uint16_t* sc, const float* x, int cols) {
+    __m512 acc0 = _mm512_setzero_ps(), acc1 = acc0;
+    const int groups = (cols + 63) / 64;
+    for (int g = 0; g < groups; ++g) {
+        const int c0 = g * 64;
+        int n = cols - c0;
+        if (n > 64) n = 64;
+        __m512 g0 = _mm512_setzero_ps(), g1 = g0;
+        if (n == 64) {
+            g0 = _mm512_fmadd_ps(load_q8x16(q + c0), _mm512_loadu_ps(x + c0), g0);
+            g1 = _mm512_fmadd_ps(load_q8x16(q + c0 + 16), _mm512_loadu_ps(x + c0 + 16), g1);
+            g0 = _mm512_fmadd_ps(load_q8x16(q + c0 + 32), _mm512_loadu_ps(x + c0 + 32), g0);
+            g1 = _mm512_fmadd_ps(load_q8x16(q + c0 + 48), _mm512_loadu_ps(x + c0 + 48), g1);
+        } else {
+            int j = 0, c = c0;
+            const int end = c0 + n;
+            for (; c + 16 <= end; c += 16, ++j) {
+                if (j & 1) g1 = _mm512_fmadd_ps(load_q8x16(q + c), _mm512_loadu_ps(x + c), g1);
+                else g0 = _mm512_fmadd_ps(load_q8x16(q + c), _mm512_loadu_ps(x + c), g0);
+            }
+            if (c < end) {   // 1..15 values left: zero-padded copy of the int8 values (byte masks need AVX512BW)
+                const int rem = end - c;
+                alignas(16) std::int8_t tmp[16] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+                for (int k = 0; k < rem; ++k) tmp[k] = q[c + k];
+                const __m512 prod = _mm512_mul_ps(load_q8x16(tmp), _mm512_maskz_loadu_ps(tail_mask(rem), x + c));
+                if (j & 1) g1 = _mm512_add_ps(g1, prod);
+                else g0 = _mm512_add_ps(g0, prod);
+            }
+        }
+        const __m512 gs = _mm512_add_ps(g0, g1);
+        const __m512 s = _mm512_set1_ps(scale_to_float(sc[g]));
+        if (g & 1) acc1 = _mm512_fmadd_ps(gs, s, acc1);
+        else acc0 = _mm512_fmadd_ps(gs, s, acc0);
+    }
+    return _mm512_reduce_add_ps(_mm512_add_ps(acc0, acc1));
+}
+
+void matvec_q8_avx512(float* out, const std::int8_t* W, const std::uint16_t* scales, const float* x, int rows,
+                      int cols) {
+    const std::size_t stride = static_cast<std::size_t>(cols);
+    const std::size_t sstride = static_cast<std::size_t>((cols + 63) / 64);
+    for (int r = 0; r < rows; ++r) {
+        out[r] = row_q8_avx512(W + static_cast<std::size_t>(r) * stride, scales + static_cast<std::size_t>(r) * sstride, x, cols);
+    }
+}
+
 void rmsnorm_avx512(float* out, const float* x, const float* weight, int n, float eps) {
     const float sum_sq = dot_avx512(x, x, n);
     const float scale = 1.0f / std::sqrt(sum_sq / static_cast<float>(n) + eps);
@@ -209,6 +271,7 @@ void rmsnorm_avx512(float* out, const float* x, const float* weight, int n, floa
 void fill_avx512(KernelTable& t) {
     t.matvec = matvec_avx512;
     t.matvec_bf16 = matvec_bf16_avx512;
+    t.matvec_q8 = matvec_q8_avx512;
     t.rmsnorm = rmsnorm_avx512;
     t.dot = dot_avx512;
     t.axpy = axpy_avx512;

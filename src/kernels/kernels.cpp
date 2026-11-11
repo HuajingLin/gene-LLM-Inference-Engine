@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <cstring>
 
+#include "common/q8.h"
 #include "kernels/kernel_table.h"
 
 namespace geneinfer {
@@ -43,6 +44,26 @@ void matvec_bf16_scalar(float* out, const std::uint16_t* W, const float* x, int 
         float acc = 0.0f;
         for (int c = 0; c < cols; ++c) {
             acc += widen(row[c]) * x[c];
+        }
+        out[r] = acc;
+    }
+}
+
+// int8 weights with one bf16 scale per group of kQ8Group values: out = sum over groups of scale * (sum q * x).
+void matvec_q8_scalar(float* out, const std::int8_t* W, const std::uint16_t* scales, const float* x, int rows,
+                      int cols) {
+    assert(rows > 0 && cols > 0);
+    const int groups = q8_groups(cols);
+    for (int r = 0; r < rows; ++r) {
+        const std::int8_t* q = W + static_cast<std::size_t>(r) * static_cast<std::size_t>(cols);
+        const std::uint16_t* sc = scales + static_cast<std::size_t>(r) * static_cast<std::size_t>(groups);
+        float acc = 0.0f;
+        for (int g = 0; g < groups; ++g) {
+            const int begin = g * kQ8Group;
+            const int end = begin + kQ8Group < cols ? begin + kQ8Group : cols;
+            float sum = 0.0f;
+            for (int c = begin; c < end; ++c) sum += static_cast<float>(q[c]) * x[c];
+            acc += widen(sc[g]) * sum;
         }
         out[r] = acc;
     }
@@ -149,7 +170,7 @@ void rope(float* v, int n, int pos, int head_size, float theta, RopeStyle style)
 namespace {
 
 KernelTable make_scalar_table() {
-    return KernelTable{matvec_scalar, matvec_bf16_scalar, rmsnorm_scalar, dot_scalar, axpy_scalar, mul_scalar, add_scalar};
+    return KernelTable{matvec_scalar, matvec_bf16_scalar, matvec_q8_scalar, rmsnorm_scalar, dot_scalar, axpy_scalar, mul_scalar, add_scalar};
 }
 
 bool cpu_has(Isa isa) {
@@ -246,6 +267,10 @@ void matvec(float* out, const float* W, const float* x, int rows, int cols) {
 void matvec_bf16(float* out, const std::uint16_t* W, const float* x, int rows, int cols) {
     assert(rows > 0 && cols > 0);
     state().table.matvec_bf16(out, W, x, rows, cols);
+}
+void matvec_q8(float* out, const std::int8_t* W, const std::uint16_t* scales, const float* x, int rows, int cols) {
+    assert(rows > 0 && cols > 0);
+    state().table.matvec_q8(out, W, scales, x, rows, cols);
 }
 void widen_bf16(float* dst, const std::uint16_t* src, int n) {
     for (int i = 0; i < n; ++i) dst[i] = widen(src[i]);

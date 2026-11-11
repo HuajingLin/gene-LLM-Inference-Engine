@@ -7,9 +7,9 @@ Lightweight LLM Inference Engine
 + Stage 2: SmolLM2-135M
 + Stage 3a: SmolLM2-135M
 + Stage 3b: SmolLM2-135M
-- Stage 3b: SmolLM2-135M
++ Stage 3c: SmolLM2-135M
+- Stage 3d: SmolLM2-135M
 ```
-[Project Wiki](https://github.com/HuajingLin/gene-LLM-Inference-Engine/wiki/Stage-3c)
 
 ## run
 ```diff
@@ -26,6 +26,7 @@ $ for isa in scalar avx2 avx512; do ./build/gi_bench --model models/SmolLM2-135M
 ### Stage 3a: Performance Optimization: SIMD matvec   
 ### Stage 3b: Weights are stored in bf16 format  
 ### Stage 3c: Multithreading 
+### Stage 3d: int8 quantization
 ```diff
                         scalar      avx2        avx512
 decode                  7.6 tok/s   23.4 tok/s  23.0 tok/s
@@ -50,7 +51,13 @@ All the checks pass, and the speedup is real: decode went from 37.7 to 23.1 ms p
 | label | prefill tok/s | decode tok/s | median ms/token | GFLOP/s | peak RSS MiB |
 |-------|---------------|--------------|-----------------|---------|--------------|
 | —     | 77.6          | 59.3         | 16.634          | 16.17   | 352.6        |
+# Threading works, but it only buys about 1.3x.
 ```
+### Stage 3d: int8 quantization
+Speed: int8 gives 9.4–9.7 ms/token with 2–3 threads, about 105 tok/s. That is 1.75x faster than the best bf16 run (16.4 ms). The kernels and the thread bit-identity check passed.   
+Accuracy is worse than I’d like. Mean KL is 1.2e-2 and the logit error is 3.4%. 
+[Project Wiki](https://github.com/HuajingLin/gene-LLM-Inference-Engine/wiki/Stage-3d)
+
 
 ## Project Structure
 ```
@@ -63,7 +70,8 @@ geneInfer/
 │   │   ├── checkpoint.h / .cpp     # M1: Config、Weights、Checkpoint::load
 │   │   ├── dtype.h / .cpp          # M7: Conversion from f16 to float32
 │   │   ├── safetensors.h / .cpp    # M7: tensors reader
-│   │   └── hf_checkpoint.cpp       # M7: Hugging Face Model directory loading
+│   │   ├── hf_checkpoint.cpp       # M7: Hugging Face Model directory loading
+│   │   └── quantize.h / .cpp       # stage 3d
 │   │
 │   ├── tokenizer/
 │   │   ├── tokenizer.h / .cpp      # M2: tokenizer
@@ -92,7 +100,8 @@ geneInfer/
 │   │   └── jthread_pool.h / .cpp   # Stage 3c
 │   │
 │   └── common/
-│       └── rope_style.h            # M8
+│       ├── rope_style.h        # M8
+│       └── q8.h                # stage 3d
 │   
 ├── models/
 │   ├── stories15M/             # TinyStories
@@ -122,7 +131,8 @@ geneInfer/
 │   ├── hf_tokenizer_golden.py      # M9 HF Golden Data
 │   ├── gen_unicode_tables.py       # M9
 │   ├── hf_tokenizer_probe.p        # M9
-│   └── pool_check_main.cpp         # stage 3c
+│   ├── pool_check_main.cpp         # stage 3c
+│   └── quant_dump_main.cpp         # stage 3d
 │
 ├── tests/
 │    ├── verify_loader.py       # M1: Verification: C++ Output vs. NumPy Element-wise Comparison
@@ -138,7 +148,9 @@ geneInfer/
 │    ├── verify_hf_tokenizer.py # M9
 │    ├── verify_unicode.py      # M9
 │    ├── verify_generate_hf.py  # M10
-│    └── verify_threads.py      # stage 3c
+│    ├── verify_threads.py      # stage 3c
+│    ├── verify_quantize.py     # stage 3d
+│    └── quant_accuracy.py      # stage 3d
 │
 └── bench/
      ├── bench_main.cpp         # M6: gi_bench

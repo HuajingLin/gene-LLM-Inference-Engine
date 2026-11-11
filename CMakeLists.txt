@@ -5,8 +5,8 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-# For single-configuration generators (Makefile/Ninja), 
-# the default is Release; for MSVC multi-configuration, use `--config Release`.
+# Default to Release for single-config generators (Makefile/Ninja).
+# For MSVC multi-config builds use: cmake --build build --config Release
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
   set(CMAKE_BUILD_TYPE Release)
 endif()
@@ -16,6 +16,7 @@ add_library(geneinfer STATIC
   src/loader/checkpoint.cpp
   src/loader/hf_checkpoint.cpp
   src/loader/dtype.cpp
+  src/loader/quantize.cpp
   src/loader/safetensors.cpp
   src/util/json.cpp
   src/util/thread_pool.cpp
@@ -71,6 +72,9 @@ target_link_libraries(gi_kernel_bench PRIVATE geneinfer)
 add_executable(gi_pool_check tools/pool_check_main.cpp)
 target_link_libraries(gi_pool_check PRIVATE geneinfer)
 
+add_executable(gi_quant_dump tools/quant_dump_main.cpp)
+target_link_libraries(gi_quant_dump PRIVATE geneinfer)
+
 add_executable(gi_json_check tools/json_check_main.cpp)
 target_link_libraries(gi_json_check PRIVATE geneinfer)
 
@@ -83,7 +87,7 @@ target_link_libraries(gi_hf_tokenize PRIVATE geneinfer)
 add_executable(gi_unicode_check tools/unicode_check_main.cpp)
 target_link_libraries(gi_unicode_check PRIVATE geneinfer)
 
-foreach(tgt geneinfer gi_inspect gi_tokenize gi_kernel_check gi_forward gi_generate gi_sampler_check gi_bench gi_kernel_bench gi_pool_check gi_json_check gi_dtype_check gi_hf_tokenize gi_unicode_check)
+foreach(tgt geneinfer gi_inspect gi_tokenize gi_kernel_check gi_forward gi_generate gi_sampler_check gi_bench gi_kernel_bench gi_pool_check gi_quant_dump gi_json_check gi_dtype_check gi_hf_tokenize gi_unicode_check)
   if(MSVC)
     target_compile_options(${tgt} PRIVATE /W4 /utf-8)
     target_compile_definitions(${tgt} PRIVATE _CRT_SECURE_NO_WARNINGS)

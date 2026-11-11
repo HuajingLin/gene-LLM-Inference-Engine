@@ -30,23 +30,38 @@ class SafetensorsFile;
 // How a weight tensor is stored in memory.
 enum class Storage { F32, BF16 };
 
-// A read-only view of a weight matrix, either float32 or bfloat16 (the upper 16 bits of a float32).
+// A read-only view of a weight matrix: float32, bfloat16 (the upper 16 bits of a float32), or int8 with one
+// bfloat16 scale per group of 64 values of a row (common/q8.h).
 struct Mat {
     const float* f32 = nullptr;
     const std::uint16_t* bf16 = nullptr;
+    const std::int8_t* q8 = nullptr;           // int8 values [rows, cols]
+    const std::uint16_t* q8_scale = nullptr;   // bf16 scales [rows, ceil(cols / 64)]
 
     Mat() = default;
     Mat(const float* p) : f32(p) {}              // NOLINT: implicit on purpose, llama2.c data is plain float
     Mat(const std::uint16_t* p) : bf16(p) {}     // NOLINT
+    Mat(const std::int8_t* q, const std::uint16_t* scale) : q8(q), q8_scale(scale) {}
     bool is_bf16() const { return bf16 != nullptr; }
-    const void* address() const { return bf16 ? static_cast<const void*>(bf16) : static_cast<const void*>(f32); }
-    friend bool operator==(const Mat& a, const Mat& b) { return a.address() == b.address() && a.is_bf16() == b.is_bf16(); }
+    bool is_q8() const { return q8 != nullptr; }
+    const void* address() const {
+        if (q8) return q8;
+        return bf16 ? static_cast<const void*>(bf16) : static_cast<const void*>(f32);
+    }
+    friend bool operator==(const Mat& a, const Mat& b) {
+        return a.address() == b.address() && a.is_bf16() == b.is_bf16() && a.is_q8() == b.is_q8();
+    }
     friend bool operator!=(const Mat& a, const Mat& b) { return !(a == b); }
 };
 
 struct LoadOptions {
     bool keep_bf16 = true;   // keep bfloat16 matrices as bfloat16 (see above)
-    // Defaults, with GI_WEIGHTS=f32 in the environment switching keep_bf16 off.
+    // Quantize the layer matrices and the classifier to int8 (group size 64, bfloat16 scales) at load time. The
+    // token embedding table stays as it is: only one row of it is read per token. Costs a few hundred
+    // milliseconds at load; the quantized copy is owned by the Checkpoint (see owned_bytes()).
+    bool int8 = false;
+    // Defaults, with GI_WEIGHTS=f32 in the environment switching keep_bf16 off and GI_WEIGHTS=int8 switching
+    // int8 on.
     static LoadOptions from_environment();
 };
 
@@ -120,7 +135,8 @@ public:
     const std::vector<TensorView>& tensors() const { return tensors_; }
     std::size_t file_size() const;
     bool has_bf16_weights() const;   // any matrix kept as bfloat16
-    std::size_t owned_bytes() const; // memory allocated for converted tensors (everything else is the file mapping)
+    std::size_t owned_bytes() const; // memory allocated for converted or quantized tensors (the rest is the file mapping)
+    bool has_int8_weights() const { return int8_; }
 
 private:
     Checkpoint();
@@ -131,6 +147,11 @@ private:
     MappedFile file_;                              // llama2.c file mapping
     std::unique_ptr<SafetensorsFile> safetensors_;  // Hugging Face weights mapping
     std::vector<std::vector<float>> converted_;     // float32 copies of F16/BF16 tensors
+    std::vector<std::vector<std::int8_t>> q8_values_;     // int8 matrices (LoadOptions::int8)
+    std::vector<std::vector<std::uint16_t>> q8_scales_;   // their bfloat16 group scales
+    bool int8_ = false;
+
+    void quantize_matrices();
     Config cfg_;
     Weights w_;
     std::vector<TensorView> tensors_;

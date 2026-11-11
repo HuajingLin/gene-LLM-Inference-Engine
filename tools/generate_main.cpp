@@ -9,6 +9,7 @@
 // Options:
 //   --prompt TEXT        text to continue (default: empty, i.e. start from BOS)
 //   --steps N            maximum number of positions including the prompt (default: model context)
+//   --weights KIND       native (default), f32 or int8: how the weight matrices are held in memory
 //   --threads N          threads sharing the matrix products (default: GI_THREADS or 1; same output)
 //   --max-seq-len N      cap the context length, i.e. the KV cache memory (default: the model's)
 //   --temperature F      0 = greedy (default 0.8)
@@ -46,7 +47,7 @@ namespace {
 [[noreturn]] void usage_error(const std::string& msg) {
     std::fprintf(stderr, "error: %s\n", msg.c_str());
     std::fprintf(stderr,
-                 "usage: gi_generate --model M [--tokenizer T] [--prompt TEXT] [--steps N] [--max-seq-len N] [--threads N]\n"
+                 "usage: gi_generate --model M [--tokenizer T] [--prompt TEXT] [--steps N] [--max-seq-len N] [--threads N] [--weights KIND]\n"
                  "                   [--temperature F] [--top-k N] [--top-p F] [--seed N]\n"
                  "                   [--bos] [--no-echo] [--quiet] [--dump-tokens FILE]\n"
                  "  M is a llama2.c .bin file (then --tokenizer is required) or a Hugging Face model directory.\n");
@@ -79,6 +80,7 @@ std::uint64_t parse_seed(const std::string& v) {
 int main(int argc, char** argv) {
     std::string model_path, tokenizer_path, prompt, dump_path;
     int steps = 0, max_seq_len = 0, n_threads = 0;
+    std::string weights_arg;
     bool echo = true, quiet = false, seed_given = false, bos = false;
     SamplerConfig scfg;
     scfg.temperature = 0.8f;
@@ -95,6 +97,7 @@ int main(int argc, char** argv) {
         else if (flag == "--prompt") prompt = value();
         else if (flag == "--steps") steps = static_cast<int>(parse_int(flag, value()));
         else if (flag == "--max-seq-len") max_seq_len = static_cast<int>(parse_int(flag, value()));
+        else if (flag == "--weights") weights_arg = value();
         else if (flag == "--threads") n_threads = static_cast<int>(parse_int(flag, value()));
         else if (flag == "--temperature") scfg.temperature = static_cast<float>(parse_double(flag, value()));
         else if (flag == "--top-k") scfg.top_k = static_cast<int>(parse_int(flag, value()));
@@ -115,7 +118,12 @@ int main(int argc, char** argv) {
     try {
         std::error_code ec;
         const bool is_hf = std::filesystem::is_directory(std::filesystem::path(model_path), ec);
-        const Checkpoint ck = Checkpoint::load(model_path);
+        LoadOptions load_options = LoadOptions::from_environment();
+        if (weights_arg == "f32") { load_options.keep_bf16 = false; load_options.int8 = false; }
+        else if (weights_arg == "int8") { load_options.int8 = true; }
+        else if (weights_arg == "native") { load_options.keep_bf16 = true; load_options.int8 = false; }
+        else if (!weights_arg.empty()) { std::fprintf(stderr, "error: --weights must be native, f32 or int8\n"); return 2; }
+        const Checkpoint ck = Checkpoint::load(model_path, load_options);
         std::unique_ptr<TextTokenizer> tok_ptr;
         if (is_hf) {
             tok_ptr = load_hf_tokenizer(tokenizer_path.empty() ? model_path : tokenizer_path, bos);
