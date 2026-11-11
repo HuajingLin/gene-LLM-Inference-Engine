@@ -256,6 +256,9 @@ int main(int argc, char** argv) {
         std::printf("  dim %d, layers %d, heads %d/%d, vocab %d, context %d | %s | %s | kernels: %s | threads: %d\n", cfg.dim,
                     cfg.n_layers, cfg.n_heads, cfg.n_kv_heads, cfg.vocab_size, ctx, compiler_string().c_str(), build,
                     geneinfer::kernels::isa_name(geneinfer::kernels::active_isa()), model.threads());
+        if (ck.has_int8_weights() && !ck.q8_skip_used().empty()) {
+            std::printf("  kept in original format (GI_Q8_SKIP / q8_skip.txt): %s\n", ck.q8_skip_used().c_str());
+        }
         std::printf("  weights in memory: %s\n", ck.has_int8_weights() ? "int8 matrices, bfloat16 scales per 64 values (quantized at load)"
                                                   : ck.has_bf16_weights() ? "bfloat16 matrices (widened in the kernels)" : "float32");
         std::printf("workload: %d prompt + %d decode positions, %d measured runs (+%d warmup)\n\n",

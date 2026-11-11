@@ -159,6 +159,12 @@ def sweep_layers(build: Path, args, prompts, ref_env) -> int:
         env = {"GI_WEIGHTS": "int8", "GI_Q8_SKIP": skip}
         label = f"{role} of {k} layers"
         print(f"{label:<34} {bytes_per_token(build, args.model, env):>9} {top1:>7.1%} {kl:>10.2e} {kl0:>10.2e}   [{skip if k <= 8 else '...'}]")
+    if args.write_policy:
+        k = min(args.write_policy, n_layers)
+        skip = ",".join(f"{role}@{l}" for l in sorted(order[:k]))
+        path = Path(args.model) / "q8_skip.txt"
+        path.write_text(f"# written by quant_accuracy.py --sweep-layers {role}: layers most sensitive to int8\n{skip}\n")
+        print(f"\nwrote {path}: {skip}")
     return 0
 
 
@@ -171,6 +177,8 @@ def main() -> int:
     ap.add_argument("--sweep", action="store_true", help="compare several GI_Q8_SKIP settings")
     ap.add_argument("--sweep-layers", metavar="ROLE", help="keep ROLE (e.g. w2) in bf16 in one layer at a time, then in the "
                     "most sensitive layers together; shows which layers need the extra precision")
+    ap.add_argument("--write-policy", type=int, metavar="K", help="with --sweep-layers: write the K most sensitive "
+                    "layers to <model>/q8_skip.txt, so that --weights int8 uses them automatically")
     ap.add_argument("--max-prompts", type=int, default=0, help="use only the first N prompts (faster sweeps)")
     ap.add_argument("--prompts-file", help="text file with one prompt per line (default: built-in prompts)")
     args = ap.parse_args()

@@ -4,6 +4,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <sstream>
 #include <stdexcept>
 
@@ -84,13 +85,42 @@ std::size_t Checkpoint::owned_bytes() const {
     return n;
 }
 
+namespace {
+
+// The contents of a q8_skip.txt: comment lines (#) are dropped, the other lines are trimmed and joined with commas.
+// A missing file gives "".
+std::string read_q8_skip_file(const std::filesystem::path& file) {
+    std::ifstream in(file);
+    if (!in) return "";
+    std::string out, line;
+    while (std::getline(in, line)) {
+        const std::size_t a = line.find_first_not_of(" \t\r");
+        if (a == std::string::npos || line[a] == '#') continue;
+        const std::size_t b = line.find_last_not_of(" \t\r");
+        if (!out.empty()) out += ',';
+        out += line.substr(a, b - a + 1);
+    }
+    return out;
+}
+
+}  // namespace
+
 Checkpoint Checkpoint::load(const std::string& path) { return load(path, LoadOptions::from_environment()); }
 
 Checkpoint Checkpoint::load(const std::string& path, const LoadOptions& options) {
     std::error_code ec;
     Checkpoint ck = std::filesystem::is_directory(std::filesystem::path(path), ec) ? load_hf(path, options)
                                                                                  : load_llama2c(path);
-    if (options.int8) ck.quantize_matrices(options.q8_skip);
+    if (options.int8) {
+        std::string skip;
+        if (options.q8_skip) {
+            skip = *options.q8_skip;
+        } else if (std::filesystem::is_directory(std::filesystem::path(path), ec)) {
+            skip = read_q8_skip_file(std::filesystem::path(path) / "q8_skip.txt");
+        }
+        ck.quantize_matrices(skip);
+        ck.q8_skip_used_ = skip;
+    }
     return ck;
 }
 

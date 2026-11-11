@@ -100,8 +100,10 @@ SkipSpec parse_skip(const std::string& text) {
     while (pos <= text.size()) {
         std::size_t comma = text.find(',', pos);
         if (comma == std::string::npos) comma = text.size();
-        const std::string tok = text.substr(pos, comma - pos);
+        std::string tok = text.substr(pos, comma - pos);
         pos = comma + 1;
+        const std::size_t a = tok.find_first_not_of(" \t\r\n");   // spaces around an entry are ignored
+        tok = a == std::string::npos ? std::string() : tok.substr(a, tok.find_last_not_of(" \t\r\n") - a + 1);
         if (tok.empty()) continue;
         bool known = false;
         const std::size_t at_pos = tok.find('@');

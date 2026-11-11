@@ -48,7 +48,10 @@ VARIANTS = {
 
 
 def run(cmd, env=None):
-    return subprocess.run(cmd, capture_output=True, env={**os.environ, **(env or {})})
+    full = {**os.environ, **(env or {})}
+    for k in [k for k, v in full.items() if v is None]:   # a None value removes the variable
+        del full[k]
+    return subprocess.run(cmd, capture_output=True, env=full)
 
 
 def bf16_round_up(f: np.ndarray) -> np.ndarray:
@@ -306,6 +309,32 @@ def main() -> int:
                             elif raw != base:
                                 failures.append(f"{label} {isa} skip={skip!r}: int8 logits with {t} threads differ from 1 thread")
             print(f"whole model: {label} done")
+
+        # 3a. q8_skip.txt in the model directory: used when GI_Q8_SKIP is not set; an explicit GI_Q8_SKIP (even an
+        #     empty one) wins; a malformed file is rejected
+        if models:
+            label0, d0 = next(iter(models.items()))
+            n0 = derived_config(read_hf_config(d0))["n_layers"]
+            side = tmp / "sidecar"
+            shutil.copytree(d0, side)
+            (side / "q8_skip.txt").write_text("# tuned list\n  w2@0, wo@0 \nwcls\n", encoding="utf-8")
+            cases = [("file only", {"GI_Q8_SKIP": None}, "w2@0,wo@0,wcls"),
+                     ("env empty overrides", {"GI_Q8_SKIP": ""}, ""),
+                     ("env overrides file", {"GI_Q8_SKIP": "w1@0"}, "w1@0")]
+            for what, genv, want_skip in cases:
+                with tempfile.TemporaryDirectory() as dd:
+                    p = dump(b, side, Path(dd), genv)
+                    if p.returncode != 0:
+                        failures.append(f"sidecar ({what}): gi_quant_dump failed: {p.stderr.decode(errors='replace')[:200]}")
+                        continue
+                    have = {f.stem for f in Path(dd).glob("*.q")}
+                    if have != expected_quantized(want_skip, n0):
+                        failures.append(f"sidecar ({what}): wrong set of quantized matrices")
+            (side / "q8_skip.txt").write_text("w2@0,nonsense\n", encoding="utf-8")
+            p = dump(b, side, tmp / "side_bad", {"GI_Q8_SKIP": None})
+            if p.returncode == 0:
+                failures.append("a malformed q8_skip.txt was accepted")
+            print("sidecar policy file done")
 
         # 3b. a malformed skip list is rejected
         if models:

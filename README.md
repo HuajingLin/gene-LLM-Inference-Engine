@@ -5,7 +5,7 @@ Lightweight LLM Inference Engine
 # Models used
 + Stage 1: stories15M
 + Stage 2: SmolLM2-135M
-- Stage 3a ~ 3d: SmolLM2-135M
+- Stage 3a ~ 3e: SmolLM2-135M
 ```
 
 ## run
@@ -21,6 +21,7 @@ cmake --build build --config Release
 - Stage 3b: Weights are stored in bf16 format  
 - Stage 3c: Multithreading 
 - Stage 3d: int8 quantization
+- Stage 3e: GI_Q8_SKIP
 
 ### Stage 3a: SIMD matvec
 ```diff
@@ -53,6 +54,9 @@ All the checks pass, and the speedup is real: decode went from 37.7 to 23.1 ms p
 Speed: int8 gives 9.4–9.7 ms/token with 2–3 threads, about 105 tok/s. That is 1.75x faster than the best bf16 run (16.4 ms). The kernels and the thread bit-identity check passed.   
 Accuracy is worse than I’d like. Mean KL is 1.2e-2 and the logit error is 3.4%.    
 [Project Wiki](https://github.com/HuajingLin/gene-LLM-Inference-Engine/wiki/Stage-3d)
+
+### Stage 3e: GI_Q8_SKIP
+per token  median 8.772 ms, so the sensitive-layer fix costs nothing in speed.
 
 
 ## Project Structure
