@@ -87,10 +87,10 @@ the 1-request run takes 0.83 s against 1.81 s without, and the 4-request run tak
 
 ### Stage 4.4 multi-row kernel 
 ```diff
-			     Multi-token	Per-token
+			Multi-token	Per-token
 Prefill, run 1		158.8 tok/s	110.4 tok/s
 Prefill, run 2		155.0 tok/s	111.1 tok/s
-Decode         	28.2 tok/s	28.2 tok/s
+Decode         	     28.2 tok/s	28.2 tok/s
 ```
 
 ## Project Structure
