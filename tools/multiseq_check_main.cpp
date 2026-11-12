@@ -1,10 +1,13 @@
 // multiseq_check_main.cpp - several sequences sharing one paged KV pool.
 //
-//   gi_multiseq <model> --max-seq-len N [--block-size B] [--kv-blocks K] [--seed S] [--mode interleave|exhaust]
+//   gi_multiseq <model> --max-seq-len N [--block-size B] [--kv-blocks K] [--seed S] [--mode interleave|rows|exhaust|rows_exhaust]
 //
 // interleave: three sequences (random token streams) are run alone to get reference logits, then run again in a
 //   random interleaving of single-token steps and small batches on one shared pool, with random rewinds
 //   (re-running earlier positions). Every logits row must be bit-identical to the reference.
+// rows: forward_rows() with rows of up to four sequences in one pass (single decode rows and prefill chunks mixed,
+//   a random subset of the rows asking for logits); each requested row must be bit-identical to the reference.
+//   A pass the pool cannot hold must throw and change nothing.
 // exhaust: a pool too small for two sequences. The first sequence fills it; the next token of either sequence must be
 //   refused with an exception that leaves the sequence length unchanged; after the first sequence is destroyed the
 //   second one must work and give the reference logits.
@@ -16,6 +19,7 @@
 #include <exception>
 #include <stdexcept>
 #include <random>
+#include <utility>
 #include <string>
 #include <vector>
 
@@ -100,6 +104,154 @@ void interleave(Transformer& m, std::mt19937& rng, int vocab, int ctx) {
     std::printf("ok interleave: %d single steps, %d batches, %d rewinds\n", steps, batches, rewinds);
 }
 
+void rows_mode(Transformer& m, std::mt19937& rng, int vocab, int ctx) {
+    const int nseq = 4;
+    std::vector<std::vector<int>> toks;
+    std::vector<std::vector<std::vector<float>>> ref;
+    for (int s = 0; s < nseq; ++s) {
+        toks.push_back(random_tokens(rng, 1 + static_cast<int>(rng() % static_cast<unsigned>(ctx)), vocab));
+        ref.push_back(run_alone(m, toks.back(), vocab));
+    }
+    std::vector<Sequence> seqs;
+    for (int s = 0; s < nseq; ++s) seqs.push_back(m.new_sequence());
+    std::vector<int> done(nseq, 0);
+    int passes = 0, rows_total = 0, checked = 0;
+    for (;;) {
+        std::vector<Transformer::StepRow> rows;
+        std::vector<std::pair<int, int>> origin;   // sequence, position of each row
+        std::vector<int> take(nseq, 0);
+        // visit the sequences in random order; each contributes 0 .. 6 consecutive rows
+        std::vector<int> order(nseq);
+        for (int s = 0; s < nseq; ++s) order[static_cast<std::size_t>(s)] = s;
+        std::shuffle(order.begin(), order.end(), rng);
+        for (int s : order) {
+            const int left = static_cast<int>(toks[static_cast<std::size_t>(s)].size()) - done[static_cast<std::size_t>(s)];
+            const int want_rows = std::min(left, static_cast<int>(rng() % 7));
+            for (int j = 0; j < want_rows && static_cast<int>(rows.size()) < m.max_batch(); ++j) {
+                const int pos = done[static_cast<std::size_t>(s)] + j;
+                rows.push_back({&seqs[static_cast<std::size_t>(s)], toks[static_cast<std::size_t>(s)][static_cast<std::size_t>(pos)],
+                                (rng() & 1u) != 0});
+                origin.push_back({s, pos});
+                ++take[static_cast<std::size_t>(s)];
+            }
+        }
+        if (rows.empty()) {
+            bool any_left = false;
+            for (int s = 0; s < nseq; ++s) any_left |= done[static_cast<std::size_t>(s)] < static_cast<int>(toks[static_cast<std::size_t>(s)].size());
+            if (!any_left) break;
+            continue;
+        }
+        const float* l = m.forward_rows(rows.data(), static_cast<int>(rows.size()));
+        int k = 0;
+        for (std::size_t i = 0; i < rows.size(); ++i) {
+            if (!rows[i].want_logits) continue;
+            expect(same(l + static_cast<std::size_t>(k) * static_cast<std::size_t>(vocab),
+                        ref[static_cast<std::size_t>(origin[i].first)][static_cast<std::size_t>(origin[i].second)]),
+                   "forward_rows logits differ from the single-sequence reference (sequence " + std::to_string(origin[i].first) + ")");
+            ++k;
+            ++checked;
+        }
+        expect((k == 0) == (l == nullptr), "forward_rows returned a wrong null/non-null logits pointer");
+        for (int s = 0; s < nseq; ++s) {
+            done[static_cast<std::size_t>(s)] += take[static_cast<std::size_t>(s)];
+            expect(seqs[static_cast<std::size_t>(s)].length() == done[static_cast<std::size_t>(s)], "sequence length wrong after forward_rows");
+        }
+        ++passes;
+        rows_total += static_cast<int>(rows.size());
+    }
+    // Bounds: a pass whose rows would go past the context must be refused and must not change anything.
+    {
+        Sequence full = m.new_sequence();
+        const std::vector<int> t = random_tokens(rng, ctx, vocab);
+        m.forward_batch(full, t.data(), ctx - 1, 0, false);
+        Sequence other = m.new_sequence();
+        const Transformer::StepRow two[2] = {{&full, t[0], true}, {&full, t[1], true}};
+        bool threw = false;
+        try {
+            m.forward_rows(two, 2);
+        } catch (const std::out_of_range&) {
+            threw = true;
+        }
+        expect(threw && full.length() == ctx - 1, "a pass running past the context was not refused cleanly");
+        const Transformer::StepRow last[2] = {{&full, t[ctx - 1], true}, {&other, t[0], true}};
+        const float* l = m.forward_rows(last, 2);   // exactly the last position: allowed
+        expect(l != nullptr && full.length() == ctx && other.length() == 1, "the last position of the context was refused");
+        expect(same(l, run_alone(m, t, vocab)[static_cast<std::size_t>(ctx - 1)]), "logits at the last position differ");
+        threw = false;
+        try {
+            const Transformer::StepRow one = {&full, t[0], true};
+            m.forward_rows(&one, 1);
+        } catch (const std::out_of_range&) {
+            threw = true;
+        }
+        expect(threw, "a row beyond the last position was accepted");
+        const Transformer::StepRow bad = {&other, vocab, true};
+        threw = false;
+        try {
+            m.forward_rows(&bad, 1);
+        } catch (const std::out_of_range&) {
+            threw = true;
+        }
+        expect(threw && other.length() == 1, "a token id outside the vocabulary was accepted");
+        {
+            std::vector<Transformer::StepRow> many(static_cast<std::size_t>(m.max_batch()) + 1, Transformer::StepRow{&other, t[0], false});
+            threw = false;
+            try {
+                m.forward_rows(many.data(), static_cast<int>(many.size()));
+            } catch (const std::invalid_argument&) {
+                threw = true;
+            }
+            expect(threw && other.length() == 1, "more rows than max_batch were accepted");
+        }
+        threw = false;
+        try {
+            m.forward_rows(&bad, 0);
+        } catch (const std::invalid_argument&) {
+            threw = true;
+        }
+        expect(threw, "zero rows were accepted");
+    }
+    std::printf("ok rows: %d passes, %d rows, %d logits rows checked\n", passes, rows_total, checked);
+}
+
+void rows_exhaust(Transformer& m, std::mt19937& rng, int vocab) {
+    KvPool& pool = m.kv_pool();
+    const int bs = pool.block_size();
+    Sequence a = m.new_sequence();
+    Sequence b = m.new_sequence();
+    const std::vector<int> t = random_tokens(rng, 3 * pool.n_blocks() * bs, vocab);
+    // fill most of the pool with a: leave exactly one free block
+    const int fill = (pool.n_blocks() - 1) * bs;
+    if (fill + bs + 1 > m.max_seq_len()) {   // the context is too short to build this situation
+        std::printf("ok rows_exhaust: skipped (context too short for this pool)\n");
+        return;
+    }
+    for (int i = 0; i < fill; ++i) m.forward(a, t[static_cast<std::size_t>(i)], i, false);
+    expect(pool.free_blocks() == 1, "setup: expected one free block");
+    // a pass that needs two new blocks (one for a, one for b, but a also crosses into a second): a gets bs rows, b gets 1
+    std::vector<Transformer::StepRow> rows;
+    for (int i = 0; i < bs + 1; ++i) rows.push_back({&a, t[static_cast<std::size_t>(fill + i)], false});
+    rows.push_back({&b, t[0], true});
+    if (static_cast<int>(rows.size()) > m.max_batch()) return;   // not testable with this batch size
+    const int free_before = pool.free_blocks();
+    bool threw = false;
+    try {
+        m.forward_rows(rows.data(), static_cast<int>(rows.size()));
+    } catch (const std::runtime_error&) {
+        threw = true;
+    }
+    expect(threw, "forward_rows did not refuse a pass the pool cannot hold");
+    expect(a.length() == fill && b.length() == 0, "a refused forward_rows changed a length");
+    expect(pool.free_blocks() == free_before && a.n_blocks() == pool.n_blocks() - 1 && b.n_blocks() == 0,
+           "a refused forward_rows kept blocks reserved");
+    // a smaller pass still works afterwards and matches the reference
+    const auto refb = run_alone(m, {t[0]}, vocab);
+    const Transformer::StepRow one = {&b, t[0], true};
+    const float* l = m.forward_rows(&one, 1);
+    expect(l != nullptr && same(l, refb[0]), "forward_rows after a refused pass gives wrong logits");
+    std::printf("ok rows_exhaust: refused cleanly, state unchanged, still usable\n");
+}
+
 void exhaust(Transformer& m, std::mt19937& rng, int vocab) {
     KvPool& pool = m.kv_pool();
     const int capacity = pool.n_blocks() * pool.block_size();
@@ -153,7 +305,7 @@ void exhaust(Transformer& m, std::mt19937& rng, int vocab) {
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        std::fprintf(stderr, "usage: %s <model> --max-seq-len N [--block-size B] [--kv-blocks K] [--seed S] [--mode interleave|exhaust]\n", argv[0]);
+        std::fprintf(stderr, "usage: %s <model> --max-seq-len N [--block-size B] [--kv-blocks K] [--seed S] [--mode interleave|rows|exhaust|rows_exhaust]\n", argv[0]);
         return 2;
     }
     try {
@@ -176,6 +328,8 @@ int main(int argc, char** argv) {
         std::mt19937 rng(seed);
         const int vocab = m.config().vocab_size;
         if (mode == "interleave") interleave(m, rng, vocab, m.max_seq_len());
+        else if (mode == "rows") rows_mode(m, rng, vocab, m.max_seq_len());
+        else if (mode == "rows_exhaust") rows_exhaust(m, rng, vocab);
         else if (mode == "exhaust") exhaust(m, rng, vocab);
         else throw std::runtime_error("unknown mode " + mode);
         std::printf("PASS\n");

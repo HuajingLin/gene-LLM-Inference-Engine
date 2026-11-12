@@ -47,6 +47,21 @@ def main() -> int:
                     runs += 1
                     if p.returncode != 0 or not p.stdout.rstrip().endswith("PASS"):
                         failures.append(f"{d.name} bs={bs} seed={seed}: {p.stdout.strip()[-200:]} {p.stderr.strip()[-200:]}")
+                for seed in range(1, 6):
+                    cmd = [str(exe), str(d), "--max-seq-len", str(ctx), "--block-size", str(bs),
+                           "--kv-blocks", str(6 * per + 4), "--seed", str(seed), "--mode", "rows"]
+                    p = subprocess.run(cmd, capture_output=True, text=True)
+                    runs += 1
+                    if p.returncode != 0 or not p.stdout.rstrip().endswith("PASS"):
+                        failures.append(f"{d.name} rows bs={bs} seed={seed}: {p.stdout.strip()[-200:]} {p.stderr.strip()[-200:]}")
+                for seed in (1, 2):
+                    for nb in (3, 5, 9):
+                        cmd = [str(exe), str(d), "--max-seq-len", str(ctx), "--block-size", str(bs), "--kv-blocks", str(nb),
+                               "--mode", "rows_exhaust", "--seed", str(seed)]
+                        p = subprocess.run(cmd, capture_output=True, text=True)
+                        runs += 1
+                        if p.returncode != 0 or not p.stdout.rstrip().endswith("PASS"):
+                            failures.append(f"{d.name} rows_exhaust bs={bs} blocks={nb}: {p.stdout.strip()[-200:]} {p.stderr.strip()[-200:]}")
                 for nb in (1, 2, 5):
                     cmd = [str(exe), str(d), "--max-seq-len", str(ctx), "--block-size", str(bs), "--kv-blocks", str(nb),
                            "--mode", "exhaust", "--seed", "7"]

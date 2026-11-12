@@ -100,7 +100,22 @@ public:
     // pos0 may be > 0 when earlier positions are already in the cache. While a trace callback is set, the tokens
     // are processed one by one so that the trace sees every token (same results, no speedup).
     const float* forward_batch(const int* tokens, int n, int pos0, bool compute_logits = true);
-    const float* forward_batch(Sequence& seq, const int* tokens, int n, int pos0, bool compute_logits = true);   // same rules as above; seq.length() == pos0 + n afterwards
+    const float* forward_batch(Sequence& seq, const int* tokens, int n, int pos0, bool compute_logits = true);
+
+    // One forward pass over rows that belong to different sequences (continuous batching). Every row is one token of
+    // one sequence; a sequence may own several consecutive rows (a prefill chunk). A row is processed at position
+    // seq->length() + (number of earlier rows of the same sequence), so the rows of a sequence must be listed in order.
+    // All matrix weights are read once for all rows. Afterwards every sequence has grown by its number of rows.
+    // Returns the logits of the rows with want_logits, one vocab_size row each in row order (valid until the next
+    // call), or nullptr if no row asks for logits. Results are bit-identical to feeding each sequence alone.
+    // 1 <= n <= max_batch(). If the pool cannot hold all new positions, std::runtime_error is thrown and no
+    // sequence has changed (blocks reserved on the way are given back).
+    struct StepRow {
+        Sequence* seq;
+        int token;
+        bool want_logits;
+    };
+    const float* forward_rows(const StepRow* rows, int n);   // same rules as above; seq.length() == pos0 + n afterwards
 
     const Config& config() const { return cfg_; }
     int max_seq_len() const { return ctx_len_; }
@@ -134,7 +149,8 @@ private:
     // The batched forward pass over m rows; row i is `tokens[i]` at position `positions[i]` of `seqs[i]` (whose
     // blocks must be reserved). Rows of one sequence must come in increasing position order; the keys and values
     // of all rows are stored before any attention runs, so a row sees the earlier rows of its own sequence.
-    void run_rows(const int* tokens, Sequence* const* seqs, const int* positions, int m, bool want_logits);
+    void run_rows(const int* tokens, Sequence* const* seqs, const int* positions, int m, bool want_logits,
+                  const unsigned char* row_logits = nullptr);
     void ensure_rope(int pos);   // cos/sin rows for positions 0..pos
 
     int max_batch_ = 64;
@@ -163,6 +179,7 @@ private:
     std::vector<float> q_;      // [attn_dim]  query
     std::vector<float> ao_;     // [attn_dim]  attention output (all heads concatenated)
     std::vector<float> logits_; // [vocab]
+    std::vector<float> rlogits_;   // [rows with logits, vocab] for forward_rows, grown on demand
 
     // The paged KV cache and the built-in sequence used by the plain forward() / forward_batch().
     std::unique_ptr<KvPool> kv_;

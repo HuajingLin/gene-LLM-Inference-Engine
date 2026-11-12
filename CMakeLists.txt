@@ -28,6 +28,7 @@ add_library(geneinfer STATIC
   src/model/kv_cache.cpp
   src/model/transformer.cpp
   src/sampler/sampler.cpp
+  src/runtime/engine.cpp
   src/runtime/generator.cpp
   src/util/process_memory.cpp
 )
@@ -67,6 +68,9 @@ target_link_libraries(gi_sampler_check PRIVATE geneinfer)
 add_executable(gi_bench bench/bench_main.cpp)
 target_link_libraries(gi_bench PRIVATE geneinfer)
 
+add_executable(gi_serve_bench bench/serve_bench_main.cpp)
+target_link_libraries(gi_serve_bench PRIVATE geneinfer)
+
 add_executable(gi_kernel_bench bench/kernel_bench_main.cpp)
 target_link_libraries(gi_kernel_bench PRIVATE geneinfer)
 
@@ -93,7 +97,10 @@ target_link_libraries(gi_kvpool_check PRIVATE geneinfer)
 add_executable(gi_multiseq tools/multiseq_check_main.cpp)
 target_link_libraries(gi_multiseq PRIVATE geneinfer)
 
-foreach(tgt geneinfer gi_inspect gi_tokenize gi_kernel_check gi_forward gi_generate gi_sampler_check gi_bench gi_kernel_bench gi_pool_check gi_quant_dump gi_json_check gi_dtype_check gi_hf_tokenize gi_unicode_check gi_kvpool_check gi_multiseq)
+add_executable(gi_engine_check tools/engine_check_main.cpp)
+target_link_libraries(gi_engine_check PRIVATE geneinfer)
+
+foreach(tgt geneinfer gi_inspect gi_tokenize gi_kernel_check gi_forward gi_generate gi_sampler_check gi_bench gi_kernel_bench gi_pool_check gi_quant_dump gi_json_check gi_dtype_check gi_hf_tokenize gi_unicode_check gi_kvpool_check gi_multiseq gi_engine_check gi_serve_bench)
   if(MSVC)
     target_compile_options(${tgt} PRIVATE /W4 /utf-8)
     target_compile_definitions(${tgt} PRIVATE _CRT_SECURE_NO_WARNINGS)

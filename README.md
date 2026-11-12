@@ -6,7 +6,8 @@ Lightweight LLM Inference Engine
 + Stage 1: stories15M
 + Stage 2: SmolLM2-135M
 + Stage 3a ~ 3f: SmolLM2-135M
-- Stage 3 M11: Qwen3.06B
++ Stage 3 M11: Qwen3.06B
+- Stage 4: Qwen3.06B
 ```
 
 ## run
@@ -72,6 +73,13 @@ Threads	Token-by-token	     Batched	     Speedup
 |-------|---------------|--------------|-----------------|---------|--------------|
 | -     | 111.5         | 27.9         | 35.781          | 33.32   | 1761.6       |
 
+### Stage 4.2 batching
+concurrent  wall (s)   tokens/s     tok/s/request  rows/pass    speedup    outputs
+1           2.539      25.2         25.2           1.23         1.00       identical to running alone
+2           3.269      39.2         19.6           2.47         1.55       identical to running alone
+4           5.343      47.9         12.0           4.94         1.90       identical to running alone
+8           8.623      59.4         7.4            9.58         2.36       identical to running alone
+(tokens/s counts generated tokens only; wall time includes the prompts.)
 
 ## Project Structure
 ```
@@ -121,7 +129,8 @@ geneInfer/
 │   
 ├── models/
 │   ├── stories15M/             # TinyStories
-│   └── SmolLM2-135M/           # SmolLM2
+│   ├── SmolLM2-135M/
+│   └── Qwen3-0.6B/
 │   
 ├── tools/
 │   ├── ref.py                  # M1: Reference forward + greedy generation; outputs the standar answer

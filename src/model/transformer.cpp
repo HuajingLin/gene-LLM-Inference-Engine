@@ -306,7 +306,8 @@ void Transformer::batch_chunk(Sequence& seq, const int* tokens, int m, int p0, b
     seq.set_length(p0 + m);
 }
 
-void Transformer::run_rows(const int* tokens, Sequence* const* seqs, const int* positions, int m, bool want_logits) {
+void Transformer::run_rows(const int* tokens, Sequence* const* seqs, const int* positions, int m, bool want_logits,
+                           const unsigned char* row_logits) {
     if (profile_) {
         profile_->last = std::chrono::steady_clock::now();
         profile_->forward_calls += m;
@@ -419,6 +420,21 @@ void Transformer::run_rows(const int* tokens, Sequence* const* seqs, const int* 
         lap(profile_, ForwardProfile::Residual);
     }
 
+    if (row_logits) {   // logits for any subset of the rows: final norm per row, then one matrix pass for all of them
+        int k = 0;
+        for (int i = 0; i < m; ++i) {
+            if (!row_logits[i]) continue;
+            kernels::rmsnorm(XB + sz(k) * sz(dim), X + sz(i) * sz(dim), w_.rms_final, dim, eps);
+            ++k;
+        }
+        lap(profile_, ForwardProfile::Norm);
+        if (k == 0) return;
+        if (rlogits_.size() < sz(k) * sz(cfg_.vocab_size)) rlogits_.resize(sz(k) * sz(cfg_.vocab_size));
+        const MatmulJob head = {rlogits_.data(), w_.wcls, XB, cfg_.vocab_size, dim, sz(cfg_.vocab_size), sz(dim)};
+        run_matmuls(&head, 1, k);
+        lap(profile_, ForwardProfile::Classifier);
+        return;
+    }
     if (!want_logits) return;
     float* last = X + sz(m - 1) * sz(dim);
     kernels::rmsnorm(last, last, w_.rms_final, dim, eps);
@@ -428,6 +444,43 @@ void Transformer::run_rows(const int* tokens, Sequence* const* seqs, const int* 
     lap(profile_, ForwardProfile::Classifier);
 }
 
+const float* Transformer::forward_rows(const StepRow* rows, int n) {
+    if (n < 1 || n > max_batch_) {
+        throw std::invalid_argument("forward_rows: " + std::to_string(n) + " rows, expected 1 .. " + std::to_string(max_batch_));
+    }
+    std::vector<int> tokens(sz(n));
+    std::vector<unsigned char> want(sz(n));
+    int k = 0;
+    for (int i = 0; i < n; ++i) {
+        const StepRow& r = rows[i];
+        if (r.seq == nullptr || &r.seq->pool() != kv_.get()) throw std::invalid_argument("forward_rows: bad or foreign sequence");
+        if (r.token < 0 || r.token >= cfg_.vocab_size) {
+            throw std::out_of_range("forward_rows: token id " + std::to_string(r.token) + " out of range");
+        }
+        int pos = r.seq->length();
+        for (int j = 0; j < i; ++j) pos += (rows[j].seq == r.seq) ? 1 : 0;
+        if (pos >= ctx_len_) {
+            throw std::out_of_range("forward_rows: position " + std::to_string(pos) + " exceeds the context length " +
+                                    std::to_string(ctx_len_));
+        }
+        row_seq_[sz(i)] = r.seq;
+        row_pos_[sz(i)] = pos;
+        tokens[sz(i)] = r.token;
+        want[sz(i)] = r.want_logits ? 1 : 0;
+        k += r.want_logits ? 1 : 0;
+    }
+    // Reserve every new position first; on failure give the blocks back so that nothing has changed.
+    bool ok = true;
+    for (int i = 0; i < n && ok; ++i) ok = row_seq_[sz(i)]->reserve(row_pos_[sz(i)] + 1);
+    if (!ok) {
+        for (int i = 0; i < n; ++i) row_seq_[sz(i)]->truncate(row_seq_[sz(i)]->length());
+        throw std::runtime_error("forward_rows: the KV pool has no free block left");
+    }
+    run_rows(tokens.data(), row_seq_.data(), row_pos_.data(), n, false, want.data());
+    for (int i = 0; i < n; ++i) row_seq_[sz(i)]->set_length(row_pos_[sz(i)] + 1);   // later rows of a sequence overwrite earlier values
+    return k > 0 ? rlogits_.data() : nullptr;
+}
+
 std::size_t Transformer::kv_cache_bytes() const {
     return kv_->bytes();
 }
@@ -435,7 +488,8 @@ std::size_t Transformer::kv_cache_bytes() const {
 std::size_t Transformer::scratch_bytes() const {
     return (x_.size() + xb_.size() + xb2_.size() + hb_.size() + hb2_.size() + q_.size() + ao_.size() +
             logits_.size() + bx_.size() + bxb_.size() + bxb2_.size() + bhb_.size() + bhb2_.size() + bq_.size() +
-            bao_.size() + bk_.size() + bv_.size() + batt_.size() + rope_cos_.size() + rope_sin_.size()) * sizeof(float) +
+            bao_.size() + bk_.size() + bv_.size() + batt_.size() + rope_cos_.size() + rope_sin_.size() +
+            rlogits_.size()) * sizeof(float) +
            row_seq_.size() * (sizeof(Sequence*) + sizeof(int) + sizeof(const int*));
 }
 

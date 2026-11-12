@@ -26,4 +26,4 @@ golden_qwen/
 # build artifacts
 build/
 
-qwen_tok_golden.json
+*.json
