@@ -38,6 +38,7 @@ int main(int argc, char** argv) {
         std::printf("config\thead_dim\t%d\n", c.head_dim);
         std::printf("config\trope_theta\t%.9g\n", static_cast<double>(c.rope_theta));
         std::printf("config\trms_norm_eps\t%.9g\n", static_cast<double>(c.rms_norm_eps));
+        std::printf("config\tqk_norm\t%d\n", c.qk_norm ? 1 : 0);
         std::printf("config\trope_style\t%s\n", c.rope_style == RopeStyle::HalfSplit ? "half_split" : "interleaved");
 
         // tensor <name> <byte_offset> <numel> <shape> <first4> <sum> <storage: f32|bf16>
@@ -93,6 +94,10 @@ int main(int argc, char** argv) {
             locate_mat("wk", li, lw.wk);
             locate_mat("wv", li, lw.wv);
             locate_mat("wo", li, lw.wo);
+            if (c.qk_norm) {
+                locate("q_norm", li, lw.q_norm, Storage::F32);
+                locate("k_norm", li, lw.k_norm, Storage::F32);
+            }
             locate("rms_ffn", li, lw.rms_ffn, Storage::F32);
             locate_mat("w1", li, lw.w1);
             locate_mat("w2", li, lw.w2);

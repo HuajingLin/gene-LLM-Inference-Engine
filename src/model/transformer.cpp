@@ -103,8 +103,8 @@ Transformer::Transformer(const Checkpoint& checkpoint, int max_seq_len, int n_th
     batt_.resize(sz(pool_ ? pool_->size() : 1) * sz(ctx_len_));
 
     const std::size_t cache_size = sz(cfg_.n_layers) * sz(ctx_len_) * sz(cfg_.kv_dim());
-    key_cache_.assign(cache_size, 0.0f);
-    value_cache_.assign(cache_size, 0.0f);
+    key_cache_.allocate(cache_size);
+    value_cache_.allocate(cache_size);
 }
 
 Transformer::~Transformer() = default;
@@ -319,6 +319,16 @@ void Transformer::batch_chunk(const int* tokens, int m, int p0, bool want_logits
         run_matmuls(qkv, 3, m);
         lap(profile_, ForwardProfile::QkvProj);
 
+        if (cfg_.qk_norm) {   // Qwen3: every q and k head is RMS-normalized (with its own weights) before RoPE
+            for (int i = 0; i < m; ++i) {
+                float* qi = Q + sz(i) * sz(attn_dim);
+                float* ki = kbase + sz(i) * sz(kv_dim);
+                for (int h = 0; h < n_heads; ++h) kernels::rmsnorm(qi + sz(h) * sz(head_size), qi + sz(h) * sz(head_size), lw.q_norm, head_size, eps);
+                for (int h = 0; h < cfg_.n_kv_heads; ++h) kernels::rmsnorm(ki + sz(h) * sz(head_size), ki + sz(h) * sz(head_size), lw.k_norm, head_size, eps);
+            }
+            lap(profile_, ForwardProfile::Norm);
+        }
+
         for (int i = 0; i < m; ++i) {
             const float* c = rope_cos_.data() + sz(p0 + i) * half;
             const float* s = rope_sin_.data() + sz(p0 + i) * half;
@@ -437,6 +447,12 @@ const float* Transformer::forward(int token, int pos, bool compute_logits) {
         const MatvecJob qkv[3] = {{q, lw.wq, xb, attn_dim, dim}, {k, lw.wk, xb, kv_dim, dim}, {v, lw.wv, xb, kv_dim, dim}};
         run_matvecs(qkv, 3);
         lap(profile_, ForwardProfile::QkvProj);
+
+        if (cfg_.qk_norm) {   // Qwen3: every q and k head is RMS-normalized (with its own weights) before RoPE
+            for (int h = 0; h < cfg_.n_heads; ++h) kernels::rmsnorm(q + sz(h) * sz(head_size), q + sz(h) * sz(head_size), lw.q_norm, head_size, eps);
+            for (int h = 0; h < cfg_.n_kv_heads; ++h) kernels::rmsnorm(k + sz(h) * sz(head_size), k + sz(h) * sz(head_size), lw.k_norm, head_size, eps);
+            lap(profile_, ForwardProfile::Norm);
+        }
 
         // Rotary position embedding on q and k (v is not rotated).
         kernels::rope_apply(q, attn_dim, rope_c, rope_s, head_size, cfg_.rope_style);

@@ -36,6 +36,11 @@ def make_config(args) -> dict:
         "torch_dtype": {"f32": "float32", "bf16": "bfloat16", "f16": "float16"}[args.dtype],
         "bos_token_id": 0, "eos_token_id": args.eos_id[0] if len(args.eos_id) == 1 else list(args.eos_id),
     }
+    if args.qwen3:   # same fields as the real Qwen3 config.json that matter here
+        cfg.update({"architectures": ["Qwen3ForCausalLM"], "model_type": "qwen3"})
+        cfg.pop("mlp_bias", None)
+        cfg.pop("rope_interleaved", None)
+        cfg["head_dim"] = args.head_dim or args.dim // args.heads
     if args.head_dim:
         cfg["head_dim"] = args.head_dim
     if args.minimal_config:  # only the required keys: the loader must apply its defaults
@@ -50,6 +55,7 @@ def main() -> None:
     ap.add_argument("--out", required=True)
     ap.add_argument("--dtype", choices=["f32", "bf16", "f16"], default="f32")
     ap.add_argument("--untied", action="store_true", help="separate lm_head.weight")
+    ap.add_argument("--qwen3", action="store_true", help="model_type qwen3: adds q_norm / k_norm per layer")
     ap.add_argument("--extras", action="store_true",
                     help="also store tensors the loader must ignore (rotary inv_freq, a tied lm_head)")
     ap.add_argument("--minimal-config", action="store_true", help="omit all optional config keys")
@@ -62,7 +68,7 @@ def main() -> None:
     ap.add_argument("--vocab", type=int, default=100)
     ap.add_argument("--with-tokenizer", type=int, default=0, metavar="MERGES",
                     help="also write a tokenizer with this many merges; the model vocabulary becomes its size (+ --vocab-pad)")
-    ap.add_argument("--tokenizer-variant", choices=["sequence", "bytelevel", "noregex"], default="sequence")
+    ap.add_argument("--tokenizer-variant", choices=["sequence", "bytelevel", "noregex", "qwen2"], default="sequence")
     ap.add_argument("--vocab-pad", type=int, default=0, help="extra model vocabulary entries beyond the tokenizer's")
     ap.add_argument("--pad-sinks", action="store_true",
                     help="untied only, needs --vocab-pad >= 2: the last two vocabulary ids get lm_head rows of +5 and -5, "
@@ -87,7 +93,7 @@ def main() -> None:
     rng = np.random.default_rng(args.seed)
     tensors = []
     for name, shape in llama_tensor_layout(cfg):
-        if name.endswith("layernorm.weight") or name == "model.norm.weight":
+        if name.endswith("norm.weight"):
             arr = 1.0 + 0.1 * rng.standard_normal(shape)
         else:
             arr = 0.2 * rng.standard_normal(shape)

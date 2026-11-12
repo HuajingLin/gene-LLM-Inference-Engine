@@ -15,6 +15,11 @@ bool is_letter(char32_t cp);       // general category L*  (regex \p{L})
 bool is_number(char32_t cp);       // general category N*  (regex \p{N})
 bool is_space(char32_t cp);        // Unicode White_Space  (regex \s)
 
+// Unicode normalization form C (canonical decomposition, canonical ordering, canonical composition) of UTF-8 text,
+// like the "NFC" normalizer of Hugging Face tokenizers. Bytes that are not valid UTF-8 are copied through unchanged
+// and separate the text around them (they neither combine nor reorder). Pure ASCII is returned as it is.
+std::string nfc(const std::string& utf8);
+
 // Decodes the code point that starts at s[pos] and advances pos past it. Malformed input (stray
 // continuation bytes, truncated or overlong sequences, surrogates, values above U+10FFFF) yields
 // U+FFFD and consumes one byte, so decoding always makes progress and never reads out of bounds.

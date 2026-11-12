@@ -138,8 +138,17 @@ private:
     std::vector<float> logits_; // [vocab]
 
     // KV cache, layout [layer][position][kv_dim].
-    std::vector<float> key_cache_;
-    std::vector<float> value_cache_;
+    // The KV cache is NOT zero-filled: a position is always written before it is read, and untouched pages of a
+    // large allocation cost no memory, so a model with a 40960-token context only uses what a run really fills.
+    struct CacheBuffer {
+        std::unique_ptr<float[]> mem;
+        std::size_t count = 0;
+        void allocate(std::size_t n) { mem.reset(new float[n]); count = n; }   // default-initialized: left untouched
+        float* data() { return mem.get(); }
+        std::size_t size() const { return count; }
+    };
+    CacheBuffer key_cache_;
+    CacheBuffer value_cache_;
 
     TraceFn trace_;
 };

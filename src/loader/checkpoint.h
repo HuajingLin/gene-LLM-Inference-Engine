@@ -87,6 +87,7 @@ struct Config {
     float rope_theta = 10000.0f;                   // RoPE base frequency
     float rms_norm_eps = 1e-5f;                    // RMSNorm epsilon
     RopeStyle rope_style = RopeStyle::Interleaved;
+    bool qk_norm = false;                          // RMSNorm on every q and k head before RoPE (Qwen3)
 
     int head_size() const { return head_dim; }
     int attn_dim() const { return n_heads * head_dim; }  // width of the q projection / attention output
@@ -101,6 +102,8 @@ struct LayerWeights {
     Mat wk;       // [kv_dim, dim]
     Mat wv;       // [kv_dim, dim]
     Mat wo;       // [dim, attn_dim]
+    const float* q_norm = nullptr;   // [head_dim]          Qwen3 only: per-head RMSNorm weights for q and k
+    const float* k_norm = nullptr;   // [head_dim]
     const float* rms_ffn = nullptr;  // [dim]               post_attention_layernorm
     Mat w1;       // [hidden, dim]       gate projection
     Mat w2;       // [dim, hidden]       down projection

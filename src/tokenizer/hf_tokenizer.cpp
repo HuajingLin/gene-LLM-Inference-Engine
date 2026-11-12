@@ -151,6 +151,93 @@ void gpt2_split(const std::string& s, std::vector<std::string>& out) {
     }
 }
 
+// The Qwen2 / Qwen3 regular expression, hand-written like the GPT-2 one:
+//   (?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+
+// Alternatives are tried in order at every position; inside one, the greedy parts give back characters when the
+// rest cannot match (that backtracking is spelled out in the comments below).
+const char* const kQwen2Pattern =
+    "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+";
+
+void qwen2_split(const std::string& s, std::vector<std::string>& out) {
+    std::vector<char32_t> cp;
+    std::vector<std::size_t> off;
+    for (std::size_t pos = 0; pos < s.size();) {
+        off.push_back(pos);
+        cp.push_back(unicode::next_code_point(s, pos));
+    }
+    off.push_back(s.size());
+    const std::size_t n = cp.size();
+
+    auto is_l = [&](std::size_t i) { return unicode::is_letter(cp[i]); };
+    auto is_n = [&](std::size_t i) { return unicode::is_number(cp[i]); };
+    auto is_s = [&](std::size_t i) { return unicode::is_space(cp[i]); };
+    auto is_nl = [&](std::size_t i) { return cp[i] == U'\r' || cp[i] == U'\n'; };
+    auto is_other = [&](std::size_t i) { return !is_s(i) && !is_l(i) && !is_n(i); };   // [^\s\p{L}\p{N}]
+    // case-insensitive ASCII letter; U+017F (long s) folds to 's'
+    auto is_ci = [&](std::size_t i, char ch) {
+        const char32_t c = cp[i];
+        if (c == static_cast<char32_t>(ch) || c == static_cast<char32_t>(ch - 'a' + 'A')) return true;
+        return ch == 's' && c == 0x17F;
+    };
+
+    std::size_t i = 0;
+    while (i < n) {
+        std::size_t end = i;
+
+        // 1. (?i:'s|'t|'re|'ve|'m|'ll|'d)
+        if (cp[i] == U'\'' && i + 1 < n) {
+            if (is_ci(i + 1, 's') || is_ci(i + 1, 't') || is_ci(i + 1, 'm') || is_ci(i + 1, 'd')) end = i + 2;
+            else if (i + 2 < n && ((is_ci(i + 1, 'r') && is_ci(i + 2, 'e')) || (is_ci(i + 1, 'v') && is_ci(i + 2, 'e')) ||
+                                   (is_ci(i + 1, 'l') && is_ci(i + 2, 'l')))) end = i + 3;
+        }
+
+        // 2. [^\r\n\p{L}\p{N}]?\p{L}+  (the optional character is anything but CR, LF, a letter or a number; if no
+        //    letter follows it, giving it back cannot help because it is not a letter itself)
+        if (end == i) {
+            std::size_t j = i;
+            if (!is_nl(i) && !is_l(i) && !is_n(i) && i + 1 < n && is_l(i + 1)) j = i + 1;
+            if (j < n && is_l(j)) {
+                std::size_t k = j;
+                while (k < n && is_l(k)) ++k;
+                end = k;
+            }
+        }
+
+        // 3. \p{N}  (one digit at a time)
+        if (end == i && is_n(i)) end = i + 1;
+
+        // 4.  ?[^\s\p{L}\p{N}]+[\r\n]*
+        if (end == i) {
+            const std::size_t j = (cp[i] == U' ') ? i + 1 : i;
+            if (j < n && is_other(j)) {
+                std::size_t k = j;
+                while (k < n && is_other(k)) ++k;
+                while (k < n && is_nl(k)) ++k;
+                end = k;
+            }
+        }
+
+        // 5. \s*[\r\n]+  : the longest whitespace run, given back until it ends with a CR or LF
+        // 6. \s+(?!\S)    : a whitespace run up to the end of the text, or all but its last character
+        // 7. \s+          : a single whitespace character in front of something else
+        if (end == i && is_s(i)) {
+            std::size_t k = i;
+            while (k < n && is_s(k)) ++k;   // the whitespace run [i, k)
+            std::size_t last_nl = k;
+            for (std::size_t m = k; m > i; --m) {
+                if (is_nl(m - 1)) { last_nl = m - 1; break; }
+            }
+            if (last_nl != k) end = last_nl + 1;                       // alternative 5
+            else if (k == n || k - i == 1) end = k;                    // alternative 6 (to the end) / 7 (one character)
+            else end = k - 1;                                          // alternative 6
+        }
+
+        if (end == i) end = i + 1;   // cannot happen (every character is a letter, number, other or space); keeps progress certain
+        out.push_back(s.substr(off[i], off[end] - off[i]));
+        i = end;
+    }
+}
+
 }  // namespace
 
 // ==================================================================================================
@@ -166,7 +253,10 @@ HfTokenizer HfTokenizer::load(const std::string& directory) {
 
     // ---- things this implementation does not do: refuse instead of guessing --------------------
     if (const JsonValue* n = root.find("normalizer")) {
-        if (!n->is_null()) fail("normalizers are not supported yet");
+        if (!n->is_null()) {
+            if (n->at("type").as_string() != "NFC") fail("normalizer '" + n->at("type").as_string() + "' is not supported (only NFC)");
+            tk.nfc_ = true;
+        }
     }
     if (const JsonValue* p = root.find("post_processor")) {
         if (!p->is_null() && p->at("type").as_string() != "ByteLevel") {
@@ -191,7 +281,20 @@ HfTokenizer HfTokenizer::load(const std::string& directory) {
         bool seen_byte_level = false;
         for (std::size_t i = 0; i < stages.size(); ++i) {
             const std::string type = stages[i]->at("type").as_string();
-            if (type == "Digits" && i == 0 && stages.size() == 2) {
+            if (type == "Split" && i == 0 && stages.size() == 2) {
+                const JsonValue* pattern = stages[i]->find("pattern");
+                const JsonValue* regex = pattern ? pattern->find("Regex") : nullptr;
+                if (!regex || !regex->is_string() || regex->as_string() != kQwen2Pattern) {
+                    fail("a Split pre_tokenizer is supported only with the Qwen2 regular expression");
+                }
+                const JsonValue* behavior = stages[i]->find("behavior");
+                const JsonValue* invert = stages[i]->find("invert");
+                if (!behavior || !behavior->is_string() || behavior->as_string() != "Isolated" ||
+                    (invert && invert->is_bool() && invert->as_bool())) {
+                    fail("the Split pre_tokenizer must use behavior Isolated without invert");
+                }
+                tk.qwen2_split_ = true;
+            } else if (type == "Digits" && i == 0 && stages.size() == 2) {
                 tk.split_digits_ = true;
                 const JsonValue* ind = stages[i]->find("individual_digits");
                 tk.individual_digits_ = ind && ind->is_bool() && ind->as_bool();
@@ -207,6 +310,7 @@ HfTokenizer HfTokenizer::load(const std::string& directory) {
             }
         }
         if (!seen_byte_level) fail("the pre_tokenizer must end with ByteLevel");
+        if (tk.qwen2_split_ && tk.use_regex_) fail("a Split pre_tokenizer needs ByteLevel with use_regex=false after it");
     }
 
     // ---- model ----------------------------------------------------------------------------------------
@@ -326,6 +430,18 @@ HfTokenizer HfTokenizer::load(const std::string& directory) {
             else if (e->is_array()) for (const JsonValue& x : e->items()) tk.eos_ids_.push_back(to_id(x, "eos_token_id"));
         }
     }
+    // generation_config.json may list more end-of-sequence ids (Qwen3: <|im_end|> and <|endoftext|>); add the new ones
+    if (fs::exists(dir / "generation_config.json")) {
+        const JsonValue gen = read_json(dir / "generation_config.json");
+        if (const JsonValue* e = gen.find("eos_token_id")) {
+            std::vector<int> more;
+            if (e->is_number()) more.push_back(to_id(*e, "eos_token_id"));
+            else if (e->is_array()) for (const JsonValue& x : e->items()) more.push_back(to_id(x, "eos_token_id"));
+            for (const int id : more) {
+                if (std::find(tk.eos_ids_.begin(), tk.eos_ids_.end(), id) == tk.eos_ids_.end()) tk.eos_ids_.push_back(id);
+            }
+        }
+    }
     return tk;
 }
 
@@ -341,8 +457,14 @@ bool HfTokenizer::is_special(int id) const {
 // ==================================================================================================
 //  encoding
 // ==================================================================================================
+std::string HfTokenizer::normalize(const std::string& text) const { return nfc_ ? unicode::nfc(text) : text; }
+
 std::vector<std::string> HfTokenizer::pre_tokenize(const std::string& text) const {
     std::vector<std::string> stage;
+    if (qwen2_split_) {
+        if (!text.empty()) qwen2_split(text, stage);
+        return stage;
+    }
     if (split_digits_) split_digits(text, individual_digits_, stage);
     else if (!text.empty()) stage.push_back(text);
     if (!use_regex_) return stage;
@@ -428,7 +550,7 @@ void HfTokenizer::bpe(const std::string& piece, std::vector<int>& out) const {
 
 void HfTokenizer::encode_plain(const std::string& text, std::vector<int>& out) const {
     if (text.empty()) return;
-    for (const std::string& piece : pre_tokenize(text)) bpe(piece, out);
+    for (const std::string& piece : pre_tokenize(normalize(text))) bpe(piece, out);
 }
 
 int HfTokenizer::match_added(const std::string& text, std::size_t pos) const {
@@ -490,8 +612,9 @@ std::string HfTokenizer::decode(const std::vector<int>& ids, bool skip_special) 
 std::string HfTokenizer::describe() const {
     std::ostringstream os;
     os << "byte-level BPE: " << id_to_token_.size() << " token ids, " << n_merges_ << " merges, " << added_.size()
-       << " added tokens\npre-tokenizer: " << (split_digits_ ? (individual_digits_ ? "digits (one per digit), " : "digits (grouped), ") : "")
-       << (use_regex_ ? "GPT-2 regex" : "no regex") << "\nbos id: " << bos_id_ << ", eos ids:";
+       << " added tokens\nnormalizer: " << (nfc_ ? "NFC" : "none")
+       << "\npre-tokenizer: " << (split_digits_ ? (individual_digits_ ? "digits (one per digit), " : "digits (grouped), ") : "")
+       << (qwen2_split_ ? "Qwen2 regex" : use_regex_ ? "GPT-2 regex" : "no regex") << "\nbos id: " << bos_id_ << ", eos ids:";
     for (const int e : eos_ids_) os << ' ' << e;
     if (eos_ids_.empty()) os << " none";
     return os.str();

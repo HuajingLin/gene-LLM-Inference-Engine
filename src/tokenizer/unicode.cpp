@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <iterator>
+#include <utility>
+#include <vector>
 
 namespace geneinfer {
 namespace unicode {
@@ -27,7 +29,123 @@ bool in_ranges(const CodePointRange (&table)[N], char32_t cp) {
     return cp <= it->hi;
 }
 
+#include "tokenizer/unicode_norm_tables.inc"
+
+int ccc_of(char32_t cp) {
+    const CccRange* end = kCccRanges + sizeof kCccRanges / sizeof kCccRanges[0];
+    const CccRange* it = std::upper_bound(kCccRanges, end, static_cast<std::uint32_t>(cp),
+                                          [](std::uint32_t value, const CccRange& r) { return value < r.lo; });
+    if (it == kCccRanges) return 0;
+    --it;
+    return cp <= it->hi ? it->ccc : 0;
+}
+
+constexpr char32_t kSBase = 0xAC00, kLBase = 0x1100, kVBase = 0x1161, kTBase = 0x11A7;
+constexpr int kLCount = 19, kVCount = 21, kTCount = 28, kNCount = kVCount * kTCount, kSCount = kLCount * kNCount;
+
+// Full canonical decomposition of one code point, appended to `out`.
+void decompose(char32_t cp, std::vector<char32_t>& out) {
+    if (cp >= kSBase && cp < kSBase + kSCount) {   // Hangul syllable: arithmetic
+        const int s = static_cast<int>(cp - kSBase);
+        out.push_back(kLBase + static_cast<char32_t>(s / kNCount));
+        out.push_back(kVBase + static_cast<char32_t>((s % kNCount) / kTCount));
+        if (s % kTCount) out.push_back(kTBase + static_cast<char32_t>(s % kTCount));
+        return;
+    }
+    const DecompEntry* end = kDecomp + sizeof kDecomp / sizeof kDecomp[0];
+    const DecompEntry* it = std::lower_bound(kDecomp, end, static_cast<std::uint32_t>(cp),
+                                             [](const DecompEntry& e, std::uint32_t value) { return e.cp < value; });
+    if (it == end || it->cp != cp) {
+        out.push_back(cp);
+        return;
+    }
+    decompose(it->first, out);
+    if (it->second) decompose(it->second, out);
+}
+
+// The primary composite of the pair, or 0.
+char32_t compose_pair(char32_t a, char32_t b) {
+    if (a >= kLBase && a < kLBase + kLCount && b >= kVBase && b < kVBase + kVCount) {
+        return kSBase + (static_cast<char32_t>(a - kLBase) * kVCount + static_cast<char32_t>(b - kVBase)) * kTCount;
+    }
+    if (a >= kSBase && a < kSBase + kSCount && (a - kSBase) % kTCount == 0 && b > kTBase && b < kTBase + kTCount) {
+        return a + (b - kTBase);
+    }
+    const ComposeEntry* end = kCompose + sizeof kCompose / sizeof kCompose[0];
+    const ComposeEntry* it = std::lower_bound(kCompose, end, std::make_pair(static_cast<std::uint32_t>(a), static_cast<std::uint32_t>(b)),
+                                              [](const ComposeEntry& e, const std::pair<std::uint32_t, std::uint32_t>& key) {
+                                                  return e.first != key.first ? e.first < key.first : e.second < key.second;
+                                              });
+    return (it != end && it->first == a && it->second == b) ? static_cast<char32_t>(it->composite) : 0;
+}
+
+void nfc_segment(const std::vector<char32_t>& in, std::string& out) {
+    std::vector<char32_t> d;
+    d.reserve(in.size() + 8);
+    for (const char32_t cp : in) decompose(cp, d);
+
+    // canonical ordering: inside every run of non-starters, stable sort by combining class
+    for (std::size_t i = 1; i < d.size(); ++i) {
+        const int c = ccc_of(d[i]);
+        if (c == 0) continue;
+        std::size_t j = i;
+        while (j > 0 && ccc_of(d[j - 1]) > c) {
+            std::swap(d[j - 1], d[j]);
+            --j;
+        }
+    }
+
+    // canonical composition
+    std::vector<char32_t> res;
+    res.reserve(d.size());
+    std::size_t starter = 0;
+    bool have_starter = false;
+    int last_ccc = 0;
+    for (const char32_t ch : d) {
+        const int c = ccc_of(ch);
+        if (have_starter) {
+            const bool adjacent = res.size() - 1 == starter;
+            const bool blocked = !adjacent && last_ccc >= c;
+            if (!blocked) {
+                const char32_t composite = compose_pair(res[starter], ch);
+                if (composite != 0) {
+                    res[starter] = composite;
+                    continue;
+                }
+            }
+        }
+        if (c == 0) {
+            starter = res.size();
+            have_starter = true;
+        }
+        res.push_back(ch);
+        last_ccc = c;
+    }
+    for (const char32_t cp : res) append_utf8(out, cp);
+}
+
 }  // namespace
+
+std::string nfc(const std::string& utf8) {
+    const bool ascii = std::all_of(utf8.begin(), utf8.end(), [](char c) { return static_cast<unsigned char>(c) < 0x80; });
+    if (ascii) return utf8;
+    std::string out;
+    out.reserve(utf8.size());
+    std::vector<char32_t> segment;
+    for (std::size_t pos = 0; pos < utf8.size();) {
+        const std::size_t start = pos;
+        const char32_t cp = next_code_point(utf8, pos);
+        if (cp == kReplacement && pos - start == 1) {   // an invalid byte (a real U+FFFD takes three): copy it through
+            nfc_segment(segment, out);
+            segment.clear();
+            out += utf8[start];
+            continue;
+        }
+        segment.push_back(cp);
+    }
+    nfc_segment(segment, out);
+    return out;
+}
 
 bool is_letter(char32_t cp) { return in_ranges(kLetterRanges, cp); }
 bool is_number(char32_t cp) { return in_ranges(kNumberRanges, cp); }

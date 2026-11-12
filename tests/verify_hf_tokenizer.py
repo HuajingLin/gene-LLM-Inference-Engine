@@ -4,7 +4,8 @@
 Checks, for every tokenizer directory tested:
   1. encode: token ids equal those of the independent Python reference (tools/hf_tok_ref.py)
   2. pre-tokenizer: the pieces equal the reference's (a real regex engine, expanded Unicode classes)
-  3. round trip: decode(encode(text)) gives back the exact bytes of the text
+  3. round trip: decode(encode(text)) gives back the exact bytes of the text (NFC-normalized, outside added tokens,
+     for tokenizers that have the NFC normalizer)
   4. decode: random id sequences (special tokens included, with and without skipping them) decode to the same bytes
   5. add_bos, and error handling (out-of-range ids, unsupported tokenizer.json settings, broken files)
   6. with --golden: ids, pieces and decoded text equal what the Hugging Face `tokenizers` library produced
@@ -31,7 +32,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent / "tools"))
-from hf_tok_ref import RefTokenizer, to_byte_level  # noqa: E402
+from hf_tok_ref import QWEN2_PATTERN, RefTokenizer, to_byte_level  # noqa: E402
 from tok_corpus import all_cases  # noqa: E402
 
 MAKE_TOKENIZER = str(HERE.parent / "tools" / "make_dummy_hf_tokenizer.py")
@@ -84,7 +85,7 @@ def check_directory(exe: str, directory: Path, texts: list[str], label: str, fai
     # ---- 3. round trip -------------------------------------------------------------------------------------------
     decoded = [bytes.fromhex(h) for h in batch(exe, directory, "decode-batch", cpp_ids)]
     for i, (t, d) in enumerate(zip(texts, decoded)):
-        if d != t.encode("utf-8"):
+        if d != ref.normalized_text(t).encode("utf-8"):
             failures.append(f"[{label}] round trip failed for {short(t)}: got {d[:40]!r}")
             break
 
@@ -174,7 +175,15 @@ def check_errors_and_options(exe: str, good: Path, tmp: Path, failures: list[str
     shutil.copytree(good, broken)
     (broken / "tokenizer.json").write_text('{"model": ', encoding="utf-8")
     expect_failure("invalid JSON", broken, "tokenizer.json")
-    expect_failure("normalizer", variant("norm", lambda t: t.update(normalizer={"type": "NFC"})), "normalizer")
+    expect_failure("normalizer", variant("norm", lambda t: t.update(normalizer={"type": "Lowercase"})), "normalizer")
+    qwen_split = {"type": "Split", "pattern": {"Regex": r"\w+"}, "behavior": "Isolated", "invert": False}
+    byte_level = {"type": "ByteLevel", "add_prefix_space": False, "trim_offsets": True, "use_regex": False}
+    expect_failure("Split with another regex", variant("split1", lambda t: t.update(
+        pre_tokenizer={"type": "Sequence", "pretokenizers": [qwen_split, byte_level]})), "Qwen2")
+    expect_failure("Split behavior", variant("split2", lambda t: t.update(
+        pre_tokenizer={"type": "Sequence", "pretokenizers": [dict(qwen_split, pattern={"Regex": QWEN2_PATTERN}, behavior="Removed"), byte_level]})), "Isolated")
+    expect_failure("Split followed by the GPT-2 regex", variant("split3", lambda t: t.update(
+        pre_tokenizer={"type": "Sequence", "pretokenizers": [dict(qwen_split, pattern={"Regex": QWEN2_PATTERN}), dict(byte_level, use_regex=True)]})), "use_regex")
     expect_failure("post-processor", variant("post", lambda t: t.update(post_processor={"type": "TemplateProcessing"})), "post_processor")
     expect_failure("decoder", variant("dec", lambda t: t.update(decoder={"type": "Metaspace"})), "decoder")
     expect_failure("pre-tokenizer Split", variant("pre", lambda t: t.update(pre_tokenizer={"type": "Split"})), "pre_tokenizer")
@@ -189,6 +198,18 @@ def check_errors_and_options(exe: str, good: Path, tmp: Path, failures: list[str
     expect_failure("lstrip", variant("lstrip", lambda t: t["added_tokens"][0].update(lstrip=True)), "lstrip")
     dup = variant("dupid", lambda t: t["model"]["vocab"].update({"zzzdup": 0}))
     expect_failure("duplicate id", dup, "share the id")
+
+    # end-of-sequence ids: config.json's, then the new ones of generation_config.json
+    eos_dir = tmp / "case_eos"
+    shutil.copytree(good, eos_dir)
+    cfg = json.loads((eos_dir / "config.json").read_text()) if (eos_dir / "config.json").exists() else {}
+    cfg["eos_token_id"] = 3
+    (eos_dir / "config.json").write_text(json.dumps(cfg))
+    (eos_dir / "generation_config.json").write_text(json.dumps({"eos_token_id": [5, 3, 7]}))
+    n += 1
+    info = run(exe, eos_dir, "info").stdout.decode()
+    if "eos ids: 3 5 7" not in info:
+        failures.append(f"eos ids of config.json and generation_config.json were not combined: {info.strip().splitlines()[-1]!r}")
 
     # ids out of range, malformed input of the batch modes
     n += 2
@@ -244,7 +265,7 @@ def main() -> int:
     with tempfile.TemporaryDirectory() as tmp_s:
         tmp = Path(tmp_s)
         for name, flags in (("sequence", ["--variant", "sequence"]), ("bytelevel", ["--variant", "bytelevel"]),
-                            ("noregex", ["--variant", "noregex"]),
+                            ("noregex", ["--variant", "noregex"]), ("qwen2", ["--variant", "qwen2"]),
                             ("sequence+ignore_merges", ["--variant", "sequence", "--ignore-merges"])):
             d = tmp / f"tok_{name.replace('+', '_')}"
             subprocess.run([sys.executable, MAKE_TOKENIZER, "--out", str(d), "--merges", "300", *flags],

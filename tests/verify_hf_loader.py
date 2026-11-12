@@ -49,6 +49,9 @@ VARIANTS = {
     "default config values": ["--minimal-config"],
     "single layer, multi-query": ["--layers", "1", "--kv-heads", "1"],
     "bf16 data at odd addresses (falls back to float32)": ["--dtype", "bf16", "--header-pad", "1"],
+    "qwen3 (q_norm / k_norm), f32": ["--qwen3"],
+    "qwen3 bf16 untied, head_dim 16 > dim / heads": ["--qwen3", "--dtype", "bf16", "--untied", "--dim", "48", "--heads", "4", "--kv-heads", "2", "--head-dim", "16", "--hidden", "96"],
+    "qwen3 with odd-address bf16 and extra tensors": ["--qwen3", "--dtype", "bf16", "--header-pad", "1", "--extras"],
 }
 
 
@@ -105,6 +108,8 @@ def check_model(exe: str, directory: Path, f32_weights: bool = False) -> list[st
     HF_ROLE = {"rms_att": "input_layernorm", "wq": "self_attn.q_proj", "wk": "self_attn.k_proj",
                "wv": "self_attn.v_proj", "wo": "self_attn.o_proj", "rms_ffn": "post_attention_layernorm",
                "w1": "mlp.gate_proj", "w2": "mlp.down_proj", "w3": "mlp.up_proj"}
+    if want["qk_norm"]:
+        HF_ROLE.update({"q_norm": "self_attn.q_norm", "k_norm": "self_attn.k_norm"})
     want_roles = {(-1, "token_embedding"): ("model.embed_tokens.weight", 0),
                   (-1, "rms_final"): ("model.norm.weight", 0),
                   (-1, "wcls"): ("model.embed_tokens.weight" if want["shared_classifier"] else "lm_head.weight", 0)}
@@ -191,7 +196,8 @@ def corrupt_cases(good: Path, tmp: Path):
     yield "sharded checkpoint", d, "sharded"
     d = fresh("bad_json"); (d / "config.json").write_text('{"hidden_size": 32,'); yield "invalid config.json", d, "config.json"
     d = fresh("not_object"); (d / "config.json").write_text("[1,2]"); yield "config.json is not an object", d, "object"
-    d = fresh("qwen"); edit_config(d, model_type="qwen3"); yield "unsupported model_type", d, "model_type"
+    d = fresh("qwen"); edit_config(d, model_type="mistral"); yield "unsupported model_type", d, "model_type"
+    d = fresh("qk"); edit_config(d, model_type="qwen3"); yield "qwen3 config without q_norm tensors", d, "q_norm"
     d = fresh("scaling"); edit_config(d, rope_scaling={"type": "llama3"}); yield "rope_scaling", d, "rope_scaling"
     d = fresh("act"); edit_config(d, hidden_act="gelu"); yield "unsupported activation", d, "hidden_act"
     d = fresh("bias"); edit_config(d, attention_bias=True); yield "attention bias", d, "attention_bias"

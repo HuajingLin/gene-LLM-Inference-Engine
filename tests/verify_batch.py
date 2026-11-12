@@ -32,6 +32,8 @@ MODELS = {
                 "--head-dim", "6", "--vocab", "103", "--max-pos", "256"],
     "bf16 odd untied": ["--dtype", "bf16", "--untied", "--dim", "50", "--hidden", "90", "--layers", "2", "--heads", "5",
                         "--kv-heads", "5", "--head-dim", "10", "--vocab", "77", "--max-pos", "256"],
+    "qwen3 bf16 qk-norm": ["--qwen3", "--dtype", "bf16", "--dim", "48", "--hidden", "90", "--layers", "2", "--heads", "4",
+                           "--kv-heads", "2", "--head-dim", "20", "--vocab", "91", "--max-pos", "256"],
     "f16 big groups": ["--dtype", "f16", "--dim", "96", "--hidden", "203", "--layers", "2", "--heads", "4",
                        "--kv-heads", "2", "--head-dim", "24", "--vocab", "259", "--max-pos", "256"],
 }

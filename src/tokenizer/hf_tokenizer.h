@@ -3,15 +3,16 @@
 //
 // Supported configuration (anything else is rejected with a clear error, never guessed):
 //   model          BPE, no continuing-subword prefix / end-of-word suffix, no byte fallback
-//   normalizer     none
+//   normalizer     none, or NFC (Unicode normalization form C)
 //   pre_tokenizer  ByteLevel(add_prefix_space=false)                      or
-//                  Sequence[Digits(individual_digits), ByteLevel(add_prefix_space=false)]
+//                  Sequence[Digits(individual_digits), ByteLevel(add_prefix_space=false)]   or
+//                  Sequence[Split(<the Qwen2 regular expression>, Isolated), ByteLevel(use_regex=false)]
 //   post_processor none or ByteLevel (adds no tokens)
 //   decoder        ByteLevel
 //   added_tokens   matched literally in the input text, without lstrip / rstrip / single_word
 //
-// Pipeline of encode(): split the text at added tokens (e.g. "<|im_start|>") -> pre-tokenize each part
-// (digits, then the GPT-2 regex) -> map bytes to the printable "byte-level" alphabet -> merge pairs
+// Pipeline of encode(): split the text at added tokens (e.g. "<|im_start|>") -> normalize each part (NFC, if the
+// tokenizer says so) -> pre-tokenize it (digits, then the GPT-2 regex; or the Qwen2 regex) -> map bytes to the printable "byte-level" alphabet -> merge pairs
 // by priority (BPE). decode() reverses the last step and returns raw UTF-8 bytes.
 #pragma once
 
@@ -45,7 +46,10 @@ public:
     std::string decode_piece(int id) const;
     std::string decode(const std::vector<int>& ids, bool skip_special = false) const;
 
-    // The pieces the pre-tokenizer cuts a plain text into (before BPE); exposed for tests.
+    // The normalizer on its own (identity when the tokenizer has none); exposed for tests.
+    std::string normalize(const std::string& text) const;
+
+    // The pieces the pre-tokenizer cuts an (already normalized) plain text into, before BPE; exposed for tests.
     std::vector<std::string> pre_tokenize(const std::string& text) const;
 
     std::string describe() const;   // one-paragraph summary of what was loaded
@@ -80,6 +84,8 @@ private:
     bool split_digits_ = false;
     bool individual_digits_ = false;
     bool use_regex_ = true;
+    bool qwen2_split_ = false;      // the Split pre-tokenizer with the Qwen2 regular expression
+    bool nfc_ = false;              // normalizer: NFC
     int bos_id_ = -1;
     std::vector<int> eos_ids_;
     std::size_t n_merges_ = 0;

@@ -23,7 +23,7 @@ add_library(geneinfer STATIC
   src/tokenizer/tokenizer.cpp
   src/tokenizer/unicode.cpp
   src/tokenizer/hf_tokenizer.cpp
-  src/tokenizer/text_tokenizer.cpp 
+  src/tokenizer/text_tokenizer.cpp
   src/kernels/kernels.cpp
   src/model/transformer.cpp
   src/sampler/sampler.cpp
@@ -71,7 +71,6 @@ target_link_libraries(gi_kernel_bench PRIVATE geneinfer)
 
 add_executable(gi_pool_check tools/pool_check_main.cpp)
 target_link_libraries(gi_pool_check PRIVATE geneinfer)
-
 add_executable(gi_quant_dump tools/quant_dump_main.cpp)
 target_link_libraries(gi_quant_dump PRIVATE geneinfer)
 

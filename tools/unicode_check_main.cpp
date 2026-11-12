@@ -1,6 +1,7 @@
 // unicode_check_main.cpp - exposes the Unicode helpers for tests/verify_unicode.py.
 //   gi_unicode_check classes   stdout: 0x110000 bytes, one per code point: bit0 = letter, bit1 = number, bit2 = space
 //   gi_unicode_check decode    stdin: bytes             stdout: the decoded code points as little-endian uint32
+//   gi_unicode_check nfc       stdin: UTF-8 texts separated by NUL bytes  stdout: their NFC forms, separated the same way
 //   gi_unicode_check encode    stdin: uint32 code points  stdout: their UTF-8 encoding
 #include <cstdint>
 #include <cstdio>
@@ -47,6 +48,19 @@ int main(int argc, char** argv) {
         std::size_t pos = 0;
         while (pos < in.size()) out.push_back(static_cast<std::uint32_t>(unicode::next_code_point(in, pos)));
         std::fwrite(out.data(), sizeof(std::uint32_t), out.size(), stdout);
+    } else if (mode == "nfc") {
+        // stdin: lines of text separated by a NUL byte; stdout: the NFC form of each, separated the same way
+        const std::string in = read_stdin();
+        std::string out;
+        std::size_t start = 0;
+        while (start <= in.size()) {
+            std::size_t end = in.find('\0', start);
+            if (end == std::string::npos) end = in.size();
+            out += unicode::nfc(in.substr(start, end - start));
+            if (end < in.size()) out += '\0';
+            start = end + 1;
+        }
+        std::fwrite(out.data(), 1, out.size(), stdout);
     } else if (mode == "encode") {
         const std::string in = read_stdin();
         std::string out;

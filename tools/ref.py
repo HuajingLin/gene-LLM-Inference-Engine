@@ -100,6 +100,9 @@ class Model:
             q = w["wq"][l] @ xb
             k = w["wk"][l] @ xb
             v = w["wv"][l] @ xb
+            if c.qk_norm:   # Qwen3: RMSNorm over every head of q and k, before RoPE
+                q = np.concatenate([rmsnorm(q[h * hs:(h + 1) * hs], w["q_norm"][l], eps) for h in range(c.n_heads)])
+                k = np.concatenate([rmsnorm(k[h * hs:(h + 1) * hs], w["k_norm"][l], eps) for h in range(c.n_kv_heads)])
             q = apply_rope(q, pos, hs, theta, style)
             k = apply_rope(k, pos, hs, theta, style)
 

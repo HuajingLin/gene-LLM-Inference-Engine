@@ -52,7 +52,8 @@ def main() -> None:
                 "auto_ids": auto(text, add_special_tokens=False)["input_ids"],
                 "pieces": None}
         if not any(a in text for a in added):
-            case["pieces"] = [piece for piece, _ in backend.pre_tokenizer.pre_tokenize_str(text)]
+            normalized = backend.normalizer.normalize_str(text) if backend.normalizer is not None else text
+            case["pieces"] = [piece for piece, _ in backend.pre_tokenizer.pre_tokenize_str(normalized)]
         cases.append(case)
 
     rng = random.Random(11)

@@ -161,6 +161,10 @@ def main() -> int:
             "f16, noregex tokenizer, head_dim 16": ["--with-tokenizer", 120, "--tokenizer-variant", "noregex",
                                                     "--dtype", "f16", "--dim", 48, "--heads", 4, "--kv-heads", 2,
                                                     "--head-dim", 16, "--seed", 2, "--max-pos", 96],
+            "qwen3: QK-norm model, NFC + Qwen2-split tokenizer, bf16 tied": ["--qwen3", "--with-tokenizer", 220, "--tokenizer-variant", "qwen2",
+                                                                          "--dtype", "bf16", "--dim", 48, "--heads", 4, "--kv-heads", 2,
+                                                                          "--head-dim", 16, "--rope-theta", 1000000, "--eps", "1e-6",
+                                                                          "--eos-id", "1,2", "--seed", 4, "--max-pos", 96],
             "padded vocabulary, ids unknown to the tokenizer": ["--with-tokenizer", 100, "--untied", "--vocab-pad", 4,
                                                                 "--pad-sinks", "--seed", 3, "--eos-id", 1, "--max-pos", 96],
         }

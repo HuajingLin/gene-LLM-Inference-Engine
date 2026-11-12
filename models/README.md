@@ -9,3 +9,6 @@ wget "https://github.com/karpathy/llama2.c/raw/master/tokenizer.bin"
 
 # SmolLM2-135M
 hf download HuggingFaceTB/SmolLM2-135M --local-dir models/SmolLM2-135M
+
+# Qwen3-06.B
+hf download Qwen/Qwen3-0.6B --local-dir models/Qwen3-0.6B

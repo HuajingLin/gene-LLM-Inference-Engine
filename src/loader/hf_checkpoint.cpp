@@ -57,8 +57,8 @@ Config parse_config(const JsonValue& j) {
     if (!j.is_object()) fail("config.json is not a JSON object");
 
     if (const JsonValue* t = j.find("model_type")) {
-        if (t->is_string() && t->as_string() != "llama") {
-            fail("unsupported model_type '" + t->as_string() + "' (only 'llama' is implemented)");
+        if (t->is_string() && t->as_string() != "llama" && t->as_string() != "qwen3") {
+            fail("unsupported model_type '" + t->as_string() + "' (only 'llama' and 'qwen3' are implemented)");
         }
     }
     if (const JsonValue* s = j.find("rope_scaling")) {
@@ -74,6 +74,7 @@ Config parse_config(const JsonValue& j) {
     }
 
     Config c;
+    if (const JsonValue* t = j.find("model_type")) c.qk_norm = t->is_string() && t->as_string() == "qwen3";
     c.dim = required_int(j, "hidden_size");
     c.hidden_dim = required_int(j, "intermediate_size");
     c.n_layers = required_int(j, "num_hidden_layers");
@@ -129,8 +130,8 @@ Checkpoint Checkpoint::load_hf(const std::string& directory, const LoadOptions& 
     const std::int64_t D = c.dim, H = c.hidden_dim, V = c.vocab_size;
     const std::int64_t A = c.attn_dim(), KV = c.kv_dim();
 
-    ck.converted_.reserve(static_cast<std::size_t>(c.n_layers) * 9 + 3);
-    ck.tensors_.reserve(static_cast<std::size_t>(c.n_layers) * 9 + 3);
+    ck.converted_.reserve(static_cast<std::size_t>(c.n_layers) * 11 + 3);
+    ck.tensors_.reserve(static_cast<std::size_t>(c.n_layers) * 11 + 3);
 
     // Returns a view of the tensor `name`, after checking existence, dtype and shape.
     // Float32 data is used in place. bfloat16 MATRICES (`matrix` = true) are used in place too, as 16-bit
@@ -185,6 +186,10 @@ Checkpoint Checkpoint::load_hf(const std::string& directory, const LoadOptions& 
         lw.wk = fetch(p + "self_attn.k_proj.weight", {KV, D}, true);
         lw.wv = fetch(p + "self_attn.v_proj.weight", {KV, D}, true);
         lw.wo = fetch(p + "self_attn.o_proj.weight", {D, A}, true);
+        if (c.qk_norm) {
+            lw.q_norm = vec(p + "self_attn.q_norm.weight", {c.head_dim});
+            lw.k_norm = vec(p + "self_attn.k_norm.weight", {c.head_dim});
+        }
         lw.rms_ffn = vec(p + "post_attention_layernorm.weight", {D});
         lw.w1 = fetch(p + "mlp.gate_proj.weight", {H, D}, true);
         lw.w3 = fetch(p + "mlp.up_proj.weight", {H, D}, true);

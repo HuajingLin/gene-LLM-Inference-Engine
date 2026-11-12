@@ -104,6 +104,7 @@ def derived_config(cfg: dict) -> dict:
         "rope_theta": np.float32(cfg.get("rope_theta", 10000.0)),
         "rms_norm_eps": np.float32(cfg.get("rms_norm_eps", 1e-6)),
         "rope_style": "half_split", "shared_classifier": bool(cfg.get("tie_word_embeddings", False)),
+        "qk_norm": cfg.get("model_type") == "qwen3",
     }
 
 
@@ -116,7 +117,10 @@ def llama_tensor_layout(cfg: dict) -> list[tuple[str, tuple[int, ...]]]:
         p = f"model.layers.{l}."
         layout += [(p + "input_layernorm.weight", (D,)), (p + "self_attn.q_proj.weight", (A, D)),
                    (p + "self_attn.k_proj.weight", (KV, D)), (p + "self_attn.v_proj.weight", (KV, D)),
-                   (p + "self_attn.o_proj.weight", (D, A)), (p + "post_attention_layernorm.weight", (D,)),
+                   (p + "self_attn.o_proj.weight", (D, A))]
+        if d["qk_norm"]:
+            layout += [(p + "self_attn.q_norm.weight", (d["head_dim"],)), (p + "self_attn.k_norm.weight", (d["head_dim"],))]
+        layout += [(p + "post_attention_layernorm.weight", (D,)),
                    (p + "mlp.gate_proj.weight", (H, D)), (p + "mlp.up_proj.weight", (H, D)),
                    (p + "mlp.down_proj.weight", (D, H))]
     layout.append(("model.norm.weight", (D,)))
@@ -130,6 +134,7 @@ def llama_tensor_layout(cfg: dict) -> list[tuple[str, tuple[int, ...]]]:
 HF_ROLE = {"rms_att": "input_layernorm", "wq": "self_attn.q_proj", "wk": "self_attn.k_proj",
            "wv": "self_attn.v_proj", "wo": "self_attn.o_proj", "rms_ffn": "post_attention_layernorm",
            "w1": "mlp.gate_proj", "w2": "mlp.down_proj", "w3": "mlp.up_proj"}
+QK_ROLE = {"q_norm": "self_attn.q_norm", "k_norm": "self_attn.k_norm"}   # Qwen3 only
 
 
 def read_hf_model(directory: str | Path):
@@ -144,11 +149,11 @@ def read_hf_model(directory: str | Path):
                     n_kv_heads=d["n_kv_heads"], vocab_size=d["vocab_size"], seq_len=d["seq_len"],
                     shared_classifier=d["shared_classifier"], head_dim=d["head_dim"],
                     rope_theta=float(d["rope_theta"]), rms_norm_eps=float(d["rms_norm_eps"]),
-                    rope_style="half_split")
+                    rope_style="half_split", qk_norm=d["qk_norm"])
     st = read_safetensors(directory / "model.safetensors")
     f32 = lambda name: st[name].as_float32()    # noqa: E731
     tensors = {"token_embedding": f32("model.embed_tokens.weight"), "rms_final": f32("model.norm.weight")}
-    for role, hf_name in HF_ROLE.items():
+    for role, hf_name in {**HF_ROLE, **(QK_ROLE if d["qk_norm"] else {})}.items():
         tensors[role] = np.stack([f32(f"model.layers.{l}.{hf_name}.weight") for l in range(d["n_layers"])])
     tensors["wcls"] = tensors["token_embedding"] if d["shared_classifier"] else f32("lm_head.weight")
     return Checkpoint(config, tensors, {}, (directory / "model.safetensors").stat().st_size)

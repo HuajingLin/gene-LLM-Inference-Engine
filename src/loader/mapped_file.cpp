@@ -85,7 +85,7 @@ MappedFile::MappedFile(const std::string& path) {
 
     const std::size_t size = static_cast<std::size_t>(st.st_size);
     void* addr = ::mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0);
-    ::close(fd);  // Once the mapping has been established, the fd can be closed; the mapping will remain valid.
+    ::close(fd);  // the mapping stays valid after the descriptor is closed
     if (addr == MAP_FAILED) {
         throw std::runtime_error("mmap failed: " + path + " (" + std::strerror(errno) + ")");
     }

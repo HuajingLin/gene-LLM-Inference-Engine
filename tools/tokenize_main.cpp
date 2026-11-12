@@ -30,8 +30,8 @@ using namespace geneinfer;
 static int usage(const char* prog) {
     std::fprintf(stderr,
                  "usage:\n"
-                 "  %s <tokenizer.bin> <vocab_size> encode [--no-bos] [--eos]\n"    //BOS = Beginning Of Sequence
-                 "  %s <tokenizer.bin> <vocab_size> decode\n",                      //EOS = End Of Sequence
+                 "  %s <tokenizer.bin> <vocab_size> encode [--no-bos] [--eos]\n"
+                 "  %s <tokenizer.bin> <vocab_size> decode\n",
                  prog, prog);
     return 2;
 }

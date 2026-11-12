@@ -2,8 +2,8 @@
 //
 //   gi_hf_tokenize <model_dir> encode [--bos]            stdin: text (raw bytes)  stdout: token ids
 //   gi_hf_tokenize <model_dir> decode [--skip-special]   stdin: token ids         stdout: text (raw bytes)
-//   gi_hf_tokenize <model_dir> pretokenize               stdin: text   stdout: the pre-tokenizer pieces, one per
-//                                                        line, as JSON strings (for debugging and tests)
+//   gi_hf_tokenize <model_dir> pretokenize               stdin: text   stdout: the pre-tokenizer pieces of the normalized
+//                                                        text, one per line, as JSON strings (for debugging and tests)
 //   gi_hf_tokenize <model_dir> info                      a summary of what was loaded
 //
 // Batch modes (one process for many inputs; JSON on stdin and stdout, used by the tests):
@@ -65,7 +65,7 @@ int main(int argc, char** argv) {
                     for (const int id : tok.encode(item.as_string(), flag_bos)) row.push_back(JsonValue::make_number(id));
                     out.push_back(std::move(row));
                 } else if (mode == "pretokenize-batch") {
-                    for (const std::string& piece : tok.pre_tokenize(item.as_string())) row.push_back(JsonValue::make_string(piece));
+                    for (const std::string& piece : tok.pre_tokenize(tok.normalize(item.as_string()))) row.push_back(JsonValue::make_string(piece));
                     out.push_back(std::move(row));
                 } else {
                     std::vector<int> ids;
@@ -95,7 +95,7 @@ int main(int argc, char** argv) {
             const std::string text = tok.decode(ids, flag_skip);
             std::fwrite(text.data(), 1, text.size(), stdout);
         } else if (mode == "pretokenize") {
-            for (const std::string& piece : tok.pre_tokenize(input)) {
+            for (const std::string& piece : tok.pre_tokenize(tok.normalize(input))) {
                 std::printf("%s\n", dump_json(JsonValue::make_string(piece)).c_str());
             }
         } else {

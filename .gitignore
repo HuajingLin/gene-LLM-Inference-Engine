@@ -21,6 +21,9 @@ dummy/
 
 # golden_hf files
 golden_hf/
+golden_qwen/
 
 # build artifacts
 build/
+
+qwen_tok_golden.json

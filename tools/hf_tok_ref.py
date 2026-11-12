@@ -72,6 +72,38 @@ def gpt2_pieces(text: str) -> list[str]:
     return pieces
 
 
+# The Qwen2 / Qwen3 pre-tokenizer pattern exactly as it appears in their tokenizer.json (the C++ code must accept
+# this string and no other for a Split stage).
+QWEN2_PATTERN = (r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*"
+                 r"|\s*[\r\n]+|\s+(?!\S)|\s+")
+
+
+@lru_cache(maxsize=1)
+def _qwen2_pattern() -> re.Pattern:
+    """QWEN2_PATTERN with \\p{L}, \\p{N} and \\s written out as explicit character classes, for Python's regex engine
+    (backtracking, leftmost alternative first, like the Oniguruma engine of the Hugging Face library)."""
+    def cat(prefix):
+        return lambda cp: not 0xD800 <= cp <= 0xDFFF and unicodedata.category(chr(cp)).startswith(prefix)
+
+    letters, numbers = _class_body(cat("L")), _class_body(cat("N"))
+    space = "".join(f"\\U{cp:08x}" for cp in WHITE_SPACE)
+    return re.compile(
+        rf"(?i:'s|'t|'re|'ve|'m|'ll|'d)"
+        rf"|[^\r\n{letters}{numbers}]?[{letters}]+"
+        rf"|[{numbers}]"
+        rf"| ?[^{space}{letters}{numbers}]+[\r\n]*"
+        rf"|[{space}]*[\r\n]+"
+        rf"|[{space}]+(?![^{space}])"
+        rf"|[{space}]+"
+    )
+
+
+def qwen2_pieces(text: str) -> list[str]:
+    pieces = _qwen2_pattern().findall(text)
+    assert "".join(pieces) == text, "the Qwen2 pattern must cover the whole text"
+    return pieces
+
+
 def split_digits(text: str, individual: bool) -> list[str]:
     out: list[str] = []
     run = ""
@@ -124,8 +156,14 @@ class RefTokenizer:
         stages = pre["pretokenizers"] if pre["type"] == "Sequence" else [pre]
         self.split_digits, self.individual = False, False
         self.use_regex = True
+        self.qwen2 = False
+        norm = tj.get("normalizer")
+        self.nfc = bool(norm) and norm["type"] == "NFC"
         for st in stages:
-            if st["type"] == "Digits":
+            if st["type"] == "Split":
+                assert st["pattern"]["Regex"] == QWEN2_PATTERN and st["behavior"] == "Isolated"
+                self.qwen2 = True
+            elif st["type"] == "Digits":
                 self.split_digits, self.individual = True, bool(st.get("individual_digits"))
             elif st["type"] == "ByteLevel":
                 self.use_regex = st.get("use_regex", True)
@@ -140,6 +178,11 @@ class RefTokenizer:
 
     # ---- encoding ----------------------------------------------------------------------------------
     def pre_tokenize(self, text: str) -> list[str]:
+        """Pieces of the NORMALIZED text (what the encoder sees)."""
+        if self.nfc:
+            text = unicodedata.normalize("NFC", text)
+        if self.qwen2:
+            return qwen2_pieces(text) if text else []
         stage = split_digits(text, self.individual) if self.split_digits else ([text] if text else [])
         if not self.use_regex:
             return stage
@@ -147,6 +190,14 @@ class RefTokenizer:
         for piece in stage:
             out.extend(gpt2_pieces(piece))
         return out
+
+    def normalized_text(self, text: str) -> str:
+        """The text as the encoder sees it: the stretches between added tokens are normalized, added tokens are not."""
+        if not self.nfc:
+            return text
+        if self._added_re is None:
+            return unicodedata.normalize("NFC", text)
+        return "".join(p if i % 2 else unicodedata.normalize("NFC", p) for i, p in enumerate(self._added_re.split(text)))
 
     def _bpe(self, mapped: str) -> list[str]:
         """The original GPT-2 merge loop: best pair first, all occurrences of it merged left to right."""
@@ -170,7 +221,7 @@ class RefTokenizer:
 
     def _encode_plain(self, text: str) -> list[int]:
         ids: list[int] = []
-        for piece in self.pre_tokenize(text):
+        for piece in self.pre_tokenize(text):   # pre_tokenize normalizes first
             mapped = to_byte_level(piece)
             if self.ignore_merges and mapped in self.vocab:   # a whole pre-token that is a token: take it as is
                 ids.append(self.vocab[mapped])
@@ -186,7 +237,7 @@ class RefTokenizer:
             if i % 2 == 1:
                 ids.append(self.added[part])
             elif part:
-                ids.extend(self._encode_plain(part))
+                ids.extend(self._encode_plain(part))   # _encode_plain normalizes
         return ids
 
     # ---- decoding ------------------------------------------------------------------------------------

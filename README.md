@@ -5,7 +5,8 @@ Lightweight LLM Inference Engine
 # Models used
 + Stage 1: stories15M
 + Stage 2: SmolLM2-135M
-- Stage 3a ~ 3f: SmolLM2-135M
++ Stage 3a ~ 3f: SmolLM2-135M
+- Stage 3 M11: Qwen3.06B
 ```
 
 ## run
@@ -22,7 +23,8 @@ cmake --build build --config Release
 - Stage 3c: Multithreading 
 - Stage 3d: int8 quantization
 - Stage 3e: GI_Q8_SKIP
-- Stage 3f: Batched prefill 
+- Stage 3f: Batched prefill
+- Stage 3.M11: Qwen3-0.6B 
 
 ### Stage 3a: SIMD matvec
 ```diff
@@ -67,6 +69,11 @@ Threads	Token-by-token	     Batched	     Speedup
 3	     140.5 tok/s	312.1 tok/s	2.2x
 4	     120.7 tok/s	333.9 tok/s	2.8x
 ```
+### Stage 3.M11: Qwen3-0.6B
+| label | prefill tok/s | decode tok/s | median ms/token | GFLOP/s | peak RSS MiB |
+|-------|---------------|--------------|-----------------|---------|--------------|
+| -     | 116.8         | 27.7         | 35.585          | 33.50   | 1761.4       |
+
 ## Project Structure
 ```
 geneInfer/
@@ -85,7 +92,8 @@ geneInfer/
 │   │   ├── tokenizer.h / .cpp      # M2: tokenizer
 │   │   ├── hf_tokenizer.h / .cpp   # M9
 │   │   ├── unicode.h / .cpp        # M9
-│   │   └── text_tokenizer.h / .cpp # M10
+│   │   ├── text_tokenizer.h / .cpp # M10
+│   │   └── unicode_norm_tables.inc # M11
 │   │
 │   ├── kernels/
 │   │   ├── kernels.h / .cpp        # M3: operators

@@ -36,6 +36,12 @@ def fixed_cases() -> list[str]:
         "\u00bd \u00b2 \u2155 fractions and superscripts", "\u2167 roman numeral", "\U0001F468\u200d\U0001F469\u200d\U0001F467 family",
         "\u00dcn\u00efc\u00f6d\u00e9 \u00dcn\u00efc\u00f6d\u00e9", "\u201csmart quotes\u201d and \u2018single\u2019", "em\u2014dash and en\u2013dash",
         "\u0e2a\u0e27\u0e31\u0e2a\u0e14\u0e35", "\ud55c\uad6d\uc5b4 \ud14d\uc2a4\ud2b8", "\u03b1\u03b2\u03b3 \u0394\u03a3\u03a9", "\u0420\u0443\u0441\u0441\u043a\u0438\u0439 \u0442\u0435\u043a\u0441\u0442",
+        "I'M WE'LL YOU'RE THEY'VE HE'D IT'S", "'\u017f is a long s", "'\u017fx I'\u017f", "'\u017f\u017f", "'Re 'vE 'Ll 'sx", "don\u2019t stop", "\u2018s", "x'\u00e9",
+        "a \n\nb", "a\r\n\r\nb", "a  \n  b", "a \n \n", "a\n\n\n  ", "  \n", "!!\n\n", "?\r\n", "...\n  \nx", "\n\r\n\n",
+        "\tindented\n\t\tmore", "ab \u00a0 cd", "ab\u2003\u2003cd", "ab\u2003 \n cd", "end   ", "end \n",
+        "Ang\u0308str\u00f6m A\u030a \u212b \u2126 \u0958 \u1100\u1161\u11a8 \ud55c", "e\u0301e\u0301\u0323 q\u0307\u0323 a\u0323\u0307",
+        "\u0041\u030a\u0308 \u1e9b\u0323 \uac00\u11a8 \u1100\u1161 \u0f43 \ufb01 \u00bd",
+        "12345 67", "\u0661\u0662 \u00b2\u00b3", "x1,2", "price: 4 5 6", "$$$ 99",
         "mixed1234abc5678def", "ab12cd", "1a", "a1", "12 34", "12\n34", " 12", "  12",
         "a" * 50, "a" * 1000, "ab" * 300, " " * 50 + "x", "x" + " " * 50 + "y", "\n" * 5 + "z", "z" + "\n" * 5, "." * 100,
         "the " * 200, "The quick brown fox jumps over the lazy dog. " * 5,
@@ -54,7 +60,8 @@ def fuzz_cases(n: int, seed: int = 7) -> list[str]:
         + ["'s", "'t", "'re", "'ve", "'m", "'ll", "'d", "n't", "the", " the", "ing", "tion", "er", "and", " and"]
         + SPECIALS
         + ["\u00e9", "\u00fc", "\u00df", "\u65e5", "\u672c", "\u8a9e", "\U0001F600", "\u00a0", "\u3000", "\u0661", "\u00bd",
-           "\u200b", "\u0301", "\u2014", "\u201c", "\u0416", "\u03b1", "\u2028"]
+           "\u200b", "\u0301", "\u2014", "\u201c", "\u0416", "\u03b1", "\u2028",
+           "\u0323", "\u0308", "\u212b", "\u1100", "\u1161", "\u11a8", "\u017f", "'S", "'LL", "\r\n\r\n", "\u2003"]
     )
     cases = []
     for _ in range(n):

@@ -8,6 +8,7 @@ Variants (--variant):
   sequence   pre_tokenizer = Sequence[Digits(individual_digits), ByteLevel]       (SmolLM2)
   bytelevel  pre_tokenizer = ByteLevel                                            (plain GPT-2 style)
   noregex    pre_tokenizer = ByteLevel with use_regex = false                     (the whole text is one piece)
+  qwen2      normalizer NFC; pre_tokenizer = Sequence[Split(Qwen2 regex, Isolated), ByteLevel(use_regex=false)]  (Qwen2, Qwen3)
   --ignore-merges additionally turns on the ignore_merges option of the BPE model
 
 Usage:
@@ -23,7 +24,8 @@ from pathlib import Path
 from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from hf_tok_ref import BYTE_TO_CHAR, gpt2_pieces, split_digits, to_byte_level  # noqa: E402
+import unicodedata  # noqa: E402
+from hf_tok_ref import BYTE_TO_CHAR, QWEN2_PATTERN, gpt2_pieces, qwen2_pieces, split_digits, to_byte_level  # noqa: E402
 from tok_corpus import SPECIALS  # noqa: E402
 
 TRAINING_TEXT = """
@@ -74,6 +76,9 @@ def build_tokenizer(out_dir, n_merges: int = 300, variant: str = "sequence", ign
     pieces: list[str] = []
     for line in TRAINING_TEXT.split("\n"):
         text = line + "\n"
+        if args.variant == "qwen2":
+            pieces.extend(qwen2_pieces(unicodedata.normalize("NFC", text)))
+            continue
         stage = split_digits(text, True) if args.variant == "sequence" else [text]
         for p in stage:
             pieces.extend([p] if args.variant == "noregex" else gpt2_pieces(p))
@@ -88,8 +93,12 @@ def build_tokenizer(out_dir, n_merges: int = 300, variant: str = "sequence", ign
     for tok in SPECIALS + base + [a + b for a, b in merges] + whole_words:
         vocab.setdefault(tok, len(vocab))
 
-    byte_level = {"type": "ByteLevel", "add_prefix_space": False, "trim_offsets": True, "use_regex": args.variant != "noregex"}
-    if args.variant == "sequence":
+    byte_level = {"type": "ByteLevel", "add_prefix_space": False, "trim_offsets": True,
+                  "use_regex": args.variant not in ("noregex", "qwen2")}
+    if args.variant == "qwen2":
+        split = {"type": "Split", "pattern": {"Regex": QWEN2_PATTERN}, "behavior": "Isolated", "invert": False}
+        pre = {"type": "Sequence", "pretokenizers": [split, byte_level]}
+    elif args.variant == "sequence":
         pre = {"type": "Sequence", "pretokenizers": [{"type": "Digits", "individual_digits": True}, byte_level]}
     else:
         pre = byte_level
@@ -97,7 +106,7 @@ def build_tokenizer(out_dir, n_merges: int = 300, variant: str = "sequence", ign
         "version": "1.0", "truncation": None, "padding": None,
         "added_tokens": [{"id": vocab[t], "content": t, "single_word": False, "lstrip": False, "rstrip": False,
                           "normalized": False, "special": True} for t in SPECIALS],
-        "normalizer": None, "pre_tokenizer": pre, "post_processor": None,
+        "normalizer": {"type": "NFC"} if args.variant == "qwen2" else None, "pre_tokenizer": pre, "post_processor": None,
         "decoder": {"type": "ByteLevel", "add_prefix_space": True, "trim_offsets": True, "use_regex": True},
         "model": {"type": "BPE", "dropout": None, "unk_token": None, "continuing_subword_prefix": None,
                   "end_of_word_suffix": None, "fuse_unk": False, "byte_fallback": False, "ignore_merges": args.ignore_merges,
@@ -118,7 +127,7 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", required=True)
     ap.add_argument("--merges", type=int, default=300)
-    ap.add_argument("--variant", choices=["sequence", "bytelevel", "noregex"], default="sequence")
+    ap.add_argument("--variant", choices=["sequence", "bytelevel", "noregex", "qwen2"], default="sequence")
     ap.add_argument("--ignore-merges", action="store_true",
                     help="set ignore_merges and add whole-word tokens that no merge produces")
     a = ap.parse_args()
