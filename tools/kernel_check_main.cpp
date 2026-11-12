@@ -11,6 +11,10 @@
 //   gi_kernel_check add     <n>                    stdin: a[n], b[n]                  -> a+b
 //   gi_kernel_check matvec_bf16 <rows> <cols>   stdin: W (bfloat16 bits), x (float32)
 //   gi_kernel_check matvec_q8 <rows> <cols>     stdin: W (int8), scales (bfloat16 bits, per 64 values of a row), x (float32)
+//   gi_kernel_check matmul_bf16 <rows> <cols> <ntok> [pad_out pad_x]   stdin: W (bfloat16 bits), X (float32, ntok rows of cols + pad_x)
+//   gi_kernel_check matmul_q8 <rows> <cols> <ntok> [pad_out pad_x]     stdin: W (int8), scales, X (as above)
+//     stdout: the whole output buffer of the matmul (ntok rows of rows + pad_out floats, padding untouched = -777), then the
+//     results of the matvec kernel for every token, [ntok, rows]. They must be bit-identical.
 //   gi_kernel_check isa                            -> text: "active=<isa> supported=<list>"
 //   gi_kernel_check rope    <n> <pos> <head_size> [theta] [interleaved|half_split]
 //   gi_kernel_check rope_cached ...             same arguments; rotates through a precomputed cos/sin row
@@ -143,6 +147,8 @@ int main(int argc, char** argv) {
         note(cur.matvec != ref.matvec, "matvec");
         note(cur.matvec_bf16 != ref.matvec_bf16, "matvec_bf16");
         note(cur.matvec_q8 != ref.matvec_q8, "matvec_q8");
+        note(cur.matmul_bf16 != ref.matmul_bf16, "matmul_bf16");
+        note(cur.matmul_q8 != ref.matmul_q8, "matmul_q8");
         note(cur.rmsnorm != ref.rmsnorm, "rmsnorm");
         note(cur.dot != ref.dot, "dot");
         note(cur.axpy != ref.axpy, "axpy");
@@ -207,6 +213,38 @@ int main(int argc, char** argv) {
             k::matvec_q8(out.data(), W.data(), S.data(), x.data(), rows, cols);
             check_guards(out, "matvec_q8");
             write_floats(out.values());
+        } else if ((op == "matmul_bf16" || op == "matmul_q8") && (argc == 5 || argc == 7)) {
+            const bool q8 = op == "matmul_q8";
+            const int rows = arg_int(argv, 2, "rows"), cols = arg_int(argv, 3, "cols"), ntok = arg_int(argv, 4, "ntok");
+            const int pad_out = argc == 7 ? arg_int(argv, 5, "pad_out") : 0, pad_x = argc == 7 ? arg_int(argv, 6, "pad_x") : 0;
+            if (rows <= 0 || cols <= 0 || ntok <= 0) throw std::runtime_error("rows, cols and ntok must be positive");
+            const std::size_t count = static_cast<std::size_t>(rows) * cols;
+            const std::size_t n_scales = static_cast<std::size_t>(rows) * static_cast<std::size_t>((cols + 63) / 64);
+            BufU16 Wb(q8 ? 0 : count, g_offset), S(q8 ? n_scales : 0, g_offset);
+            BufI8 Wq(q8 ? count : 0, g_offset);
+            if (q8) {
+                if (std::fread(Wq.data(), 1, count, stdin) != count) throw std::runtime_error("expected int8 weights on stdin");
+                if (std::fread(S.data(), sizeof(std::uint16_t), n_scales, stdin) != n_scales) throw std::runtime_error("expected scales on stdin");
+            } else if (std::fread(Wb.data(), sizeof(std::uint16_t), count, stdin) != count) {
+                throw std::runtime_error("expected bfloat16 weights on stdin");
+            }
+            const int x_stride = cols + pad_x, out_stride = rows + pad_out;
+            const Buf X = read_buf(static_cast<std::size_t>(ntok) * static_cast<std::size_t>(x_stride));
+            Buf out(static_cast<std::size_t>(ntok) * static_cast<std::size_t>(out_stride), g_offset);
+            Buf ref(static_cast<std::size_t>(ntok) * static_cast<std::size_t>(rows), g_offset);
+            if (q8) k::matmul_q8(out.data(), out_stride, Wq.data(), S.data(), X.data(), x_stride, ntok, rows, cols);
+            else k::matmul_bf16(out.data(), out_stride, Wb.data(), X.data(), x_stride, ntok, rows, cols);
+            for (int t = 0; t < ntok; ++t) {
+                float* o = ref.data() + static_cast<std::size_t>(t) * rows;
+                const float* x = X.data() + static_cast<std::size_t>(t) * x_stride;
+                if (q8) k::matvec_q8(o, Wq.data(), S.data(), x, rows, cols);
+                else k::matvec_bf16(o, Wb.data(), x, rows, cols);
+            }
+            check_guards(out, op.c_str());
+            std::vector<float> all = out.values();
+            const std::vector<float> r = ref.values();
+            all.insert(all.end(), r.begin(), r.end());
+            write_floats(all);
         } else if (op == "rmsnorm" && argc == 3) {
             const int n = arg_int(argv, 2, "n");
             if (n <= 0) throw std::runtime_error("n must be positive");

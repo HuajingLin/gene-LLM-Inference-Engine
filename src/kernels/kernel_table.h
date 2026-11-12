@@ -11,6 +11,11 @@ struct KernelTable {
     void (*matvec)(float* out, const float* W, const float* x, int rows, int cols);
     void (*matvec_bf16)(float* out, const std::uint16_t* W, const float* x, int rows, int cols);
     void (*matvec_q8)(float* out, const std::int8_t* W, const std::uint16_t* scales, const float* x, int rows, int cols);
+    // Several activation vectors against one matrix: out[t * out_stride + r], t < ntok. Optional (nullptr: the public
+    // matmul_* functions call the matvec entry once per token, which gives the same bits).
+    void (*matmul_bf16)(float* out, int out_stride, const std::uint16_t* W, const float* x, int x_stride, int ntok, int rows, int cols);
+    void (*matmul_q8)(float* out, int out_stride, const std::int8_t* W, const std::uint16_t* scales, const float* x, int x_stride,
+                      int ntok, int rows, int cols);
     void (*rmsnorm)(float* out, const float* x, const float* weight, int n, float eps);
     float (*dot)(const float* a, const float* b, int n);
     void (*axpy)(float* y, float alpha, const float* x, int n);

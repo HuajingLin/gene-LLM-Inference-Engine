@@ -119,6 +119,48 @@ def suite(exe: str, seed: int):
             failures.append(f"matvec_bf16 special values {sel}: {got} != {ref}")
         record("matvec_bf16", f"special values {sel.start}:{sel.stop}", 0.0)
 
+    # ---- matmul_bf16 / matmul_q8: several tokens against one matrix, bit-identical to the matvec per token --------------
+    # (rows, cols, tokens, pad_out, pad_x): all token-block remainders (1..4 and beyond), rows that are not multiples of 4,
+    # column counts around the 16/32/64 steps, partial last q8 groups, and strides larger than the vectors.
+    mm_shapes = [(1, 1, 1, 0, 0), (1, 17, 3, 0, 0), (3, 33, 2, 1, 2), (4, 16, 4, 0, 0), (5, 31, 5, 3, 0), (7, 64, 6, 0, 5), (8, 32, 7, 2, 1),
+                 (9, 65, 8, 0, 0), (12, 100, 9, 4, 4), (13, 127, 3, 0, 3), (16, 129, 4, 1, 1), (10, 192, 11, 0, 0), (33, 48, 13, 5, 0),
+                 (576, 576, 5, 0, 0), (64, 1024, 4, 0, 7), (6, 3072, 7, 0, 0), (130, 70, 1, 0, 0), (2, 15, 15, 0, 0), (4, 63, 16, 2, 2)]
+    for rows, cols, ntok, pad_o, pad_x in mm_shapes:
+        X = rng.standard_normal((ntok, cols + pad_x)).astype(np.float32)
+        if pad_x:
+            X[:, cols:] = np.nan                       # the padding must never be read
+        # bf16
+        Wf = rng.standard_normal((rows, cols)).astype(np.float32)
+        bits = f32_to_bf16(Wf)
+        W = bf16_to_f32(bits)
+        for op, payload, want_w in (("matmul_bf16", bits.tobytes() + f32(X).tobytes(), W),):
+            got = run_raw(exe, [op, rows, cols, ntok, pad_o, pad_x], payload)
+            out = got[: ntok * (rows + pad_o)].reshape(ntok, rows + pad_o)
+            ref = got[ntok * (rows + pad_o):].reshape(ntok, rows)
+            case = f"{rows}x{cols} tokens={ntok} pad={pad_o},{pad_x}"
+            if not np.array_equal(out[:, :rows].view(np.uint32), ref.view(np.uint32)):
+                failures.append(f"{op} {case}: not bit-identical to the matvec per token")
+            if pad_o and not np.all(out[:, rows:] == np.float32(-777.0)):
+                failures.append(f"{op} {case}: wrote into the padding between output rows")
+            want = X[:, :cols].astype(np.float64) @ want_w.astype(np.float64).T
+            record(op, case, err(out[:, :rows].reshape(-1), want.reshape(-1)))
+        # q8
+        q = rng.integers(-127, 128, size=(rows, cols), dtype=np.int8)
+        sc_f = (rng.random((rows, (cols + 63) // 64)).astype(np.float32) * 0.05 + 0.001)
+        sc_bits = f32_to_bf16(sc_f)
+        sc = bf16_to_f32(sc_bits)
+        got = run_raw(exe, ["matmul_q8", rows, cols, ntok, pad_o, pad_x], q.tobytes() + sc_bits.tobytes() + f32(X).tobytes())
+        out = got[: ntok * (rows + pad_o)].reshape(ntok, rows + pad_o)
+        ref = got[ntok * (rows + pad_o):].reshape(ntok, rows)
+        case = f"{rows}x{cols} tokens={ntok} pad={pad_o},{pad_x}"
+        if not np.array_equal(out[:, :rows].view(np.uint32), ref.view(np.uint32)):
+            failures.append(f"matmul_q8 {case}: not bit-identical to the matvec per token")
+        if pad_o and not np.all(out[:, rows:] == np.float32(-777.0)):
+            failures.append(f"matmul_q8 {case}: wrote into the padding between output rows")
+        Wd = q.astype(np.float64) * np.repeat(sc.astype(np.float64), 64, axis=1)[:, :cols]
+        want = X[:, :cols].astype(np.float64) @ Wd.T
+        record("matmul_q8", case, err(out[:, :rows].reshape(-1), want.reshape(-1)))
+
     # ---- matvec_q8: int8 weights with one bf16 scale per 64 values of a row ---------------------------
     # (1) accuracy against float64 with the dequantized weights q * scale; (2) computing the matrix in two pieces
     # (rows [0, k) and [k, rows)) gives BIT-IDENTICAL results to computing it at once: this is what row slicing
@@ -292,7 +334,7 @@ def main() -> int:
                 all_failures.append(f"[{isa}] the program did not switch to {isa}: {got.strip()!r}")
                 continue
             ops = got.split("simd_ops=")[1].strip()
-            want_ops = "" if isa == "scalar" else "matvec,matvec_bf16,matvec_q8,rmsnorm,dot,axpy,mul,add"
+            want_ops = ("" if isa == "scalar" else "matvec,matvec_bf16,matvec_q8" + (",matmul_bf16,matmul_q8" if isa == "avx512" else "") + ",rmsnorm,dot,axpy,mul,add")
             if ops != want_ops:
                 all_failures.append(f"[{isa}] kernels running SIMD code: {ops!r}, expected {want_ops!r} "
                                     f"(a silent fallback to the scalar version would pass the value checks)")

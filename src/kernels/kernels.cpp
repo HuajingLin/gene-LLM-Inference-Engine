@@ -184,7 +184,7 @@ void rope(float* v, int n, int pos, int head_size, float theta, RopeStyle style)
 namespace {
 
 KernelTable make_scalar_table() {
-    return KernelTable{matvec_scalar, matvec_bf16_scalar, matvec_q8_scalar, rmsnorm_scalar, dot_scalar, axpy_scalar, mul_scalar, add_scalar};
+    return KernelTable{matvec_scalar, matvec_bf16_scalar, matvec_q8_scalar, nullptr, nullptr, rmsnorm_scalar, dot_scalar, axpy_scalar, mul_scalar, add_scalar};
 }
 
 bool cpu_has(Isa isa) {
@@ -285,6 +285,28 @@ void matvec_bf16(float* out, const std::uint16_t* W, const float* x, int rows, i
 void matvec_q8(float* out, const std::int8_t* W, const std::uint16_t* scales, const float* x, int rows, int cols) {
     assert(rows > 0 && cols > 0);
     state().table.matvec_q8(out, W, scales, x, rows, cols);
+}
+void matmul_bf16(float* out, int out_stride, const std::uint16_t* W, const float* x, int x_stride, int ntok, int rows, int cols) {
+    assert(rows > 0 && cols > 0 && ntok > 0);
+    const KernelTable& t = state().table;
+    if (t.matmul_bf16) {
+        t.matmul_bf16(out, out_stride, W, x, x_stride, ntok, rows, cols);
+        return;
+    }
+    for (int i = 0; i < ntok; ++i) t.matvec_bf16(out + static_cast<std::size_t>(i) * static_cast<std::size_t>(out_stride), W, x + static_cast<std::size_t>(i) * static_cast<std::size_t>(x_stride), rows, cols);
+}
+void matmul_q8(float* out, int out_stride, const std::int8_t* W, const std::uint16_t* scales, const float* x, int x_stride, int ntok,
+               int rows, int cols) {
+    assert(rows > 0 && cols > 0 && ntok > 0);
+    const KernelTable& t = state().table;
+    if (t.matmul_q8) {
+        t.matmul_q8(out, out_stride, W, scales, x, x_stride, ntok, rows, cols);
+        return;
+    }
+    for (int i = 0; i < ntok; ++i) {
+        t.matvec_q8(out + static_cast<std::size_t>(i) * static_cast<std::size_t>(out_stride), W, scales,
+                    x + static_cast<std::size_t>(i) * static_cast<std::size_t>(x_stride), rows, cols);
+    }
 }
 void widen_bf16(float* dst, const std::uint16_t* src, int n) {
     for (int i = 0; i < n; ++i) dst[i] = widen(src[i]);

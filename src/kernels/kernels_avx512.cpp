@@ -251,6 +251,157 @@ void matvec_q8_avx512(float* out, const std::int8_t* W, const std::uint16_t* sca
     }
 }
 
+// ---- several tokens against one matrix --------------------------------------------------------------------------
+// The weights of a row are loaded and converted to float32 once and used for up to MT tokens. For every (row, token)
+// the arithmetic is exactly the one of matvec_q8_avx512 / matvec_bf16_avx512 (same operations, same order, own
+// accumulators per token), so the bits are the same as calling the matvec once per token.
+constexpr int MT = 4;   // tokens per block
+
+// The sum of the products of one q8 group of n (1..63, the last group of a row) values, as in row_q8_avx512.
+inline __m512 q8_partial_group(const std::int8_t* q, const float* x, int c0, int n) {
+    __m512 g0 = _mm512_setzero_ps(), g1 = g0;
+    int j = 0, c = c0;
+    const int end = c0 + n;
+    for (; c + 16 <= end; c += 16, ++j) {
+        if (j & 1) g1 = _mm512_fmadd_ps(load_q8x16(q + c), _mm512_loadu_ps(x + c), g1);
+        else g0 = _mm512_fmadd_ps(load_q8x16(q + c), _mm512_loadu_ps(x + c), g0);
+    }
+    if (c < end) {
+        const int rem = end - c;
+        alignas(16) std::int8_t tmp[16] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+        for (int k = 0; k < rem; ++k) tmp[k] = q[c + k];
+        const __m512 prod = _mm512_mul_ps(load_q8x16(tmp), _mm512_maskz_loadu_ps(tail_mask(rem), x + c));
+        if (j & 1) g1 = _mm512_add_ps(g1, prod);
+        else g0 = _mm512_add_ps(g0, prod);
+    }
+    return _mm512_add_ps(g0, g1);
+}
+
+// One row of the q8 matrix against K tokens.
+template <int K>
+inline void row_q8_tokens(float* out, int out_stride, const std::int8_t* q, const std::uint16_t* sc, const float* x, int x_stride, int cols) {
+    __m512 acc0[K], acc1[K];
+    for (int t = 0; t < K; ++t) acc0[t] = acc1[t] = _mm512_setzero_ps();
+    const int groups = (cols + 63) / 64;
+    for (int g = 0; g < groups; ++g) {
+        const int c0 = g * 64;
+        int n = cols - c0;
+        if (n > 64) n = 64;
+        const __m512 s = _mm512_set1_ps(scale_to_float(sc[g]));
+        if (n == 64) {
+            const __m512 w0 = load_q8x16(q + c0), w1 = load_q8x16(q + c0 + 16), w2 = load_q8x16(q + c0 + 32), w3 = load_q8x16(q + c0 + 48);
+            for (int t = 0; t < K; ++t) {
+                const float* xt = x + static_cast<std::size_t>(t) * static_cast<std::size_t>(x_stride) + c0;
+                __m512 g0 = _mm512_fmadd_ps(w0, _mm512_loadu_ps(xt), _mm512_setzero_ps());
+                __m512 g1 = _mm512_fmadd_ps(w1, _mm512_loadu_ps(xt + 16), _mm512_setzero_ps());
+                g0 = _mm512_fmadd_ps(w2, _mm512_loadu_ps(xt + 32), g0);
+                g1 = _mm512_fmadd_ps(w3, _mm512_loadu_ps(xt + 48), g1);
+                const __m512 gs = _mm512_add_ps(g0, g1);
+                if (g & 1) acc1[t] = _mm512_fmadd_ps(gs, s, acc1[t]);
+                else acc0[t] = _mm512_fmadd_ps(gs, s, acc0[t]);
+            }
+        } else {
+            for (int t = 0; t < K; ++t) {
+                const __m512 gs = q8_partial_group(q, x + static_cast<std::size_t>(t) * static_cast<std::size_t>(x_stride), c0, n);
+                if (g & 1) acc1[t] = _mm512_fmadd_ps(gs, s, acc1[t]);
+                else acc0[t] = _mm512_fmadd_ps(gs, s, acc0[t]);
+            }
+        }
+    }
+    for (int t = 0; t < K; ++t) out[static_cast<std::size_t>(t) * static_cast<std::size_t>(out_stride)] = _mm512_reduce_add_ps(_mm512_add_ps(acc0[t], acc1[t]));
+}
+
+void matmul_q8_avx512(float* out, int out_stride, const std::int8_t* W, const std::uint16_t* scales, const float* x, int x_stride,
+                      int ntok, int rows, int cols) {
+    const std::size_t stride = static_cast<std::size_t>(cols);
+    const std::size_t sstride = static_cast<std::size_t>((cols + 63) / 64);
+    for (int t0 = 0; t0 < ntok; t0 += MT) {
+        const int k = ntok - t0 < MT ? ntok - t0 : MT;
+        float* o = out + static_cast<std::size_t>(t0) * static_cast<std::size_t>(out_stride);
+        const float* xs = x + static_cast<std::size_t>(t0) * static_cast<std::size_t>(x_stride);
+        for (int r = 0; r < rows; ++r) {
+            const std::int8_t* q = W + static_cast<std::size_t>(r) * stride;
+            const std::uint16_t* sc = scales + static_cast<std::size_t>(r) * sstride;
+            switch (k) {
+                case 4: row_q8_tokens<4>(o + r, out_stride, q, sc, xs, x_stride, cols); break;
+                case 3: row_q8_tokens<3>(o + r, out_stride, q, sc, xs, x_stride, cols); break;
+                case 2: row_q8_tokens<2>(o + r, out_stride, q, sc, xs, x_stride, cols); break;
+                default: row_q8_tokens<1>(o + r, out_stride, q, sc, xs, x_stride, cols); break;
+            }
+        }
+    }
+}
+
+// Two rows of the bf16 matrix (taken from a full block of four rows, as in matvec_bf16_avx512) against K tokens.
+template <int K>
+inline void rows2_bf16_tokens(float* out, int out_stride, const std::uint16_t* w0, const std::uint16_t* w1, const float* x, int x_stride,
+                              int cols) {
+    __m512 a00[K], a01[K], a10[K], a11[K];
+    for (int t = 0; t < K; ++t) a00[t] = a01[t] = a10[t] = a11[t] = _mm512_setzero_ps();
+    int c = 0;
+    for (; c + 32 <= cols; c += 32) {
+        const __m512 w00 = load_bf16x16(w0 + c), w01 = load_bf16x16(w0 + c + 16);
+        const __m512 w10 = load_bf16x16(w1 + c), w11 = load_bf16x16(w1 + c + 16);
+        for (int t = 0; t < K; ++t) {
+            const float* xt = x + static_cast<std::size_t>(t) * static_cast<std::size_t>(x_stride) + c;
+            const __m512 xa = _mm512_loadu_ps(xt);
+            const __m512 xb = _mm512_loadu_ps(xt + 16);
+            a00[t] = _mm512_fmadd_ps(w00, xa, a00[t]);
+            a01[t] = _mm512_fmadd_ps(w01, xb, a01[t]);
+            a10[t] = _mm512_fmadd_ps(w10, xa, a10[t]);
+            a11[t] = _mm512_fmadd_ps(w11, xb, a11[t]);
+        }
+    }
+    for (; c + 16 <= cols; c += 16) {
+        const __m512 w00 = load_bf16x16(w0 + c), w10 = load_bf16x16(w1 + c);
+        for (int t = 0; t < K; ++t) {
+            const __m512 xa = _mm512_loadu_ps(x + static_cast<std::size_t>(t) * static_cast<std::size_t>(x_stride) + c);
+            a00[t] = _mm512_fmadd_ps(w00, xa, a00[t]);
+            a10[t] = _mm512_fmadd_ps(w10, xa, a10[t]);
+        }
+    }
+    if (c < cols) {
+        const __mmask16 m = tail_mask(cols - c);
+        const __m512 w01 = load_bf16x16_tail(w0 + c, cols - c), w11 = load_bf16x16_tail(w1 + c, cols - c);
+        for (int t = 0; t < K; ++t) {
+            const __m512 xa = _mm512_maskz_loadu_ps(m, x + static_cast<std::size_t>(t) * static_cast<std::size_t>(x_stride) + c);
+            a01[t] = _mm512_fmadd_ps(w01, xa, a01[t]);
+            a11[t] = _mm512_fmadd_ps(w11, xa, a11[t]);
+        }
+    }
+    for (int t = 0; t < K; ++t) {
+        float* o = out + static_cast<std::size_t>(t) * static_cast<std::size_t>(out_stride);
+        o[0] = _mm512_reduce_add_ps(_mm512_add_ps(a00[t], a01[t]));
+        o[1] = _mm512_reduce_add_ps(_mm512_add_ps(a10[t], a11[t]));
+    }
+}
+
+void matmul_bf16_avx512(float* out, int out_stride, const std::uint16_t* W, const float* x, int x_stride, int ntok, int rows, int cols) {
+    const std::size_t stride = static_cast<std::size_t>(cols);
+    const int quad_rows = rows & ~3;   // rows in full blocks of four use the paired-row path, the rest the plain dot (as matvec_bf16)
+    for (int t0 = 0; t0 < ntok; t0 += MT) {
+        const int k = ntok - t0 < MT ? ntok - t0 : MT;
+        float* o = out + static_cast<std::size_t>(t0) * static_cast<std::size_t>(out_stride);
+        const float* xs = x + static_cast<std::size_t>(t0) * static_cast<std::size_t>(x_stride);
+        for (int r = 0; r < quad_rows; r += 2) {
+            const std::uint16_t* w0 = W + static_cast<std::size_t>(r) * stride;
+            const std::uint16_t* w1 = w0 + stride;
+            switch (k) {
+                case 4: rows2_bf16_tokens<4>(o + r, out_stride, w0, w1, xs, x_stride, cols); break;
+                case 3: rows2_bf16_tokens<3>(o + r, out_stride, w0, w1, xs, x_stride, cols); break;
+                case 2: rows2_bf16_tokens<2>(o + r, out_stride, w0, w1, xs, x_stride, cols); break;
+                default: rows2_bf16_tokens<1>(o + r, out_stride, w0, w1, xs, x_stride, cols); break;
+            }
+        }
+        for (int r = quad_rows; r < rows; ++r) {
+            for (int t = 0; t < k; ++t) {
+                o[static_cast<std::size_t>(t) * static_cast<std::size_t>(out_stride) + static_cast<std::size_t>(r)] =
+                    dot_bf16_avx512(W + static_cast<std::size_t>(r) * stride, xs + static_cast<std::size_t>(t) * static_cast<std::size_t>(x_stride), cols);
+            }
+        }
+    }
+}
+
 void rmsnorm_avx512(float* out, const float* x, const float* weight, int n, float eps) {
     const float sum_sq = dot_avx512(x, x, n);
     const float scale = 1.0f / std::sqrt(sum_sq / static_cast<float>(n) + eps);
@@ -272,6 +423,8 @@ void fill_avx512(KernelTable& t) {
     t.matvec = matvec_avx512;
     t.matvec_bf16 = matvec_bf16_avx512;
     t.matvec_q8 = matvec_q8_avx512;
+    t.matmul_bf16 = matmul_bf16_avx512;
+    t.matmul_q8 = matmul_q8_avx512;
     t.rmsnorm = rmsnorm_avx512;
     t.dot = dot_avx512;
     t.axpy = axpy_avx512;

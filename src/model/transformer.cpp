@@ -47,6 +47,31 @@ long env_long(const char* name, long fallback) {
     return n;
 }
 
+// Rows [begin, end) of the products of ntok tokens: token t reads x + t * x_stride and writes
+// out + t * out_stride. Bit-identical to calling matvec_rows once per token. Quantized and bf16
+// weights go through the multi-token kernels, which widen each weight vector once for several tokens.
+inline void matmul_rows(float* out, std::size_t out_stride_sz, const Mat& W, const float* x, std::size_t x_stride_sz, int ntok,
+                        int begin, int end, int cols) {
+    // GI_MULTI_TOKEN=0 selects the per-token matvec path (for A/B timing); one token always uses it.
+    static const bool multi = env_long("GI_MULTI_TOKEN", 1) != 0;
+    if (!multi || ntok == 1) {
+        for (int tok = 0; tok < ntok; ++tok)
+            matvec_rows(out + sz(tok) * out_stride_sz, W, x + sz(tok) * x_stride_sz, begin, end, cols);
+        return;
+    }
+    const int out_stride = static_cast<int>(out_stride_sz), x_stride = static_cast<int>(x_stride_sz);
+    const std::size_t offset = static_cast<std::size_t>(begin) * static_cast<std::size_t>(cols);
+    if (W.is_q8()) {
+        const std::size_t soffset = static_cast<std::size_t>(begin) * static_cast<std::size_t>(q8_groups(cols));
+        kernels::matmul_q8(out + begin, out_stride, W.q8 + offset, W.q8_scale + soffset, x, x_stride, ntok, end - begin, cols);
+    } else if (W.is_bf16()) {
+        kernels::matmul_bf16(out + begin, out_stride, W.bf16 + offset, x, x_stride, ntok, end - begin, cols);
+    } else {
+        for (int tok = 0; tok < ntok; ++tok)
+            kernels::matvec(out + begin + sz(tok) * sz(out_stride), W.f32 + offset, x + sz(tok) * sz(x_stride), end - begin, cols);
+    }
+}
+
 // Attributes the time since the previous checkpoint to `section`.
 inline void lap(ForwardProfile* p, ForwardProfile::Section section) {
     if (!p) return;
@@ -254,9 +279,7 @@ void Transformer::run_matmuls(const MatmulJob* jobs, int n, int ntok) {
             const int tile = rows_per_tile(job.W, job.cols);
             for (int r0 = begin; r0 < end; r0 += tile) {
                 const int r1 = std::min(end, r0 + tile);
-                for (int tok = 0; tok < c.ntok; ++tok) {
-                    matvec_rows(job.out + sz(tok) * job.out_stride, job.W, job.x + sz(tok) * job.x_stride, r0, r1, job.cols);
-                }
+                matmul_rows(job.out, job.out_stride, job.W, job.x, job.x_stride, c.ntok, r0, r1, job.cols);
             }
         }
     };

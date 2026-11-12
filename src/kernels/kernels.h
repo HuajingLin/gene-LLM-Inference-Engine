@@ -48,6 +48,15 @@ void matvec_bf16(float* out, const std::uint16_t* W, const float* x, int rows, i
 // float32 and half of bfloat16.
 void matvec_q8(float* out, const std::int8_t* W, const std::uint16_t* scales, const float* x, int rows, int cols);
 
+// Several activation vectors against the same matrix (batched prompt processing, several sequences in one decode
+// step): out[t * out_stride + r] = row r of W . (x + t * x_stride), for t < ntok. Every element has exactly the bits
+// that matvec_bf16() / matvec_q8() give for that token with the same rows and cols: on AVX-512 the weights are
+// converted once and used for up to four tokens (the arithmetic per token is untouched), elsewhere the
+// matvec is simply called once per token. `out` must not overlap W or x.
+void matmul_bf16(float* out, int out_stride, const std::uint16_t* W, const float* x, int x_stride, int ntok, int rows, int cols);
+void matmul_q8(float* out, int out_stride, const std::int8_t* W, const std::uint16_t* scales, const float* x, int x_stride, int ntok,
+               int rows, int cols);
+
 // dst[i] = float32(src[i]) for bfloat16 values (one embedding-table row, say).
 void widen_bf16(float* dst, const std::uint16_t* src, int n);
 
