@@ -19,6 +19,7 @@
 #include <vector>
 
 #include "loader/checkpoint.h"
+#include "model/kv_cache.h"
 #include "util/thread_pool.h"
 
 namespace geneinfer {
@@ -59,10 +60,21 @@ public:
     // `max_batch` is the most tokens forward_batch() processes together (longer inputs are cut into pieces of
     // this size): 0 = the environment variable GI_BATCH (default 64). It only sets the size of the activation
     // buffers and of the cache-sized tiles; results do not depend on it.
-    explicit Transformer(const Checkpoint& checkpoint, int max_seq_len = 0, int n_threads = 0, int max_batch = 0);
+    //
+    // `block_size` and `kv_blocks` shape the paged KV cache (see kv_cache.h): positions per block (0 = the
+    // environment variable GI_BLOCK_SIZE, default 16) and the number of blocks in the pool (0 = just enough for
+    // one sequence of max_seq_len positions). Results do not depend on the block size.
+    explicit Transformer(const Checkpoint& checkpoint, int max_seq_len = 0, int n_threads = 0, int max_batch = 0,
+                         int block_size = 0, int kv_blocks = 0);
     ~Transformer();
     int threads() const;
     int max_batch() const { return max_batch_; }
+
+    // The paged KV cache. Sequences created on it can be run independently of each other; the plain forward()
+    // and forward_batch() below use one built-in sequence (position 0 starts it again).
+    KvPool& kv_pool() { return *kv_; }
+    const KvPool& kv_pool() const { return *kv_; }
+    Sequence new_sequence() { return Sequence(*kv_); }
 
     // Processes `token` at position `pos` and returns the logits (vocab_size floats) that
     // predict the next token. The returned pointer stays valid until the next forward() call.
@@ -73,6 +85,12 @@ public:
     // product are skipped and nullptr is returned. The KV cache is updated either way.
     const float* forward(int token, int pos, bool compute_logits = true);
 
+    // The same on an explicit sequence. `pos` may be at most seq.length(): the next free position appends, an
+    // earlier one rewinds the sequence to it (the later positions are forgotten); a larger one would leave a gap
+    // and throws std::out_of_range, as does a position beyond the context length. If the pool has no free block
+    // left, std::runtime_error is thrown and the sequence is unchanged. Afterwards seq.length() == pos + 1.
+    const float* forward(Sequence& seq, int token, int pos, bool compute_logits = true);
+
     // Processes n tokens at the consecutive positions pos0 .. pos0+n-1 in one go (prompt processing, "prefill")
     // and returns the logits of the LAST token if compute_logits is true, otherwise nullptr. The KV cache ends up
     // exactly as if forward() had been called for each token, and so does everything computed from it: the
@@ -82,12 +100,13 @@ public:
     // pos0 may be > 0 when earlier positions are already in the cache. While a trace callback is set, the tokens
     // are processed one by one so that the trace sees every token (same results, no speedup).
     const float* forward_batch(const int* tokens, int n, int pos0, bool compute_logits = true);
+    const float* forward_batch(Sequence& seq, const int* tokens, int n, int pos0, bool compute_logits = true);   // same rules as above; seq.length() == pos0 + n afterwards
 
     const Config& config() const { return cfg_; }
     int max_seq_len() const { return ctx_len_; }
 
     // Memory owned by this object (the weights are not included: they live in the mmap).
-    std::size_t kv_cache_bytes() const;  // keys + values for all layers and positions
+    std::size_t kv_cache_bytes() const;  // the whole KV pool (keys + values, all layers, all blocks)
     std::size_t scratch_bytes() const;   // activation buffers, attention scores, logits
 
     void set_trace(TraceFn fn) { trace_ = std::move(fn); }
@@ -111,11 +130,19 @@ private:
         std::size_t out_stride, x_stride;
     };
     void run_matmuls(const MatmulJob* jobs, int n, int ntok);
-    void batch_chunk(const int* tokens, int m, int pos0, bool compute_logits);
+    void batch_chunk(Sequence& seq, const int* tokens, int m, int pos0, bool compute_logits);
+    // The batched forward pass over m rows; row i is `tokens[i]` at position `positions[i]` of `seqs[i]` (whose
+    // blocks must be reserved). Rows of one sequence must come in increasing position order; the keys and values
+    // of all rows are stored before any attention runs, so a row sees the earlier rows of its own sequence.
+    void run_rows(const int* tokens, Sequence* const* seqs, const int* positions, int m, bool want_logits);
     void ensure_rope(int pos);   // cos/sin rows for positions 0..pos
 
     int max_batch_ = 64;
     std::vector<float> bx_, bxb_, bxb2_, bhb_, bhb2_, bq_, bao_;   // [max_batch, ...] activations of forward_batch
+    std::vector<float> bk_, bv_;                                    // [max_batch, kv_dim] new keys / values before they go into the blocks
+    std::vector<Sequence*> row_seq_;                                // [max_batch] per row: its sequence, position, block table
+    std::vector<int> row_pos_;
+    std::vector<const int*> row_table_;
     std::vector<float> batt_;                                       // [threads, ctx_len] attention scores (decode and batch)
     std::vector<float> rope_cos_, rope_sin_;                        // [rows, head_size / 2], filled on demand
     int rope_rows_ = 0;
@@ -137,18 +164,9 @@ private:
     std::vector<float> ao_;     // [attn_dim]  attention output (all heads concatenated)
     std::vector<float> logits_; // [vocab]
 
-    // KV cache, layout [layer][position][kv_dim].
-    // The KV cache is NOT zero-filled: a position is always written before it is read, and untouched pages of a
-    // large allocation cost no memory, so a model with a 40960-token context only uses what a run really fills.
-    struct CacheBuffer {
-        std::unique_ptr<float[]> mem;
-        std::size_t count = 0;
-        void allocate(std::size_t n) { mem.reset(new float[n]); count = n; }   // default-initialized: left untouched
-        float* data() { return mem.get(); }
-        std::size_t size() const { return count; }
-    };
-    CacheBuffer key_cache_;
-    CacheBuffer value_cache_;
+    // The paged KV cache and the built-in sequence used by the plain forward() / forward_batch().
+    std::unique_ptr<KvPool> kv_;
+    std::unique_ptr<Sequence> default_seq_;   // declared after kv_: destroyed first, gives its blocks back
 
     TraceFn trace_;
 };

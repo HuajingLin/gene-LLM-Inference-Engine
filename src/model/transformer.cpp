@@ -64,7 +64,8 @@ const char* ForwardProfile::name(int s) {
     return names[s];
 }
 
-Transformer::Transformer(const Checkpoint& checkpoint, int max_seq_len, int n_threads, int max_batch)
+Transformer::Transformer(const Checkpoint& checkpoint, int max_seq_len, int n_threads, int max_batch, int block_size,
+                         int kv_blocks)
     : cfg_(checkpoint.config()), w_(checkpoint.weights()) {
     if (max_seq_len < 0 || max_seq_len > cfg_.seq_len) {
         throw std::invalid_argument("max_seq_len must be in [0, " + std::to_string(cfg_.seq_len) +
@@ -100,11 +101,20 @@ Transformer::Transformer(const Checkpoint& checkpoint, int max_seq_len, int n_th
     bhb2_.resize(sz(max_batch_) * sz(cfg_.hidden_dim));
     bq_.resize(sz(max_batch_) * sz(cfg_.attn_dim()));
     bao_.resize(sz(max_batch_) * sz(cfg_.attn_dim()));
+    bk_.resize(sz(max_batch_) * sz(cfg_.kv_dim()));
+    bv_.resize(sz(max_batch_) * sz(cfg_.kv_dim()));
+    row_seq_.resize(sz(max_batch_));
+    row_pos_.resize(sz(max_batch_));
+    row_table_.resize(sz(max_batch_));
     batt_.resize(sz(pool_ ? pool_->size() : 1) * sz(ctx_len_));
 
-    const std::size_t cache_size = sz(cfg_.n_layers) * sz(ctx_len_) * sz(cfg_.kv_dim());
-    key_cache_.allocate(cache_size);
-    value_cache_.allocate(cache_size);
+    if (block_size < 0 || kv_blocks < 0) throw std::invalid_argument("block_size and kv_blocks must be >= 0");
+    if (block_size == 0) block_size = static_cast<int>(env_long("GI_BLOCK_SIZE", 16));
+    if (block_size == 0) block_size = 16;
+    if (block_size > ctx_len_) block_size = ctx_len_;   // never bigger than a whole context
+    if (kv_blocks == 0) kv_blocks = (ctx_len_ + block_size - 1) / block_size;   // one full-length sequence
+    kv_ = std::make_unique<KvPool>(cfg_.n_layers, cfg_.kv_dim(), block_size, kv_blocks);
+    default_seq_ = std::make_unique<Sequence>(*kv_);
 }
 
 Transformer::~Transformer() = default;
@@ -169,39 +179,48 @@ int rows_per_tile(const Mat& W, int cols) {
 
 namespace {
 
-// Attention for m consecutive tokens (positions p0 .. p0+m-1) over the KV cache of one layer. The work items are
-// (token, head) pairs dealt out round-robin to the threads (later tokens cost more); every item uses its thread's
-// own score row. A single-token decode step is the case m == 1. Each item runs the same operations in the same
-// order whatever the thread count, so the output does not depend on it.
+// Attention for m rows over the KV cache of one layer. Row i is the position positions[i] of the sequence whose
+// block table is tables[i]; it attends to positions 0 .. positions[i]. The work items are (row, head) pairs dealt
+// out round-robin to the threads (later positions cost more); every item uses its thread's own score row. A
+// single-token decode step is the case m == 1. Each item runs the same operations in the same order whatever the
+// thread count and whatever the block size, so the output depends on neither.
 struct AttCtx {
     const float* q;
     float* ao;
-    const float* keys;
-    const float* values;
+    const KvPool* pool;
+    int layer;
+    const int* const* tables;
+    const int* positions;
     float* scratch;   // [threads, ctx_len]
-    int m, p0, n_heads, head_size, kv_mul, attn_dim, kv_dim, ctx_len;
+    int m, n_heads, head_size, kv_mul, attn_dim, kv_dim, ctx_len;
     float inv_scale;
 };
 
 void attention_body(void* p, int t, int nt) {
     const AttCtx& c = *static_cast<const AttCtx*>(p);
     float* scores = c.scratch + sz(t) * sz(c.ctx_len);
+    const int bs = c.pool->block_size();
     const int items = c.m * c.n_heads;
     for (int item = t; item < items; item += nt) {
         const int i = item / c.n_heads, h = item % c.n_heads;
-        const int pos = c.p0 + i;
+        const int pos = c.positions[i];
+        const int* table = c.tables[i];
         const float* qh = c.q + sz(i) * sz(c.attn_dim) + sz(h) * sz(c.head_size);
-        const int kv_head = h / c.kv_mul;   // GQA: kv_mul query heads share one KV head
-        for (int tt = 0; tt <= pos; ++tt) {
-            const float* kt = c.keys + sz(tt) * sz(c.kv_dim) + sz(kv_head) * sz(c.head_size);
-            scores[tt] = kernels::dot(qh, kt, c.head_size) * c.inv_scale;
+        const std::size_t head_off = sz(h / c.kv_mul) * sz(c.head_size);   // GQA: kv_mul query heads share one KV head
+        for (int start = 0, b = 0; start <= pos; start += bs, ++b) {
+            const float* kb = c.pool->keys(table[b], c.layer) + head_off;
+            const int cnt = std::min(bs, pos + 1 - start);
+            for (int j = 0; j < cnt; ++j) {
+                scores[start + j] = kernels::dot(qh, kb + sz(j) * sz(c.kv_dim), c.head_size) * c.inv_scale;
+            }
         }
         kernels::softmax(scores, pos + 1);
         float* out = c.ao + sz(i) * sz(c.attn_dim) + sz(h) * sz(c.head_size);
         std::fill(out, out + c.head_size, 0.0f);
-        for (int tt = 0; tt <= pos; ++tt) {
-            const float* vt = c.values + sz(tt) * sz(c.kv_dim) + sz(kv_head) * sz(c.head_size);
-            kernels::axpy(out, scores[tt], vt, c.head_size);
+        for (int start = 0, b = 0; start <= pos; start += bs, ++b) {
+            const float* vb = c.pool->values(table[b], c.layer) + head_off;
+            const int cnt = std::min(bs, pos + 1 - start);
+            for (int j = 0; j < cnt; ++j) kernels::axpy(out, scores[start + j], vb + sz(j) * sz(c.kv_dim), c.head_size);
         }
     }
 }
@@ -246,29 +265,48 @@ void Transformer::run_matmuls(const MatmulJob* jobs, int n, int ntok) {
 }
 
 const float* Transformer::forward_batch(const int* tokens, int n, int pos0, bool compute_logits) {
+    return forward_batch(*default_seq_, tokens, n, pos0, compute_logits);
+}
+
+const float* Transformer::forward_batch(Sequence& seq, const int* tokens, int n, int pos0, bool compute_logits) {
     if (n < 1) throw std::invalid_argument("forward_batch: no tokens");
     if (pos0 < 0 || pos0 > ctx_len_ - n) {
         throw std::out_of_range("forward_batch: positions " + std::to_string(pos0) + ".." + std::to_string(pos0 + n - 1) +
                                 " exceed the context length " + std::to_string(ctx_len_));
+    }
+    if (&seq.pool() != kv_.get()) throw std::invalid_argument("forward_batch: the sequence belongs to another KV pool");
+    if (pos0 > seq.length()) {
+        throw std::out_of_range("forward_batch: start position " + std::to_string(pos0) + " leaves a gap, the sequence holds " +
+                                std::to_string(seq.length()) + " positions");
     }
     for (int i = 0; i < n; ++i) {
         if (tokens[i] < 0 || tokens[i] >= cfg_.vocab_size) {
             throw std::out_of_range("forward_batch: token id " + std::to_string(tokens[i]) + " out of range");
         }
     }
+    if (!seq.reserve(pos0 + n)) throw std::runtime_error("forward_batch: the KV pool has no free block left");
     if (trace_) {   // the trace wants every token: one by one
         const float* logits = nullptr;
-        for (int i = 0; i < n; ++i) logits = forward(tokens[i], pos0 + i, compute_logits && i == n - 1);
+        for (int i = 0; i < n; ++i) logits = forward(seq, tokens[i], pos0 + i, compute_logits && i == n - 1);
         return compute_logits ? logits : nullptr;
     }
     for (int done = 0; done < n; done += max_batch_) {
         const int m = std::min(max_batch_, n - done);
-        batch_chunk(tokens + done, m, pos0 + done, compute_logits && done + m == n);
+        batch_chunk(seq, tokens + done, m, pos0 + done, compute_logits && done + m == n);
     }
     return compute_logits ? logits_.data() : nullptr;
 }
 
-void Transformer::batch_chunk(const int* tokens, int m, int p0, bool want_logits) {
+void Transformer::batch_chunk(Sequence& seq, const int* tokens, int m, int p0, bool want_logits) {
+    for (int i = 0; i < m; ++i) {
+        row_seq_[sz(i)] = &seq;
+        row_pos_[sz(i)] = p0 + i;
+    }
+    run_rows(tokens, row_seq_.data(), row_pos_.data(), m, want_logits);
+    seq.set_length(p0 + m);
+}
+
+void Transformer::run_rows(const int* tokens, Sequence* const* seqs, const int* positions, int m, bool want_logits) {
     if (profile_) {
         profile_->last = std::chrono::steady_clock::now();
         profile_->forward_calls += m;
@@ -280,10 +318,16 @@ void Transformer::batch_chunk(const int* tokens, int m, int p0, bool want_logits
     const int kv_mul = cfg_.kv_mul();
     const int head_size = cfg_.head_size();
     const int n_heads = cfg_.n_heads;
+    const int bs = kv_->block_size();
     const float inv_scale = 1.0f / std::sqrt(static_cast<float>(head_size));
     const float eps = cfg_.rms_norm_eps;
 
-    ensure_rope(p0 + m - 1);
+    int max_pos = 0;
+    for (int i = 0; i < m; ++i) {
+        row_table_[sz(i)] = seqs[i]->block_table();
+        max_pos = std::max(max_pos, positions[i]);
+    }
+    ensure_rope(max_pos);
     const std::size_t half = sz(head_size / 2);
 
     float* X = bx_.data();
@@ -304,10 +348,8 @@ void Transformer::batch_chunk(const int* tokens, int m, int p0, bool want_logits
     for (int l = 0; l < cfg_.n_layers; ++l) {
         const std::size_t layer = sz(l);
         const LayerWeights& lw = w_.layers[layer];
-        float* layer_keys = key_cache_.data() + layer * sz(ctx_len_) * sz(kv_dim);
-        float* layer_values = value_cache_.data() + layer * sz(ctx_len_) * sz(kv_dim);
-        float* kbase = layer_keys + sz(p0) * sz(kv_dim);    // the new tokens' K and V go straight into the cache
-        float* vbase = layer_values + sz(p0) * sz(kv_dim);
+        float* kbase = bk_.data();   // the new keys and values are computed here and then stored into their blocks
+        float* vbase = bv_.data();
 
         // ---------------- attention block ----------------
         for (int i = 0; i < m; ++i) kernels::rmsnorm(XB + sz(i) * sz(dim), X + sz(i) * sz(dim), lw.rms_att, dim, eps);
@@ -330,16 +372,26 @@ void Transformer::batch_chunk(const int* tokens, int m, int p0, bool want_logits
         }
 
         for (int i = 0; i < m; ++i) {
-            const float* c = rope_cos_.data() + sz(p0 + i) * half;
-            const float* s = rope_sin_.data() + sz(p0 + i) * half;
+            const float* c = rope_cos_.data() + sz(positions[i]) * half;
+            const float* s = rope_sin_.data() + sz(positions[i]) * half;
             kernels::rope_apply(Q + sz(i) * sz(attn_dim), attn_dim, c, s, head_size, cfg_.rope_style);
             kernels::rope_apply(kbase + sz(i) * sz(kv_dim), kv_dim, c, s, head_size, cfg_.rope_style);
         }
+        // Store the new keys and values into their blocks (a chunk may cross block boundaries, and rows of
+        // different sequences go to different blocks).
+        for (int i = 0; i < m; ++i) {
+            const int pos = positions[i];
+            const int block = row_table_[sz(i)][pos / bs];
+            const std::size_t off = sz(pos % bs) * sz(kv_dim);
+            std::memcpy(kv_->keys(block, l) + off, kbase + sz(i) * sz(kv_dim), sz(kv_dim) * sizeof(float));
+            std::memcpy(kv_->values(block, l) + off, vbase + sz(i) * sz(kv_dim), sz(kv_dim) * sizeof(float));
+        }
         lap(profile_, ForwardProfile::Rope);
 
-        // Attention: item = (token, head). Token i sees positions 0 .. p0+i (the chunk's own K/V are all in the
-        // cache already). Items are dealt out round-robin because later tokens cost more.
-        const AttCtx ac{Q, AO, layer_keys, layer_values, batt_.data(), m, p0, n_heads, head_size, kv_mul, attn_dim, kv_dim, ctx_len_, inv_scale};
+        // Attention: item = (row, head); a row sees positions 0 .. its own (the rows' keys and values are all in
+        // the cache already). Items are dealt out round-robin because later positions cost more.
+        const AttCtx ac{Q, AO, kv_.get(), l, row_table_.data(), positions, batt_.data(), m, n_heads, head_size, kv_mul,
+                        attn_dim, kv_dim, ctx_len_, inv_scale};
         if (pool_) pool_->run(attention_body, const_cast<AttCtx*>(&ac));
         else attention_body(const_cast<AttCtx*>(&ac), 0, 1);
         lap(profile_, ForwardProfile::Attention);
@@ -377,16 +429,21 @@ void Transformer::batch_chunk(const int* tokens, int m, int p0, bool want_logits
 }
 
 std::size_t Transformer::kv_cache_bytes() const {
-    return (key_cache_.size() + value_cache_.size()) * sizeof(float);
+    return kv_->bytes();
 }
 
 std::size_t Transformer::scratch_bytes() const {
     return (x_.size() + xb_.size() + xb2_.size() + hb_.size() + hb2_.size() + q_.size() + ao_.size() +
             logits_.size() + bx_.size() + bxb_.size() + bxb2_.size() + bhb_.size() + bhb2_.size() + bq_.size() +
-            bao_.size() + batt_.size() + rope_cos_.size() + rope_sin_.size()) * sizeof(float);
+            bao_.size() + bk_.size() + bv_.size() + batt_.size() + rope_cos_.size() + rope_sin_.size()) * sizeof(float) +
+           row_seq_.size() * (sizeof(Sequence*) + sizeof(int) + sizeof(const int*));
 }
 
 const float* Transformer::forward(int token, int pos, bool compute_logits) {
+    return forward(*default_seq_, token, pos, compute_logits);
+}
+
+const float* Transformer::forward(Sequence& seq, int token, int pos, bool compute_logits) {
     if (token < 0 || token >= cfg_.vocab_size) {
         throw std::out_of_range("forward: token id " + std::to_string(token) + " out of range");
     }
@@ -394,6 +451,12 @@ const float* Transformer::forward(int token, int pos, bool compute_logits) {
         throw std::out_of_range("forward: position " + std::to_string(pos) +
                                 " exceeds the context length " + std::to_string(ctx_len_));
     }
+    if (&seq.pool() != kv_.get()) throw std::invalid_argument("forward: the sequence belongs to another KV pool");
+    if (pos > seq.length()) {
+        throw std::out_of_range("forward: position " + std::to_string(pos) + " leaves a gap, the sequence holds " +
+                                std::to_string(seq.length()) + " positions");
+    }
+    if (!seq.reserve(pos + 1)) throw std::runtime_error("forward: the KV pool has no free block left");
 
     if (profile_) {
         profile_->last = std::chrono::steady_clock::now();
@@ -433,17 +496,17 @@ const float* Transformer::forward(int token, int pos, bool compute_logits) {
         const std::size_t layer = sz(l);
         const LayerWeights& lw = w_.layers[layer];
 
-        // Start of this layer's slice of the KV cache; positions follow, each kv_dim wide.
-        float* layer_keys = key_cache_.data() + layer * sz(ctx_len_) * sz(kv_dim);
-        float* layer_values = value_cache_.data() + layer * sz(ctx_len_) * sz(kv_dim);
+        // Where the current position lives in the paged KV cache.
+        const int block = seq.block_table()[pos / kv_->block_size()];
+        const std::size_t row_off = sz(pos % kv_->block_size()) * sz(kv_dim);
 
         // ---------------- attention block ----------------
         kernels::rmsnorm(xb, x, lw.rms_att, dim, eps);
         lap(profile_, ForwardProfile::Norm);
 
         // K and V of the current position are written directly into the cache.
-        float* k = layer_keys + sz(pos) * sz(kv_dim);
-        float* v = layer_values + sz(pos) * sz(kv_dim);
+        float* k = kv_->keys(block, l) + row_off;
+        float* v = kv_->values(block, l) + row_off;
         const MatvecJob qkv[3] = {{q, lw.wq, xb, attn_dim, dim}, {k, lw.wk, xb, kv_dim, dim}, {v, lw.wv, xb, kv_dim, dim}};
         run_matvecs(qkv, 3);
         lap(profile_, ForwardProfile::QkvProj);
@@ -462,7 +525,8 @@ const float* Transformer::forward(int token, int pos, bool compute_logits) {
         // Each query head attends over all positions 0..pos of its (shared) KV head; the heads are spread over
         // the threads when there is enough work to pay for waking them.
         {
-            const AttCtx ac{q, ao, layer_keys, layer_values, batt_.data(), 1, pos, cfg_.n_heads, head_size, kv_mul,
+            const int* table = seq.block_table();
+            const AttCtx ac{q, ao, kv_.get(), l, &table, &pos, batt_.data(), 1, cfg_.n_heads, head_size, kv_mul,
                             attn_dim, kv_dim, ctx_len_, inv_scale};
             const int nt = pool_ ? pool_->size() : 1;
             const long work = static_cast<long>(cfg_.n_heads) * (pos + 1) * head_size * 2;   // multiply-adds
@@ -498,6 +562,7 @@ const float* Transformer::forward(int token, int pos, bool compute_logits) {
     }
 
     // 3. Final norm and classifier (for shared weights, wcls is the embedding table).
+    seq.set_length(pos + 1);
     if (!compute_logits) return nullptr;
     kernels::rmsnorm(x, x, w_.rms_final, dim, eps);
     lap(profile_, ForwardProfile::Norm);

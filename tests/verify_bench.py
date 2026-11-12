@@ -4,7 +4,7 @@
 A benchmark cannot be "right" in the way a kernel can, so this checks what can be checked:
   1. the JSON report is complete and echoes the model configuration from the file header
   2. the memory numbers equal formulas computed independently in Python
-       KV cache  = layers * context * kv_dim * 2 (K and V) * 4 bytes
+       KV cache  = layers * blocks * block_size (16, at most the context) * kv_dim * 2 (K and V) * 4 bytes
        scratch   = activation buffers + attention scores + logits
        weights/token = every tensor except the unused RoPE tables
   3. timing statistics are ordered (min <= median <= p95 <= max) and throughputs positive
@@ -88,12 +88,16 @@ def main() -> int:
             failures.append("the markdown table row is missing from the output")
 
         # ---- 2. memory formulas ------------------------------------------------------------
-        kv = c.n_layers * ctx * c.kv_dim * 2 * 4
+        # the paged pool holds whole blocks (16 positions each by default, never more than the context)
+        bsz = min(16, ctx)
+        kv = c.n_layers * ((ctx + bsz - 1) // bsz) * bsz * c.kv_dim * 2 * 4
         # x, xb, xb2 | q and the attention output | FFN gate and up | logits
         scratch = (3 * c.dim + 2 * c.attn_dim + 2 * c.hidden_dim + c.vocab_size) * 4
         # prompt batch (64 tokens by default): three dim, two hidden and two attention buffers, one attention score row per
         # thread (one thread here; used by decode too), and the RoPE cos/sin tables of the positions visited (head_size/2 pairs each)
         batch = 64 * (3 * c.dim + 2 * c.hidden_dim + 2 * c.attn_dim) * 4 + ctx * 4
+        # the K and V rows of a batch before they are scattered into blocks, and the per-row sequence pointer, position and block table pointer
+        batch += 64 * 2 * c.kv_dim * 4 + 64 * (8 + 4 + 8)
         rope_rows = n_prompt + n_decode
         scratch += batch + rope_rows * (c.attn_dim // c.n_heads) * 4
         weights = 0

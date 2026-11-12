@@ -25,6 +25,7 @@ add_library(geneinfer STATIC
   src/tokenizer/hf_tokenizer.cpp
   src/tokenizer/text_tokenizer.cpp
   src/kernels/kernels.cpp
+  src/model/kv_cache.cpp
   src/model/transformer.cpp
   src/sampler/sampler.cpp
   src/runtime/generator.cpp
@@ -86,7 +87,13 @@ target_link_libraries(gi_hf_tokenize PRIVATE geneinfer)
 add_executable(gi_unicode_check tools/unicode_check_main.cpp)
 target_link_libraries(gi_unicode_check PRIVATE geneinfer)
 
-foreach(tgt geneinfer gi_inspect gi_tokenize gi_kernel_check gi_forward gi_generate gi_sampler_check gi_bench gi_kernel_bench gi_pool_check gi_quant_dump gi_json_check gi_dtype_check gi_hf_tokenize gi_unicode_check)
+add_executable(gi_kvpool_check tools/kvpool_check_main.cpp)
+target_link_libraries(gi_kvpool_check PRIVATE geneinfer)
+
+add_executable(gi_multiseq tools/multiseq_check_main.cpp)
+target_link_libraries(gi_multiseq PRIVATE geneinfer)
+
+foreach(tgt geneinfer gi_inspect gi_tokenize gi_kernel_check gi_forward gi_generate gi_sampler_check gi_bench gi_kernel_bench gi_pool_check gi_quant_dump gi_json_check gi_dtype_check gi_hf_tokenize gi_unicode_check gi_kvpool_check gi_multiseq)
   if(MSVC)
     target_compile_options(${tgt} PRIVATE /W4 /utf-8)
     target_compile_definitions(${tgt} PRIVATE _CRT_SECURE_NO_WARNINGS)

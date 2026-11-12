@@ -16,15 +16,8 @@ cmake --build build --config Release
 ```
 
 ## Main Stages
-- Stage 1: M1 ~ M6   
-- Stage 2: M7 ~ M10   
-- Stage 3a: Performance Optimization, SIMD matvec   
-- Stage 3b: Weights are stored in bf16 format  
-- Stage 3c: Multithreading 
-- Stage 3d: int8 quantization
-- Stage 3e: GI_Q8_SKIP
-- Stage 3f: Batched prefill
-- Stage 3.M11: Qwen3-0.6B 
+### Stage 1: M1 ~ M6   
+### Stage 2: M7 ~ M10
 
 ### Stage 3a: SIMD matvec
 ```diff
@@ -74,6 +67,12 @@ Threads	Token-by-token	     Batched	     Speedup
 |-------|---------------|--------------|-----------------|---------|--------------|
 | -     | 116.8         | 27.7         | 35.585          | 33.50   | 1761.4       |
 
+### Stage 4.1: the paged KV cache
+| label | prefill tok/s | decode tok/s | median ms/token | GFLOP/s | peak RSS MiB |
+|-------|---------------|--------------|-----------------|---------|--------------|
+| -     | 111.5         | 27.9         | 35.781          | 33.32   | 1761.6       |
+
+
 ## Project Structure
 ```
 geneInfer/
@@ -103,6 +102,7 @@ geneInfer/
 │   │
 │   ├── model/
 │   │   └── transformer.h / .cpp    # M4
+│   │   └── kv_cache.h / .cpp       # Stage 4.1
 │   │
 │   ├── sampler/
 │   │   └── sampler.h / .cpp        # M5
@@ -149,7 +149,10 @@ geneInfer/
 │   ├── hf_tokenizer_probe.p        # M9
 │   ├── pool_check_main.cpp         # stage 3c
 │   ├── quant_dump_main.cpp         # stage 3d
-│   └── quant_stats.py              # stage 3e
+│   ├── quant_stats.py              # stage 3e
+│   ├── gen_norm_tables.py      # M11
+│   ├── multiseq_check_main.cpp # stage 4.1
+│   └── kvpool_check_main.cpp   # stage 4.1
 │
 ├── tests/
 │    ├── verify_loader.py       # M1: Verification: C++ Output vs. NumPy Element-wise Comparison
@@ -168,7 +171,10 @@ geneInfer/
 │    ├── verify_threads.py      # stage 3c
 │    ├── verify_quantize.py     # stage 3d
 │    ├── quant_accuracy.py      # stage 3d
-│    └── verify_batch.py        # stage 3f
+│    ├── verify_batch.py        # stage 3f
+│    ├── verify_nfc.py          # M11
+│    ├── verify_kvpool.py       # stage 4.1
+│    └── verify_multiseq.py     # stage 4.1
 │
 └── bench/
      ├── bench_main.cpp         # M6: gi_bench
