@@ -40,6 +40,7 @@ public:
     void retain(int block);    // one more owner of an allocated block
     void release(int block);   // one owner less; the block is free again when the count reaches 0
     int ref_count(int block) const;
+    void copy_block(int from, int to);   // all layers, keys and values (copy-on-write); both blocks must be allocated
 
     // The keys / values of `block` for `layer`: block_size rows of kv_dim floats.
     float* keys(int block, int layer) { return base(block, layer); }
@@ -85,6 +86,16 @@ public:
 
     // Set by the forward pass after it has stored positions up to n - 1 (n <= capacity()).
     void set_length(int n);
+
+    // Starts an empty sequence with blocks that already hold the keys and values of the first blocks.size() *
+    // block_size positions (a cached prefix). The caller has retained each block once for this sequence; the
+    // sequence now owns those references. Throws std::logic_error if the sequence is not empty.
+    void adopt(const std::vector<int>& blocks);
+
+    // Copy-on-write: makes sure the block at table index `index` belongs to this sequence alone, copying it into a
+    // fresh block if somebody else (another sequence, the prefix cache) shares it. Returns false when the pool has no
+    // block left for the copy (nothing changed). Always call it before writing into a block that may be shared.
+    bool make_writable(int index);
 
 private:
     KvPool* pool_;

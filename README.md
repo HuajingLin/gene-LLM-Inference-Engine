@@ -81,6 +81,11 @@ concurrent  wall (s)   tokens/s     tok/s/request  rows/pass    speedup    outpu
 8           8.623      59.4         7.4            9.58         2.36       identical to running alone
 (tokens/s counts generated tokens only; wall time includes the prompts.)
 
+### Stage 4.3 prefix caching
+the 1-request run takes 0.83 s against 1.81 s without, and the 4-request run takes 1.79 s against 7.0 s, about 2.2x and 3.9x faster.
+
+
+
 ## Project Structure
 ```
 geneInfer/
@@ -109,14 +114,16 @@ geneInfer/
 │   │   └── kernels_avx512.cpp      # Stage 3a
 │   │
 │   ├── model/
-│   │   └── transformer.h / .cpp    # M4
-│   │   └── kv_cache.h / .cpp       # Stage 4.1
+│   │   ├── transformer.h / .cpp    # M4
+│   │   ├── kv_cache.h / .cpp       # Stage 4.1
+│   │   └── prefix_cache.h / .cpp   # Stage 4.3
 │   │
 │   ├── sampler/
 │   │   └── sampler.h / .cpp        # M5
 │   │
 │   ├── runtime/
-│   │   └── generator.h / c.pp      # M5
+│   │   ├── generator.h / c.pp      # M5
+│   │   └── engine.h / c.pp         # stage 4.2
 │   │
 │   ├── util/
 │   │   ├── process_memory.h / .cpp # M6
@@ -161,7 +168,8 @@ geneInfer/
 │   ├── quant_stats.py              # stage 3e
 │   ├── gen_norm_tables.py      # M11
 │   ├── multiseq_check_main.cpp # stage 4.1
-│   └── kvpool_check_main.cpp   # stage 4.1
+│   ├── kvpool_check_main.cpp   # stage 4.1
+│   └── prefixcache_check_main.cpp  # stage 4.3
 │
 ├── tests/
 │    ├── verify_loader.py       # M1: Verification: C++ Output vs. NumPy Element-wise Comparison
@@ -183,7 +191,8 @@ geneInfer/
 │    ├── verify_batch.py        # stage 3f
 │    ├── verify_nfc.py          # M11
 │    ├── verify_kvpool.py       # stage 4.1
-│    └── verify_multiseq.py     # stage 4.1
+│    ├── verify_multiseq.py     # stage 4.1
+│    └── verify_prefixcache.py  # stage 4.3
 │
 └── bench/
      ├── bench_main.cpp         # M6: gi_bench

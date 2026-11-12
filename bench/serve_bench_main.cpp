@@ -2,11 +2,16 @@
 //
 //   gi_serve_bench --model DIR_OR_FILE [--concurrency 1,2,4,8] [--prompt-tokens 16] [--decode-tokens 64]
 //                  [--runs 3] [--max-seq-len N] [--threads N] [--weights native|f32|int8] [--block-size B]
+//                  [--shared-prefix N] [--warm-cache] [--no-prefix-cache]
 //
 // For every concurrency level C the same C synthetic requests (random prompt tokens, greedy sampling, no end token,
 // exactly --decode-tokens generated tokens each) are run through the Engine with C requests allowed to run at
 // once. Decoding is limited by the speed at which the weights stream from memory; with C requests in one pass every
 // weight is read once for C tokens, so the aggregate tokens/s should grow with C until the arithmetic becomes the limit.
+// --shared-prefix N makes the first N prompt tokens identical in all requests (a common system prompt); with
+// --warm-cache one Engine (and so one prefix cache) lives across the warm-up and the measured runs, like a server that
+// has already seen the prompt, and the table shows how many prompt positions the cache supplied. Without it every run
+// starts with an empty cache. --no-prefix-cache turns the cache off.
 // The C = 1 line is the unbatched baseline (the same code path with a single row per pass). The tokens of every
 // request are compared with the C = 1 run of the same request, which must be identical.
 #include <algorithm>
@@ -14,6 +19,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
+#include <memory>
 #include <random>
 #include <sstream>
 #include <string>
@@ -60,7 +66,8 @@ double median(std::vector<double> v) {
 
 int main(int argc, char** argv) {
     std::string model_path, weights_arg, conc_arg = "1,2,4,8";
-    int prompt_tokens = 16, decode_tokens = 64, runs = 3, max_seq_len = 0, n_threads = 0, block_size = 0;
+    int prompt_tokens = 16, decode_tokens = 64, runs = 3, max_seq_len = 0, n_threads = 0, block_size = 0, shared_prefix = 0;
+    bool warm_cache = false, prefix_cache = true;
     for (int i = 1; i < argc; ++i) {
         const std::string f = argv[i];
         auto value = [&]() -> std::string {
@@ -68,6 +75,9 @@ int main(int argc, char** argv) {
             return argv[++i];
         };
         if (f == "--model") model_path = value();
+        else if (f == "--shared-prefix") shared_prefix = std::atoi(value().c_str());
+        else if (f == "--warm-cache") warm_cache = true;
+        else if (f == "--no-prefix-cache") prefix_cache = false;
         else if (f == "--concurrency") conc_arg = value();
         else if (f == "--prompt-tokens") prompt_tokens = std::atoi(value().c_str());
         else if (f == "--decode-tokens") decode_tokens = std::atoi(value().c_str());
@@ -114,21 +124,27 @@ int main(int argc, char** argv) {
         std::mt19937 rng(7);
         std::vector<EngineRequest> reqs(static_cast<std::size_t>(cmax));
         for (EngineRequest& r : reqs) {
-            for (int j = 0; j < prompt_tokens; ++j) r.prompt.push_back(static_cast<int>(rng() % static_cast<unsigned>(vocab)));
+            for (int j = 0; j < prompt_tokens; ++j) {
+                const int t = static_cast<int>(rng() % static_cast<unsigned>(vocab));
+                r.prompt.push_back(j < shared_prefix && !reqs.empty() && &r != &reqs.front() ? reqs.front().prompt[static_cast<std::size_t>(j)] : t);
+            }
             r.max_positions = total - 1;   // prompt_tokens + decode_tokens - 1 positions give decode_tokens generated tokens
             r.sampler.temperature = 0.0f;
         }
 
         std::printf("model: %s | %d threads | prompt %d + decode %d tokens per request | block size %d | max rows per pass %d\n",
                     model_path.c_str(), model.threads(), prompt_tokens, decode_tokens, bs, model.max_batch());
-        std::printf("%-11s %-10s %-12s %-14s %-12s %-10s %s\n", "concurrent", "wall (s)", "tokens/s", "tok/s/request", "rows/pass", "speedup", "outputs");
+        std::printf("%-11s %-10s %-12s %-14s %-12s %-10s %-14s %s\n", "concurrent", "wall (s)", "tokens/s", "tok/s/request", "rows/pass", "speedup", "cached pos.", "outputs");
 
         std::vector<std::vector<int>> baseline(static_cast<std::size_t>(cmax));   // from the C = 1 style run, per request
         double base_tps = 0.0;
         bool all_same = true;
         // Baseline outputs: every request alone.
         for (int r = 0; r < cmax; ++r) {
-            Engine e(model, tok, EngineConfig{1, 0, 0});
+            EngineConfig base_cfg;
+            base_cfg.max_running = 1;
+            base_cfg.prefix_cache = false;
+            Engine e(model, tok, base_cfg);
             const int id = e.submit(reqs[static_cast<std::size_t>(r)]);
             e.run_until_idle();
             baseline[static_cast<std::size_t>(r)] = e.result(id).generated_tokens;
@@ -138,10 +154,17 @@ int main(int argc, char** argv) {
             std::vector<double> walls;
             double rows_per_pass = 0.0;
             bool same = true;
+            long cached_positions = 0;
+            EngineConfig ec;
+            ec.max_running = c;
+            ec.prefix_cache = prefix_cache;
+            std::unique_ptr<Engine> warm;
+            if (warm_cache) warm = std::make_unique<Engine>(model, tok, ec);
             for (int run = -1; run < runs; ++run) {   // run -1 is the unmeasured warm-up
-                EngineConfig ec;
-                ec.max_running = c;
-                Engine e(model, tok, ec);
+                std::unique_ptr<Engine> fresh;
+                if (!warm_cache) fresh = std::make_unique<Engine>(model, tok, ec);
+                Engine& e = warm_cache ? *warm : *fresh;
+                const long passes_before = e.stats().passes, rows_before = e.stats().rows, cached_before = e.stats().prefix_tokens;
                 std::vector<int> ids;
                 const auto t0 = std::chrono::steady_clock::now();
                 for (int r = 0; r < c; ++r) ids.push_back(e.submit(reqs[static_cast<std::size_t>(r)]));
@@ -149,14 +172,15 @@ int main(int argc, char** argv) {
                 const double wall = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
                 if (run >= 0) walls.push_back(wall);
                 for (int r = 0; r < c; ++r) same = same && e.result(ids[static_cast<std::size_t>(r)]).generated_tokens == baseline[static_cast<std::size_t>(r)];
-                rows_per_pass = static_cast<double>(e.stats().rows) / static_cast<double>(e.stats().passes);
+                rows_per_pass = static_cast<double>(e.stats().rows - rows_before) / static_cast<double>(e.stats().passes - passes_before);
+                if (run >= 0) cached_positions = e.stats().prefix_tokens - cached_before;   // of the last measured run
             }
             all_same = all_same && same;
             const double wall = median(walls);
             const double tps = static_cast<double>(c) * decode_tokens / wall;
             if (base_tps == 0.0) base_tps = tps;
-            std::printf("%-11d %-10.3f %-12.1f %-14.1f %-12.2f %-10.2f %s\n", c, wall, tps, tps / c, rows_per_pass, tps / base_tps,
-                        same ? "identical to running alone" : "DIFFER");
+            std::printf("%-11d %-10.3f %-12.1f %-14.1f %-12.2f %-10.2f %-14ld %s\n", c, wall, tps, tps / c, rows_per_pass, tps / base_tps,
+                        cached_positions, same ? "identical to running alone" : "DIFFER");
         }
         std::printf("(tokens/s counts generated tokens only; wall time includes the prompts.)\n");
         return all_same ? 0 : 1;

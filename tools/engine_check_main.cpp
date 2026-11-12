@@ -1,7 +1,7 @@
 // engine_check_main.cpp - the Engine (request queue + continuous batching) against generate() run alone.
 //
 //   gi_engine_check <hf model dir with tokenizer.json> --max-seq-len N [--seed S] [--requests R] [--block-size B]
-//                   [--kv-blocks K] [--max-running M] [--step-rows W] [--chunk C] [--staggered] [--oversize] [--wide-eos]
+//                   [--kv-blocks K] [--max-running M] [--step-rows W] [--chunk C] [--staggered] [--oversize] [--wide-eos] [--shared-prefix L] [--no-prefix-cache]
 //
 // R random requests (prompt lengths, position limits and sampler settings are drawn from the seed) are first run
 // one after the other with generate() on a model with a roomy pool (the reference), then all together through an
@@ -61,11 +61,16 @@ int main(int argc, char** argv) {
     try {
         int ctx = 0, bs = 0, nblocks = 0, nreq = 6, max_running = 4, step_rows = 0, chunk = 0;
         unsigned seed = 1;
-        bool staggered = false, oversize = false, wide = false;
+        bool staggered = false, oversize = false, wide = false, prefix_cache = true;
+        int shared_prefix = 0;
         for (int i = 2; i < argc; ++i) {
             const std::string a = argv[i];
             if (a == "--staggered") {
                 staggered = true;
+                continue;
+            }
+            if (a == "--no-prefix-cache") {
+                prefix_cache = false;
                 continue;
             }
             if (a == "--wide-eos") {
@@ -86,6 +91,7 @@ int main(int argc, char** argv) {
             else if (a == "--max-running") max_running = std::stoi(v);
             else if (a == "--step-rows") step_rows = std::stoi(v);
             else if (a == "--chunk") chunk = std::stoi(v);
+            else if (a == "--shared-prefix") shared_prefix = std::stoi(v);
             else throw std::runtime_error("unknown option " + a);
         }
         const Checkpoint ck = Checkpoint::load(argv[1]);
@@ -95,12 +101,19 @@ int main(int argc, char** argv) {
         const int vocab = model.config().vocab_size;
         std::mt19937 rng(seed);
 
+        const std::vector<int> base_a = [&] { std::vector<int> v; for (int i = 0; i < std::max(shared_prefix, 1); ++i) v.push_back(static_cast<int>(rng() % static_cast<unsigned>(vocab))); return v; }();
+        const std::vector<int> base_b = [&] { std::vector<int> v; for (int i = 0; i < std::max(shared_prefix, 1); ++i) v.push_back(static_cast<int>(rng() % static_cast<unsigned>(vocab))); return v; }();
         std::vector<EngineRequest> reqs;
         std::vector<GenerateResult> refs;
         for (int r = 0; r < nreq; ++r) {
             EngineRequest q;
             const int plen = 1 + static_cast<int>(rng() % static_cast<unsigned>(std::max(1, ctx / 2)));
             for (int j = 0; j < plen; ++j) q.prompt.push_back(static_cast<int>(rng() % static_cast<unsigned>(vocab)));
+            if (shared_prefix > 0) {   // start with (a part of) one of two common prefixes, then continue on its own
+                const std::vector<int>& base = (rng() & 1u) ? base_a : base_b;
+                const int keep = std::min<int>(plen, static_cast<int>(rng() % static_cast<unsigned>(shared_prefix + 1)));
+                for (int j = 0; j < keep; ++j) q.prompt[static_cast<std::size_t>(j)] = base[static_cast<std::size_t>(j)];
+            }
             q.max_positions = (rng() % 3 == 0) ? 0 : (rng() % 5 == 0) ? 1 + static_cast<int>(rng() % static_cast<unsigned>(plen)) : plen + static_cast<int>(rng() % 24);
             q.sampler.temperature = (rng() % 2 == 0) ? 0.0f : 0.5f + static_cast<float>(rng() % 10) / 10.0f;
             q.sampler.top_k = (rng() % 3 == 0) ? 0 : 1 + static_cast<int>(rng() % 20);
@@ -127,6 +140,7 @@ int main(int argc, char** argv) {
             if (!e.result(small_id).error.empty() || e.result(small_id).generated_tokens != want.generated_tokens) {
                 throw Failure{"the small request next to an oversized one differs from generate() or failed: " + e.result(small_id).error};
             }
+            e.clear_prefix_cache();
             if (model.kv_pool().free_blocks() != model.kv_pool().n_blocks()) throw Failure{"blocks leaked"};
             std::printf("ok oversize: the request that cannot fit failed cleanly, its neighbour was unaffected\n");
             std::printf("PASS\n");
@@ -136,6 +150,7 @@ int main(int argc, char** argv) {
         ec.max_running = max_running;
         ec.step_rows = step_rows;
         ec.prefill_chunk = chunk;
+        ec.prefix_cache = prefix_cache;
         Engine engine(model, *tok, ec);
         std::vector<int> ids;
         std::size_t submitted = 0;
@@ -173,15 +188,20 @@ int main(int argc, char** argv) {
             const long steps = reqs[r].max_positions <= 0 ? ctx : std::min<long>(reqs[r].max_positions, ctx);
             expected_rows += g > 0 ? plen + g - 1 : std::min(steps, plen);
         }
-        if (model.kv_pool().free_blocks() != model.kv_pool().n_blocks()) throw Failure{"blocks leaked after all requests finished"};
+        if (model.kv_pool().free_blocks() + engine.cached_blocks() != model.kv_pool().n_blocks()) throw Failure{"blocks leaked after all requests finished"};
+        engine.clear_prefix_cache();
+        if (model.kv_pool().free_blocks() != model.kv_pool().n_blocks()) throw Failure{"blocks still in use after clearing the prefix cache"};
         const EngineStats& st = engine.stats();
         const int rows_limit = (step_rows > 0 && step_rows < model.max_batch()) ? step_rows : model.max_batch();
-        if (st.preemptions == 0 && st.rows != expected_rows) throw Failure{"the engine processed " + std::to_string(st.rows) + " rows, expected " + std::to_string(expected_rows) + " (no preemptions)"};
+        if (st.preemptions == 0 && st.rows + st.prefix_tokens != expected_rows) throw Failure{"the engine processed " + std::to_string(st.rows) + " rows and reused " + std::to_string(st.prefix_tokens) + " cached positions, expected " + std::to_string(expected_rows) + " in total (no preemptions)"};
+        if (!prefix_cache && (st.prefix_tokens != 0 || st.prefix_hits != 0)) throw Failure{"prefix cache statistics are not zero with the cache disabled"};
         if (st.max_rows_in_pass > rows_limit) throw Failure{"a pass had more rows than --step-rows allows"};
         if (chunk > 0 && st.max_chunk > chunk) throw Failure{"a request added more prompt rows to a pass than --chunk allows"};
         if (st.max_running_seen > max_running) throw Failure{"more requests ran at once than --max-running allows"};
-        std::printf("ok engine: %d requests, %ld generated tokens, %ld passes, %ld rows (max %d per pass), %ld preemptions, up to %d running\n",
-                    nreq, total_generated, st.passes, st.rows, st.max_rows_in_pass, st.preemptions, st.max_running_seen);
+        std::printf("ok engine: %d requests, %ld generated tokens, %ld passes, %ld rows (max %d per pass), %ld preemptions, up to %d running, "
+                    "prefix cache: %ld positions reused in %ld admissions, %ld blocks evicted\n",
+                    nreq, total_generated, st.passes, st.rows, st.max_rows_in_pass, st.preemptions, st.max_running_seen, st.prefix_tokens,
+                    st.prefix_hits, st.evicted_blocks);
         std::printf("PASS\n");
         return 0;
     } catch (const Failure& f) {

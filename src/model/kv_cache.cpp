@@ -1,5 +1,6 @@
 #include "model/kv_cache.h"
 
+#include <cstring>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -50,6 +51,15 @@ int KvPool::ref_count(int block) const {
     return refs_[static_cast<std::size_t>(block)];
 }
 
+void KvPool::copy_block(int from, int to) {
+    if (from < 0 || from >= n_blocks_ || to < 0 || to >= n_blocks_ || from == to || refs_[static_cast<std::size_t>(from)] < 1 ||
+        refs_[static_cast<std::size_t>(to)] < 1) {
+        throw std::logic_error("KvPool::copy_block: both blocks must be different allocated blocks");
+    }
+    std::memcpy(mem_.get() + static_cast<std::size_t>(to) * block_floats_, mem_.get() + static_cast<std::size_t>(from) * block_floats_,
+                block_floats_ * sizeof(float));
+}
+
 Sequence::Sequence(Sequence&& other) noexcept
     : pool_(other.pool_), blocks_(std::move(other.blocks_)), length_(other.length_) {
     other.blocks_.clear();
@@ -93,6 +103,24 @@ void Sequence::truncate(int n) {
 void Sequence::set_length(int n) {
     if (n < 0 || n > capacity()) throw std::out_of_range("Sequence::set_length: beyond the reserved capacity");
     length_ = n;
+}
+
+void Sequence::adopt(const std::vector<int>& blocks) {
+    if (!blocks_.empty() || length_ != 0) throw std::logic_error("Sequence::adopt: the sequence is not empty");
+    blocks_ = blocks;
+    length_ = static_cast<int>(blocks.size()) * pool_->block_size();
+}
+
+bool Sequence::make_writable(int index) {
+    if (index < 0 || index >= static_cast<int>(blocks_.size())) throw std::out_of_range("Sequence::make_writable: no such block");
+    const int b = blocks_[static_cast<std::size_t>(index)];
+    if (pool_->ref_count(b) <= 1) return true;
+    const int fresh = pool_->allocate();
+    if (fresh < 0) return false;
+    pool_->copy_block(b, fresh);
+    pool_->release(b);
+    blocks_[static_cast<std::size_t>(index)] = fresh;
+    return true;
 }
 
 }  // namespace geneinfer

@@ -145,6 +145,7 @@ private:
         std::size_t out_stride, x_stride;
     };
     void run_matmuls(const MatmulJob* jobs, int n, int ntok);
+    bool prepare_write(Sequence& seq, int first, int last);   // reserve + copy-on-write for positions first..last; false if the pool is full
     void batch_chunk(Sequence& seq, const int* tokens, int m, int pos0, bool compute_logits);
     // The batched forward pass over m rows; row i is `tokens[i]` at position `positions[i]` of `seqs[i]` (whose
     // blocks must be reserved). Rows of one sequence must come in increasing position order; the keys and values

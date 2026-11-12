@@ -21,6 +21,7 @@
 #include <string>
 #include <vector>
 
+#include "model/prefix_cache.h"
 #include "model/transformer.h"
 #include "sampler/sampler.h"
 #include "tokenizer/text_tokenizer.h"
@@ -31,6 +32,7 @@ struct EngineConfig {
     int max_running = 8;       // requests that hold KV memory and take part in a pass at the same time
     int step_rows = 0;         // rows per pass; 0 = the model's max_batch
     int prefill_chunk = 0;     // most prompt tokens one request adds to a pass; 0 = no limit besides step_rows
+    bool prefix_cache = true;  // reuse the KV blocks of earlier requests that start with the same tokens
 };
 
 struct EngineRequest {
@@ -49,6 +51,7 @@ struct EngineResult {
     bool stopped_by_end_token = false;
     std::string error;                   // not empty if the request failed (e.g. the KV pool is too small for it)
     int preemptions = 0;
+    long cached_tokens = 0;              // positions taken from the prefix cache instead of being computed (all admissions)
     long first_pass = -1;                // pass in which the request first took part / produced its first token
     long first_token_pass = -1;
     long last_pass = -1;
@@ -59,6 +62,9 @@ struct EngineStats {
     long rows = 0;            // rows over all passes
     long logits_rows = 0;
     long preemptions = 0;
+    long prefix_tokens = 0;   // positions served by the prefix cache
+    long prefix_hits = 0;     // admissions that found at least one cached block
+    long evicted_blocks = 0;
     int max_rows_in_pass = 0;
     int max_chunk = 0;        // most rows one request contributed to a single pass (prompt chunks)
     int max_running_seen = 0;
@@ -81,6 +87,9 @@ public:
     int running() const;
     int waiting() const;
 
+    int cached_blocks() const { return cache_ ? cache_->entries() : 0; }   // blocks the prefix cache holds
+    void clear_prefix_cache() { if (cache_) cache_->clear(); }
+
     const EngineResult& result(int id) const;
     const EngineStats& stats() const { return stats_; }
 
@@ -89,6 +98,7 @@ private:
     void admit();
     void preempt_youngest();
     void finish(Job& job, const std::string& error);
+    void cache_new_blocks(Job& job);
 
     Transformer& model_;
     const TextTokenizer& tokenizer_;
@@ -97,6 +107,7 @@ private:
     std::deque<Job*> waiting_;
     std::vector<Job*> running_;                // in admission order
     EngineStats stats_;
+    std::unique_ptr<PrefixCache> cache_;   // declared last: destroyed first (it holds references into the pool)
 };
 
 }  // namespace geneinfer

@@ -284,7 +284,10 @@ const float* Transformer::forward_batch(Sequence& seq, const int* tokens, int n,
             throw std::out_of_range("forward_batch: token id " + std::to_string(tokens[i]) + " out of range");
         }
     }
-    if (!seq.reserve(pos0 + n)) throw std::runtime_error("forward_batch: the KV pool has no free block left");
+    if (!prepare_write(seq, pos0, pos0 + n - 1)) {
+        seq.truncate(seq.length());
+        throw std::runtime_error("forward_batch: the KV pool has no free block left");
+    }
     if (trace_) {   // the trace wants every token: one by one
         const float* logits = nullptr;
         for (int i = 0; i < n; ++i) logits = forward(seq, tokens[i], pos0 + i, compute_logits && i == n - 1);
@@ -444,6 +447,17 @@ void Transformer::run_rows(const int* tokens, Sequence* const* seqs, const int* 
     lap(profile_, ForwardProfile::Classifier);
 }
 
+// Room for positions first..last of seq, and every block they touch belongs to seq alone (copy-on-write). Blocks that are
+// still shared with the prefix cache or another sequence are copied first, so a write never changes what others read.
+bool Transformer::prepare_write(Sequence& seq, int first, int last) {
+    if (!seq.reserve(last + 1)) return false;
+    const int bs = kv_->block_size();
+    for (int idx = first / bs; idx <= last / bs; ++idx) {
+        if (!seq.make_writable(idx)) return false;
+    }
+    return true;
+}
+
 const float* Transformer::forward_rows(const StepRow* rows, int n) {
     if (n < 1 || n > max_batch_) {
         throw std::invalid_argument("forward_rows: " + std::to_string(n) + " rows, expected 1 .. " + std::to_string(max_batch_));
@@ -471,7 +485,7 @@ const float* Transformer::forward_rows(const StepRow* rows, int n) {
     }
     // Reserve every new position first; on failure give the blocks back so that nothing has changed.
     bool ok = true;
-    for (int i = 0; i < n && ok; ++i) ok = row_seq_[sz(i)]->reserve(row_pos_[sz(i)] + 1);
+    for (int i = 0; i < n && ok; ++i) ok = prepare_write(*row_seq_[sz(i)], row_pos_[sz(i)], row_pos_[sz(i)]);
     if (!ok) {
         for (int i = 0; i < n; ++i) row_seq_[sz(i)]->truncate(row_seq_[sz(i)]->length());
         throw std::runtime_error("forward_rows: the KV pool has no free block left");
@@ -510,7 +524,10 @@ const float* Transformer::forward(Sequence& seq, int token, int pos, bool comput
         throw std::out_of_range("forward: position " + std::to_string(pos) + " leaves a gap, the sequence holds " +
                                 std::to_string(seq.length()) + " positions");
     }
-    if (!seq.reserve(pos + 1)) throw std::runtime_error("forward: the KV pool has no free block left");
+    if (!prepare_write(seq, pos, pos)) {
+        seq.truncate(seq.length());
+        throw std::runtime_error("forward: the KV pool has no free block left");
+    }
 
     if (profile_) {
         profile_->last = std::chrono::steady_clock::now();

@@ -1,6 +1,6 @@
 // multiseq_check_main.cpp - several sequences sharing one paged KV pool.
 //
-//   gi_multiseq <model> --max-seq-len N [--block-size B] [--kv-blocks K] [--seed S] [--mode interleave|rows|exhaust|rows_exhaust]
+//   gi_multiseq <model> --max-seq-len N [--block-size B] [--kv-blocks K] [--seed S] [--mode interleave|rows|cow|exhaust|rows_exhaust]
 //
 // interleave: three sequences (random token streams) are run alone to get reference logits, then run again in a
 //   random interleaving of single-token steps and small batches on one shared pool, with random rewinds
@@ -8,6 +8,9 @@
 // rows: forward_rows() with rows of up to four sequences in one pass (single decode rows and prefill chunks mixed,
 //   a random subset of the rows asking for logits); each requested row must be bit-identical to the reference.
 //   A pass the pool cannot hold must throw and change nothing.
+// cow: two sequences share the first blocks of one history (KvPool::retain + Sequence::adopt); the second is rewound
+//   into the middle of a shared block and continues with other tokens, through forward(), forward_batch() or
+//   forward_rows(). Copy-on-write must keep the first sequence unchanged: both must match their references.
 // exhaust: a pool too small for two sequences. The first sequence fills it; the next token of either sequence must be
 //   refused with an exception that leaves the sequence length unchanged; after the first sequence is destroyed the
 //   second one must work and give the reference logits.
@@ -252,6 +255,65 @@ void rows_exhaust(Transformer& m, std::mt19937& rng, int vocab) {
     std::printf("ok rows_exhaust: refused cleanly, state unchanged, still usable\n");
 }
 
+void cow_mode(Transformer& m, std::mt19937& rng, int vocab, int ctx) {
+    KvPool& pool = m.kv_pool();
+    const int bs = pool.block_size();
+    int rounds = 0;
+    for (int variant = 0; variant < 3; ++variant) {
+        const int n = std::max(bs + 2, ctx / 2 + static_cast<int>(rng() % static_cast<unsigned>(ctx / 2)));
+        if (n + 4 > ctx) continue;
+        const std::vector<int> a = random_tokens(rng, n + 3, vocab);    // sequence A: n tokens, then 3 more after B diverged
+        const int shared_blocks = n / bs;
+        if (shared_blocks < 1) continue;
+        const int m_rewind = 1 + static_cast<int>(rng() % static_cast<unsigned>(shared_blocks * bs - 1 > 0 ? shared_blocks * bs - 1 : 1));   // inside the shared part
+        std::vector<int> b(a.begin(), a.begin() + m_rewind);
+        const std::vector<int> extra = random_tokens(rng, 5, vocab);
+        b.insert(b.end(), extra.begin(), extra.end());
+        if (static_cast<int>(b.size()) > ctx) continue;
+        const auto ref_a = run_alone(m, a, vocab);
+        const auto ref_b = run_alone(m, b, vocab);
+
+        Sequence sa = m.new_sequence();
+        for (int i = 0; i < n; ++i) m.forward(sa, a[static_cast<std::size_t>(i)], i, false);
+        Sequence sb = m.new_sequence();
+        std::vector<int> shared(sa.block_table(), sa.block_table() + shared_blocks);
+        for (int blk : shared) pool.retain(blk);
+        sb.adopt(shared);
+        expect(sb.length() == shared_blocks * bs, "adopt did not set the length");
+        sb.truncate(m_rewind);   // into the middle of the shared region
+        // B continues with its own tokens
+        if (variant == 0) {
+            for (std::size_t i = static_cast<std::size_t>(m_rewind); i < b.size(); ++i) {
+                const float* l = m.forward(sb, b[i], static_cast<int>(i));
+                expect(same(l, ref_b[i]), "B (forward) differs from its reference after copy-on-write");
+            }
+        } else if (variant == 1) {
+            const float* l = m.forward_batch(sb, b.data() + m_rewind, static_cast<int>(b.size()) - m_rewind, m_rewind, true);
+            expect(same(l, ref_b.back()), "B (forward_batch) differs from its reference after copy-on-write");
+        } else {
+            std::vector<Transformer::StepRow> rows;
+            for (std::size_t i = static_cast<std::size_t>(m_rewind); i < b.size(); ++i) rows.push_back({&sb, b[i], i + 1 == b.size()});
+            const float* l = m.forward_rows(rows.data(), static_cast<int>(rows.size()));
+            expect(l != nullptr && same(l, ref_b.back()), "B (forward_rows) differs from its reference after copy-on-write");
+        }
+        expect(sb.block_table()[(m_rewind) / bs] != sa.block_table()[m_rewind / bs], "B still shares the block it wrote into");
+        // A goes on and must not have seen B's writes
+        for (int i = n; i < n + 3; ++i) {
+            const float* l = m.forward(sa, a[static_cast<std::size_t>(i)], i);
+            expect(same(l, ref_a[static_cast<std::size_t>(i)]), "A differs from its reference after B wrote into a shared block");
+        }
+        // and A re-reading its whole history in one batch gives the reference too
+        {
+            Sequence sc = m.new_sequence();
+            const float* l = m.forward_batch(sc, a.data(), n + 3, 0, true);
+            expect(same(l, ref_a.back()), "reference batch differs");
+        }
+        ++rounds;
+    }
+    expect(pool.free_blocks() <= pool.n_blocks(), "pool accounting broken");
+    std::printf("ok cow: %d rounds, diverged sequences match their references\n", rounds);
+}
+
 void exhaust(Transformer& m, std::mt19937& rng, int vocab) {
     KvPool& pool = m.kv_pool();
     const int capacity = pool.n_blocks() * pool.block_size();
@@ -305,7 +367,7 @@ void exhaust(Transformer& m, std::mt19937& rng, int vocab) {
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        std::fprintf(stderr, "usage: %s <model> --max-seq-len N [--block-size B] [--kv-blocks K] [--seed S] [--mode interleave|rows|exhaust|rows_exhaust]\n", argv[0]);
+        std::fprintf(stderr, "usage: %s <model> --max-seq-len N [--block-size B] [--kv-blocks K] [--seed S] [--mode interleave|rows|cow|exhaust|rows_exhaust]\n", argv[0]);
         return 2;
     }
     try {
@@ -330,6 +392,7 @@ int main(int argc, char** argv) {
         if (mode == "interleave") interleave(m, rng, vocab, m.max_seq_len());
         else if (mode == "rows") rows_mode(m, rng, vocab, m.max_seq_len());
         else if (mode == "rows_exhaust") rows_exhaust(m, rng, vocab);
+        else if (mode == "cow") cow_mode(m, rng, vocab, m.max_seq_len());
         else if (mode == "exhaust") exhaust(m, rng, vocab);
         else throw std::runtime_error("unknown mode " + mode);
         std::printf("PASS\n");
