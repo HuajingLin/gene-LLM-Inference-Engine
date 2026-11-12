@@ -74,22 +74,24 @@ Threads	Token-by-token	     Batched	     Speedup
 | -     | 111.5         | 27.9         | 35.781          | 33.32   | 1761.6       |
 
 ### Stage 4.2 batching
+```diff
 concurrent  wall (s)   tokens/s     tok/s/request  rows/pass    speedup    outputs
 1           2.539      25.2         25.2           1.23         1.00       identical to running alone
 2           3.269      39.2         19.6           2.47         1.55       identical to running alone
 4           5.343      47.9         12.0           4.94         1.90       identical to running alone
 8           8.623      59.4         7.4            9.58         2.36       identical to running alone
 (tokens/s counts generated tokens only; wall time includes the prompts.)
-
+```
 ### Stage 4.3 prefix caching
 the 1-request run takes 0.83 s against 1.81 s without, and the 4-request run takes 1.79 s against 7.0 s, about 2.2x and 3.9x faster.
 
 ### Stage 4.4 multi-row kernel 
+```diff
 			     Multi-token	Per-token
 Prefill, run 1		158.8 tok/s	110.4 tok/s
 Prefill, run 2		155.0 tok/s	111.1 tok/s
 Decode         	28.2 tok/s	28.2 tok/s
-
+```
 
 ## Project Structure
 ```
