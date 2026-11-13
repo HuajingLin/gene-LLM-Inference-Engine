@@ -9,7 +9,8 @@ All numbers come from one laptop (i7-1185G7, 16 GB, about 18.5 GB/s DRAM bandwid
 + Stage 2: SmolLM2-135M
 + Stage 3a ~ 3f: SmolLM2-135M
 + Stage 3 M11: Qwen3.06B
-- Stage 4: Qwen3.06B
++ Stage 4.1 ~ 4.4: Qwen3.06B
+- Stage 4.5: Llama-3.2-1B 
 ```
 
 ## run
