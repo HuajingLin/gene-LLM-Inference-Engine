@@ -20,6 +20,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import subprocess
 import sys
@@ -294,6 +295,61 @@ def suite(exe: str, seed: int):
             record("rope", f"HF formulation theta={theta:g} n={n} head={hs} pos={pos}",
                    err(run(exe, ["rope", n, pos, hs, repr(theta), "half_split"], v),
                        hf_style_rope(v, pos, hs, theta)))
+
+    # llama3 frequency scaling, written the way Hugging Face's _compute_llama3_parameters states it (a loop with
+    # if / elif per frequency), applied through the explicit rotate_half formulation: independent of both the C++ code
+    # and tools/ref.py.
+    def hf_llama3_inv_freq(head_dim, theta, factor, low, high, original):
+        inv_freq = 1.0 / (theta ** (np.arange(0, head_dim, 2, dtype=np.float64) / head_dim))
+        out = []
+        for f in inv_freq:
+            wavelen = 2 * math.pi / f
+            if wavelen < original / high:
+                out.append(f)
+            elif wavelen > original / low:
+                out.append(f / factor)
+            else:
+                smooth = (original / wavelen - low) / (high - low)
+                out.append((1 - smooth) * f / factor + smooth * f)
+        return np.array(out)
+
+    def hf_rope_with(x, pos, head_dim, inv_freq):
+        heads = x.astype(np.float64).reshape(-1, head_dim)
+        emb = np.concatenate([pos * inv_freq, pos * inv_freq])
+        cos, sin = np.cos(emb), np.sin(emb)
+        rotate_half = np.concatenate([-heads[:, head_dim // 2:], heads[:, :head_dim // 2]], axis=-1)
+        return (heads * cos + rotate_half * sin).reshape(-1)
+
+    llama3_cases = [  # (theta, factor, low, high, original_max_position, head_size)
+        (500000.0, 32.0, 1.0, 4.0, 8192, 64),     # Llama 3.2 1B / 3B
+        (500000.0, 8.0, 1.0, 4.0, 8192, 128),     # Llama 3.1 8B
+        (500000.0, 4.0, 1.0, 4.0, 64, 16),        # small: all three regimes in 8 frequencies
+        (10000.0, 2.0, 0.5, 6.0, 100, 32),
+        (100000.0, 16.0, 1.0, 2.0, 37, 8),
+    ]
+    for theta, factor, low, high, original, hs in llama3_cases:
+        inv = hf_llama3_inv_freq(hs, theta, factor, low, high, original)
+        plain = 1.0 / (theta ** (np.arange(0, hs, 2, dtype=np.float64) / hs))
+        if not (np.any(inv == plain) or np.any(np.isclose(inv, plain / factor))):
+            failures.append(f"llama3 test case ({theta}, {factor}) exercises neither the unscaled nor the stretched regime")
+        for pos in (0, 1, 5, 63, 100, 2047, 8191, 31999):
+            v = rng.standard_normal(hs * 3).astype(np.float32)
+            args = ["rope", hs * 3, pos, hs, repr(theta), "half_split", repr(factor), repr(low), repr(high), original]
+            record("rope", f"llama3 theta={theta:g} factor={factor:g} orig={original} head={hs} pos={pos}",
+                   err(run(exe, args, v), hf_rope_with(v, pos, hs, inv)))
+            direct = run(exe, args, v)
+            cached = run(exe, ["rope_cached", *args[1:]], v)
+            if direct.tobytes() != cached.tobytes():
+                failures.append(f"rope_cached differs from rope with llama3 scaling (theta={theta:g} head={hs} pos={pos})")
+    v = rng.standard_normal(64).astype(np.float32)   # scaling must change the result (pos 40 is far from the original context)
+    plain = run(exe, ["rope", 64, 40, 64, "500000", "half_split"], v)
+    scaled = run(exe, ["rope", 64, 40, 64, "500000", "half_split", "32", "1", "4", "64"], v)
+    if np.allclose(plain, scaled, atol=1e-4):
+        failures.append("llama3 scaling did not change the rotation")
+    for bad in (["0.5", "1", "4", "64"], ["8", "4", "4", "64"], ["8", "1", "4", "0"], ["8", "0", "4", "64"]):
+        p = subprocess.run([exe, "rope", "8", "1", "8", "10000", "half_split", *bad], input=v[:8].tobytes(), capture_output=True)
+        if p.returncode == 0:
+            failures.append(f"invalid llama3 scaling {bad} was accepted by gi_kernel_check")
 
     v = rng.standard_normal(48).astype(np.float32)  # the two styles must really differ
     a = run(exe, ["rope", 48, 7, 48, "10000", "interleaved"], v)

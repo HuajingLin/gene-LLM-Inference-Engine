@@ -133,6 +133,10 @@ int main(int argc, char** argv) {
             tok_ptr = load_llama2c_tokenizer(tokenizer_path, ck.config().vocab_size);
         }
         const TextTokenizer& tok = *tok_ptr;
+        if (tok.bos_by_default_not_added() && !quiet) {
+            std::fprintf(stderr, "note: this tokenizer puts the BOS token in front of prompts by default (Hugging Face does); "
+                                 "add --bos to do the same\n");
+        }
         if (tok.vocab_size() > ck.config().vocab_size) {
             throw std::runtime_error("the tokenizer has " + std::to_string(tok.vocab_size()) +
                                      " tokens but the model only " + std::to_string(ck.config().vocab_size) +

@@ -186,7 +186,7 @@ void Transformer::ensure_rope(int pos) {
         rope_cos_.resize((sz(rope_rows_) + 1) * half);
         rope_sin_.resize((sz(rope_rows_) + 1) * half);
         kernels::rope_table_row(rope_cos_.data() + sz(rope_rows_) * half, rope_sin_.data() + sz(rope_rows_) * half,
-                                rope_rows_, cfg_.head_size(), cfg_.rope_theta);
+                                rope_rows_, cfg_.head_size(), cfg_.rope_theta, &cfg_.rope_scaling);
         ++rope_rows_;
     }
 }

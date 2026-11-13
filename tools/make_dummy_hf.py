@@ -36,6 +36,10 @@ def make_config(args) -> dict:
         "torch_dtype": {"f32": "float32", "bf16": "bfloat16", "f16": "float16"}[args.dtype],
         "bos_token_id": 0, "eos_token_id": args.eos_id[0] if len(args.eos_id) == 1 else list(args.eos_id),
     }
+    if args.rope_scaling:   # --rope-scaling FACTOR,LOW,HIGH,ORIGINAL -> the llama3 type, as in Llama 3.2's config.json
+        factor, low, high, original = args.rope_scaling
+        cfg["rope_scaling"] = {"factor": factor, "low_freq_factor": low, "high_freq_factor": high,
+                               "original_max_position_embeddings": int(original), "rope_type": "llama3"}
     if args.qwen3:   # same fields as the real Qwen3 config.json that matter here
         cfg.update({"architectures": ["Qwen3ForCausalLM"], "model_type": "qwen3"})
         cfg.pop("mlp_bias", None)
@@ -68,7 +72,7 @@ def main() -> None:
     ap.add_argument("--vocab", type=int, default=100)
     ap.add_argument("--with-tokenizer", type=int, default=0, metavar="MERGES",
                     help="also write a tokenizer with this many merges; the model vocabulary becomes its size (+ --vocab-pad)")
-    ap.add_argument("--tokenizer-variant", choices=["sequence", "bytelevel", "noregex", "qwen2"], default="sequence")
+    ap.add_argument("--tokenizer-variant", choices=["sequence", "bytelevel", "noregex", "qwen2", "llama3"], default="sequence")
     ap.add_argument("--vocab-pad", type=int, default=0, help="extra model vocabulary entries beyond the tokenizer's")
     ap.add_argument("--pad-sinks", action="store_true",
                     help="untied only, needs --vocab-pad >= 2: the last two vocabulary ids get lm_head rows of +5 and -5, "
@@ -78,6 +82,8 @@ def main() -> None:
     ap.add_argument("--header-pad", type=int, default=0,
                     help="extra spaces after the safetensors JSON header: makes all tensor data start at odd addresses")
     ap.add_argument("--max-pos", type=int, default=64)
+    ap.add_argument("--rope-scaling", type=lambda t: [float(x) for x in t.split(",")], default=None,
+                    help="llama3 rope scaling as FACTOR,LOW_FREQ_FACTOR,HIGH_FREQ_FACTOR,ORIGINAL_MAX_POSITION")
     ap.add_argument("--rope-theta", type=float, default=100000.0)
     ap.add_argument("--eps", type=float, default=1e-5)
     ap.add_argument("--seed", type=int, default=0)

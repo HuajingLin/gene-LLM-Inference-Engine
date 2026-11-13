@@ -158,7 +158,45 @@ void gpt2_split(const std::string& s, std::vector<std::string>& out) {
 const char* const kQwen2Pattern =
     "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+";
 
-void qwen2_split(const std::string& s, std::vector<std::string>& out) {
+// The Llama 3 expression is the same except that up to three digits form one piece: \p{N}{1,3} instead of \p{N}.
+const char* const kLlama3Pattern =
+    "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+";
+
+// max_digits is the longest run of digits that forms one piece (1 for Qwen2 / Qwen3, 3 for Llama 3).
+// A post_processor may only be
+//   - ByteLevel (it changes offsets, never the tokens),
+//   - a TemplateProcessing whose single-sequence template is exactly "<special token> $A" (Llama 3: <|begin_of_text|>), or
+//   - a Sequence of those (at most one template).
+// Anything else could add tokens that this tokenizer would then silently leave out. The special token of the template is
+// not added by encode(): like for every model it is requested explicitly with add_bos. Its id goes to `bos_id`.
+void check_post_processor(const JsonValue& p, int& bos_id, int depth) {
+    if (depth > 2 || !p.is_object()) fail("post_processor is too deeply nested or not an object");
+    const std::string type = p.at("type").as_string();
+    if (type == "ByteLevel") return;
+    if (type == "Sequence") {
+        for (const JsonValue& sub : p.at("processors").items()) check_post_processor(sub, bos_id, depth + 1);
+        return;
+    }
+    const std::string unsupported = "post_processor '" + type + "' is not supported (it would add tokens); only ByteLevel and "
+                                    "a TemplateProcessing of the form '<special token> $A' are";
+    if (type != "TemplateProcessing" || bos_id >= 0) fail(unsupported);
+    const JsonValue* single = p.find("single");
+    if (!single || !single->is_array() || single->items().size() != 2) fail(unsupported);
+    const JsonValue* special = single->items()[0].find("SpecialToken");
+    const JsonValue* seq = single->items()[1].find("Sequence");
+    const JsonValue* seq_id = seq ? seq->find("id") : nullptr;
+    const JsonValue* name = special ? special->find("id") : nullptr;
+    if (!name || !name->is_string() || !seq_id || !seq_id->is_string() || seq_id->as_string() != "A") fail(unsupported);
+    const JsonValue* tokens = p.find("special_tokens");
+    const JsonValue* entry = tokens ? tokens->find(name->as_string()) : nullptr;
+    const JsonValue* ids = entry ? entry->find("ids") : nullptr;
+    if (!ids || !ids->is_array() || ids->items().size() != 1 || !ids->items()[0].is_number()) fail(unsupported);
+    const double id = ids->items()[0].as_number();
+    if (!(id >= 0.0) || id > 2e9 || id != static_cast<double>(static_cast<int>(id))) fail(unsupported);
+    bos_id = static_cast<int>(id);
+}
+
+void qwen2_split(const std::string& s, std::vector<std::string>& out, int max_digits) {
     std::vector<char32_t> cp;
     std::vector<std::size_t> off;
     for (std::size_t pos = 0; pos < s.size();) {
@@ -203,8 +241,12 @@ void qwen2_split(const std::string& s, std::vector<std::string>& out) {
             }
         }
 
-        // 3. \p{N}  (one digit at a time)
-        if (end == i && is_n(i)) end = i + 1;
+        // 3. \p{N} or \p{N}{1,3}  (a run of at most max_digits numbers)
+        if (end == i && is_n(i)) {
+            std::size_t k = i + 1;
+            while (k < n && is_n(k) && k - i < static_cast<std::size_t>(max_digits)) ++k;
+            end = k;
+        }
 
         // 4.  ?[^\s\p{L}\p{N}]+[\r\n]*
         if (end == i) {
@@ -259,9 +301,8 @@ HfTokenizer HfTokenizer::load(const std::string& directory) {
         }
     }
     if (const JsonValue* p = root.find("post_processor")) {
-        if (!p->is_null() && p->at("type").as_string() != "ByteLevel") {
-            fail("post_processor '" + p->at("type").as_string() + "' is not supported (it would add tokens)");
-        }
+        if (!p->is_null()) check_post_processor(*p, tk.template_bos_id_, 0);
+        tk.template_adds_bos_ = tk.template_bos_id_ >= 0;
     }
     {
         const JsonValue* d = root.find("decoder");
@@ -284,9 +325,10 @@ HfTokenizer HfTokenizer::load(const std::string& directory) {
             if (type == "Split" && i == 0 && stages.size() == 2) {
                 const JsonValue* pattern = stages[i]->find("pattern");
                 const JsonValue* regex = pattern ? pattern->find("Regex") : nullptr;
-                if (!regex || !regex->is_string() || regex->as_string() != kQwen2Pattern) {
-                    fail("a Split pre_tokenizer is supported only with the Qwen2 regular expression");
+                if (!regex || !regex->is_string() || (regex->as_string() != kQwen2Pattern && regex->as_string() != kLlama3Pattern)) {
+                    fail("a Split pre_tokenizer is supported only with the Qwen2 or the Llama 3 regular expression");
                 }
+                tk.split_max_digits_ = regex->as_string() == kLlama3Pattern ? 3 : 1;
                 const JsonValue* behavior = stages[i]->find("behavior");
                 const JsonValue* invert = stages[i]->find("invert");
                 if (!behavior || !behavior->is_string() || behavior->as_string() != "Isolated" ||
@@ -425,11 +467,16 @@ HfTokenizer HfTokenizer::load(const std::string& directory) {
         if (const JsonValue* b = cfg.find("bos_token_id")) {
             if (b->is_number()) tk.bos_id_ = to_id(*b, "bos_token_id");
         }
+        if (tk.template_bos_id_ >= 0 && tk.bos_id_ >= 0 && tk.bos_id_ != tk.template_bos_id_) {
+            fail("the post_processor adds token " + std::to_string(tk.template_bos_id_) + " but config.json says bos_token_id " +
+                 std::to_string(tk.bos_id_));
+        }
         if (const JsonValue* e = cfg.find("eos_token_id")) {
             if (e->is_number()) tk.eos_ids_.push_back(to_id(*e, "eos_token_id"));
             else if (e->is_array()) for (const JsonValue& x : e->items()) tk.eos_ids_.push_back(to_id(x, "eos_token_id"));
         }
     }
+    if (tk.template_bos_id_ >= 0 && tk.bos_id_ < 0) tk.bos_id_ = tk.template_bos_id_;   // tokenizer-only directory
     // generation_config.json may list more end-of-sequence ids (Qwen3: <|im_end|> and <|endoftext|>); add the new ones
     if (fs::exists(dir / "generation_config.json")) {
         const JsonValue gen = read_json(dir / "generation_config.json");
@@ -462,7 +509,7 @@ std::string HfTokenizer::normalize(const std::string& text) const { return nfc_ 
 std::vector<std::string> HfTokenizer::pre_tokenize(const std::string& text) const {
     std::vector<std::string> stage;
     if (qwen2_split_) {
-        if (!text.empty()) qwen2_split(text, stage);
+        if (!text.empty()) qwen2_split(text, stage, split_max_digits_);
         return stage;
     }
     if (split_digits_) split_digits(text, individual_digits_, stage);
@@ -614,9 +661,10 @@ std::string HfTokenizer::describe() const {
     os << "byte-level BPE: " << id_to_token_.size() << " token ids, " << n_merges_ << " merges, " << added_.size()
        << " added tokens\nnormalizer: " << (nfc_ ? "NFC" : "none")
        << "\npre-tokenizer: " << (split_digits_ ? (individual_digits_ ? "digits (one per digit), " : "digits (grouped), ") : "")
-       << (qwen2_split_ ? "Qwen2 regex" : use_regex_ ? "GPT-2 regex" : "no regex") << "\nbos id: " << bos_id_ << ", eos ids:";
+       << (qwen2_split_ ? (split_max_digits_ == 3 ? "Llama 3 regex" : "Qwen2 regex") : use_regex_ ? "GPT-2 regex" : "no regex") << "\nbos id: " << bos_id_ << ", eos ids:";
     for (const int e : eos_ids_) os << ' ' << e;
     if (eos_ids_.empty()) os << " none";
+    os << "\nbos added by the original tokenizer by default: " << (template_adds_bos_ ? "yes" : "no");
     return os.str();
 }
 

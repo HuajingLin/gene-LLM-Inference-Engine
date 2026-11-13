@@ -31,6 +31,7 @@ class Config:
     rope_theta: float = 10000.0
     rms_norm_eps: float = 1e-5
     rope_style: str = "interleaved"      # or "half_split" (Hugging Face)
+    rope_scaling: dict | None = None     # config.json "rope_scaling" of type llama3, or None
     qk_norm: bool = False                # per-head RMSNorm of q and k before RoPE (Qwen3)
 
     @property

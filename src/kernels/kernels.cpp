@@ -139,12 +139,23 @@ void add_scalar(float* a, const float* b, int n) {
 
 }  // namespace
 
-void rope_table_row(float* cos_out, float* sin_out, int pos, int head_size, float theta) {
+void rope_table_row(float* cos_out, float* sin_out, int pos, int head_size, float theta, const RopeScaling* scaling) {
     assert(head_size > 0 && head_size % 2 == 0);
     const int half = head_size / 2;
     for (int k = 0; k < half; ++k) {
         // Angles are computed in double precision: for large `pos` a float angle would lose several digits.
-        const double freq = 1.0 / std::pow(static_cast<double>(theta), 2.0 * static_cast<double>(k) / head_size);
+        double freq = 1.0 / std::pow(static_cast<double>(theta), 2.0 * static_cast<double>(k) / head_size);
+        if (scaling && scaling->enabled) {
+            const double original = static_cast<double>(scaling->original_max_position);
+            const double wavelength = 6.283185307179586476925 / freq;
+            if (wavelength > original / scaling->low_freq_factor) {
+                freq /= scaling->factor;                                   // slow rotations: stretched
+            } else if (!(wavelength < original / scaling->high_freq_factor)) {   // in between: blend
+                const double smooth = (original / wavelength - scaling->low_freq_factor) /
+                                      (scaling->high_freq_factor - scaling->low_freq_factor);
+                freq = (1.0 - smooth) * freq / scaling->factor + smooth * freq;
+            }
+        }
         const double angle = static_cast<double>(pos) * freq;
         cos_out[k] = static_cast<float>(std::cos(angle));
         sin_out[k] = static_cast<float>(std::sin(angle));
@@ -168,12 +179,12 @@ void rope_apply(float* v, int n, const float* cos_row, const float* sin_row, int
     }
 }
 
-void rope(float* v, int n, int pos, int head_size, float theta, RopeStyle style) {
+void rope(float* v, int n, int pos, int head_size, float theta, RopeStyle style, const RopeScaling* scaling) {
     assert(head_size > 0 && head_size % 2 == 0 && n % head_size == 0);
     constexpr int kMaxHalf = 1024;                     // head_size up to 2048
     assert(head_size / 2 <= kMaxHalf);
     float c[kMaxHalf], s[kMaxHalf];
-    rope_table_row(c, s, pos, head_size, theta);
+    rope_table_row(c, s, pos, head_size, theta, scaling);
     rope_apply(v, n, c, s, head_size, style);
 }
 

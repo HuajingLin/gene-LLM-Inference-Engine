@@ -16,7 +16,7 @@
 //     stdout: the whole output buffer of the matmul (ntok rows of rows + pad_out floats, padding untouched = -777), then the
 //     results of the matvec kernel for every token, [ntok, rows]. They must be bit-identical.
 //   gi_kernel_check isa                            -> text: "active=<isa> supported=<list>"
-//   gi_kernel_check rope    <n> <pos> <head_size> [theta] [interleaved|half_split]
+//   gi_kernel_check rope    <n> <pos> <head_size> [theta] [interleaved|half_split [factor low_freq_factor high_freq_factor original_max_position]]
 //   gi_kernel_check rope_cached ...             same arguments; rotates through a precomputed cos/sin row
 //                                                  stdin: v[n]                        -> out[n]
 //
@@ -128,7 +128,7 @@ int usage() {
                  "usage: gi_kernel_check <op> <args...>\n"
                  "  matvec <rows> <cols> | rmsnorm <n> | softmax <n> | silu <n>\n"
                  "  dot <n> | axpy <n> <alpha> | mul <n> | add <n> |\n"
-                 "  rope <n> <pos> <head_size> [theta] [interleaved|half_split]\n");
+                 "  rope <n> <pos> <head_size> [theta] [interleaved|half_split [factor low high original_max_position]]\n");
     return 2;
 }
 
@@ -287,7 +287,7 @@ int main(int argc, char** argv) {
             else k::add(a.data(), b.data(), n);
             check_guards(a, "mul/add");
             write_floats(a.values());
-        } else if ((op == "rope" || op == "rope_cached") && argc >= 5 && argc <= 7) {
+        } else if ((op == "rope" || op == "rope_cached") && argc >= 5 && (argc <= 7 || argc == 11)) {
             const int n = arg_int(argv, 2, "n"), pos = arg_int(argv, 3, "pos");
             const int head_size = arg_int(argv, 4, "head_size");
             float theta = 10000.0f;
@@ -297,7 +297,17 @@ int main(int argc, char** argv) {
                 theta = std::strtof(argv[5], &end);
                 if (end == argv[5] || *end != '\0' || !(theta > 1.0f)) throw std::runtime_error("invalid theta");
             }
-            if (argc == 7) {
+            geneinfer::RopeScaling scaling;
+            if (argc == 11) {   // llama3 scaling: factor low_freq_factor high_freq_factor original_max_position
+                scaling.enabled = true;
+                scaling.factor = std::strtod(argv[7], nullptr);
+                scaling.low_freq_factor = std::strtod(argv[8], nullptr);
+                scaling.high_freq_factor = std::strtod(argv[9], nullptr);
+                scaling.original_max_position = arg_int(argv, 10, "original_max_position");
+                if (!(scaling.factor >= 1.0) || !(scaling.low_freq_factor > 0.0) || !(scaling.high_freq_factor > scaling.low_freq_factor) ||
+                    scaling.original_max_position <= 0) throw std::runtime_error("invalid llama3 scaling");
+            }
+            if (argc >= 7) {
                 const std::string s = argv[6];
                 if (s == "half_split") style = geneinfer::RopeStyle::HalfSplit;
                 else if (s != "interleaved") throw std::runtime_error("style must be interleaved or half_split");
@@ -307,10 +317,10 @@ int main(int argc, char** argv) {
             }
             auto v = read_floats(static_cast<std::size_t>(n));
             if (op == "rope") {
-                k::rope(v.data(), n, pos, head_size, theta, style);
+                k::rope(v.data(), n, pos, head_size, theta, style, &scaling);
             } else {   // the same rotation through a precomputed cos/sin row
                 std::vector<float> c(static_cast<std::size_t>(head_size / 2)), s(c.size());
-                k::rope_table_row(c.data(), s.data(), pos, head_size, theta);
+                k::rope_table_row(c.data(), s.data(), pos, head_size, theta, &scaling);
                 k::rope_apply(v.data(), n, c.data(), s.data(), head_size, style);
             }
             write_floats(v);

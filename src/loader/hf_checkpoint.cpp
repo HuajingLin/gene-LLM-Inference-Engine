@@ -52,6 +52,43 @@ std::string shape_string(const std::vector<std::int64_t>& shape) {
     return s + "]";
 }
 
+// rope_scaling: null / absent / type "default" mean none; type "llama3" (Llama 3.1 / 3.2) is implemented;
+// every other type (linear, dynamic, yarn, longrope, ...) is refused instead of silently running with wrong positions.
+RopeScaling parse_rope_scaling(const JsonValue& s) {
+    RopeScaling r;
+    if (s.is_null()) return r;
+    if (!s.is_object()) fail("rope_scaling is not an object");
+    std::string type;
+    for (const char* key : {"rope_type", "type"}) {
+        if (const JsonValue* t = s.find(key)) {
+            if (!t->is_string()) fail(std::string("rope_scaling.") + key + " is not a string");
+            type = t->as_string();
+            break;
+        }
+    }
+    if (type == "default") return r;
+    if (type != "llama3") fail("rope_scaling type '" + type + "' is not supported (only 'llama3')");
+    auto number = [&](const char* key) {
+        const JsonValue* v = s.find(key);
+        if (!v || !v->is_number()) fail(std::string("rope_scaling.") + key + " is required for type 'llama3'");
+        return v->as_number();
+    };
+    r.enabled = true;
+    r.factor = number("factor");
+    r.low_freq_factor = number("low_freq_factor");
+    r.high_freq_factor = number("high_freq_factor");
+    const double original = number("original_max_position_embeddings");
+    if (!(r.factor >= 1.0)) fail("rope_scaling.factor must be >= 1");
+    if (!(r.low_freq_factor > 0.0) || !(r.high_freq_factor > r.low_freq_factor)) {
+        fail("rope_scaling needs 0 < low_freq_factor < high_freq_factor");
+    }
+    if (!(original >= 1.0) || original > 1e9 || original != static_cast<double>(static_cast<int>(original))) {
+        fail("rope_scaling.original_max_position_embeddings must be a positive integer");
+    }
+    r.original_max_position = static_cast<int>(original);
+    return r;
+}
+
 // Translates config.json into a Config, refusing anything this engine cannot run correctly.
 Config parse_config(const JsonValue& j) {
     if (!j.is_object()) fail("config.json is not a JSON object");
@@ -60,9 +97,6 @@ Config parse_config(const JsonValue& j) {
         if (t->is_string() && t->as_string() != "llama" && t->as_string() != "qwen3") {
             fail("unsupported model_type '" + t->as_string() + "' (only 'llama' and 'qwen3' are implemented)");
         }
-    }
-    if (const JsonValue* s = j.find("rope_scaling")) {
-        if (!s->is_null()) fail("rope_scaling is not supported yet");
     }
     if (const JsonValue* a = j.find("hidden_act")) {
         if (a->is_string() && a->as_string() != "silu") fail("unsupported hidden_act '" + a->as_string() + "'");
@@ -93,6 +127,8 @@ Config parse_config(const JsonValue& j) {
     c.rope_theta = static_cast<float>(optional_number(j, "rope_theta", 10000.0));
     c.rms_norm_eps = static_cast<float>(optional_number(j, "rms_norm_eps", 1e-6));
     c.rope_style = RopeStyle::HalfSplit;  // Hugging Face Llama always rotates (i, i + head_dim/2)
+
+    if (const JsonValue* s = j.find("rope_scaling")) c.rope_scaling = parse_rope_scaling(*s);
 
     const JsonValue* tie = j.find("tie_word_embeddings");
     c.shared_classifier = tie && tie->is_bool() && tie->as_bool();

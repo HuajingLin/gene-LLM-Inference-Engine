@@ -34,6 +34,9 @@ public:
     int vocab_size() const { return static_cast<int>(id_to_token_.size()); }   // largest id + 1
     int token_to_id(const std::string& token) const;                           // -1 if unknown
     bool is_special(int id) const;                                             // added token marked "special"
+    // True when tokenizer.json's post_processor prepends the BOS token (Hugging Face then adds it by default, as for
+    // Llama 3); encode() does so only on request (add_bos).
+    bool template_adds_bos() const { return template_adds_bos_; }
     int bos_id() const { return bos_id_; }                                     // -1 if the model has none
     const std::vector<int>& eos_ids() const { return eos_ids_; }               // end-of-sequence token ids
 
@@ -84,9 +87,12 @@ private:
     bool split_digits_ = false;
     bool individual_digits_ = false;
     bool use_regex_ = true;
-    bool qwen2_split_ = false;      // the Split pre-tokenizer with the Qwen2 regular expression
+    bool qwen2_split_ = false;      // the Split pre-tokenizer with the Qwen2 or the Llama 3 regular expression
+    int split_max_digits_ = 1;      // longest run of digits that forms one piece: 1 (Qwen2) or 3 (Llama 3)
     bool nfc_ = false;              // normalizer: NFC
     int bos_id_ = -1;
+    bool template_adds_bos_ = false;
+    int template_bos_id_ = -1;
     std::vector<int> eos_ids_;
     std::size_t n_merges_ = 0;
 };

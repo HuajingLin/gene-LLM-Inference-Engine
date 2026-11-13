@@ -78,8 +78,14 @@ QWEN2_PATTERN = (r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| 
                  r"|\s*[\r\n]+|\s+(?!\S)|\s+")
 
 
-@lru_cache(maxsize=1)
-def _qwen2_pattern() -> re.Pattern:
+# The Llama 3 pattern: the same as Qwen2's except that a run of up to three digits is one piece.
+LLAMA3_PATTERN = (r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*"
+                  r"|\s*[\r\n]+|\s+(?!\S)|\s+")
+SPLIT_PATTERNS = {QWEN2_PATTERN: 1, LLAMA3_PATTERN: 3}   # pattern string -> longest digit run in one piece
+
+
+@lru_cache(maxsize=2)
+def _split_pattern(max_digits: int) -> re.Pattern:
     """QWEN2_PATTERN with \\p{L}, \\p{N} and \\s written out as explicit character classes, for Python's regex engine
     (backtracking, leftmost alternative first, like the Oniguruma engine of the Hugging Face library)."""
     def cat(prefix):
@@ -90,7 +96,7 @@ def _qwen2_pattern() -> re.Pattern:
     return re.compile(
         rf"(?i:'s|'t|'re|'ve|'m|'ll|'d)"
         rf"|[^\r\n{letters}{numbers}]?[{letters}]+"
-        rf"|[{numbers}]"
+        rf"|[{numbers}]{{1,{max_digits}}}"
         rf"| ?[^{space}{letters}{numbers}]+[\r\n]*"
         rf"|[{space}]*[\r\n]+"
         rf"|[{space}]+(?![^{space}])"
@@ -98,10 +104,18 @@ def _qwen2_pattern() -> re.Pattern:
     )
 
 
-def qwen2_pieces(text: str) -> list[str]:
-    pieces = _qwen2_pattern().findall(text)
-    assert "".join(pieces) == text, "the Qwen2 pattern must cover the whole text"
+def split_pieces(text: str, max_digits: int) -> list[str]:
+    pieces = _split_pattern(max_digits).findall(text)
+    assert "".join(pieces) == text, "the split pattern must cover the whole text"
     return pieces
+
+
+def qwen2_pieces(text: str) -> list[str]:
+    return split_pieces(text, 1)
+
+
+def llama3_pieces(text: str) -> list[str]:
+    return split_pieces(text, 3)
 
 
 def split_digits(text: str, individual: bool) -> list[str]:
@@ -156,13 +170,13 @@ class RefTokenizer:
         stages = pre["pretokenizers"] if pre["type"] == "Sequence" else [pre]
         self.split_digits, self.individual = False, False
         self.use_regex = True
-        self.qwen2 = False
+        self.split_max_digits = 0      # 0: no Split stage; else the longest digit run of one piece (1 Qwen2, 3 Llama 3)
         norm = tj.get("normalizer")
         self.nfc = bool(norm) and norm["type"] == "NFC"
         for st in stages:
             if st["type"] == "Split":
-                assert st["pattern"]["Regex"] == QWEN2_PATTERN and st["behavior"] == "Isolated"
-                self.qwen2 = True
+                assert st["pattern"]["Regex"] in SPLIT_PATTERNS and st["behavior"] == "Isolated"
+                self.split_max_digits = SPLIT_PATTERNS[st["pattern"]["Regex"]]
             elif st["type"] == "Digits":
                 self.split_digits, self.individual = True, bool(st.get("individual_digits"))
             elif st["type"] == "ByteLevel":
@@ -181,8 +195,8 @@ class RefTokenizer:
         """Pieces of the NORMALIZED text (what the encoder sees)."""
         if self.nfc:
             text = unicodedata.normalize("NFC", text)
-        if self.qwen2:
-            return qwen2_pieces(text) if text else []
+        if self.split_max_digits:
+            return split_pieces(text, self.split_max_digits) if text else []
         stage = split_digits(text, self.individual) if self.split_digits else ([text] if text else [])
         if not self.use_regex:
             return stage

@@ -61,6 +61,8 @@ SUITE = {
     "bf16 untied, dim 36 / hidden 70 (SIMD loop tails)": ["--dtype", "bf16", "--untied", "--dim", "36", "--heads", "4", "--kv-heads", "2", "--head-dim", "10", "--hidden", "70"],
     "bf16, 8/2 heads, dim 64": ["--dtype", "bf16", "--dim", "64", "--heads", "8", "--kv-heads", "2", "--hidden", "176"],
     "extra tensors in the file": ["--extras", "--untied"],
+    "llama3 rope scaling: all three regimes (head_dim 16, theta 5e5)": ["--dim", "64", "--heads", "4", "--kv-heads", "2", "--head-dim", "16", "--rope-theta", "500000", "--rope-scaling", "4,1,4,64", "--max-pos", "120"],
+    "llama3 rope scaling, bf16 untied, head_dim 32": ["--dtype", "bf16", "--untied", "--dim", "64", "--heads", "2", "--kv-heads", "1", "--head-dim", "32", "--rope-theta", "500000", "--rope-scaling", "8,1,4,24", "--max-pos", "120"],
     "qwen3: QK-norm, 4/2 heads": ["--qwen3"],
     "qwen3: bf16, head_dim 16 > dim/heads, theta 1e6": ["--qwen3", "--dtype", "bf16", "--dim", "48", "--heads", "4", "--kv-heads", "2", "--head-dim", "16", "--hidden", "96", "--rope-theta", "1000000", "--eps", "1e-6"],
     "qwen3: untied f16, odd head_dim 10, 6/3 heads": ["--qwen3", "--dtype", "f16", "--untied", "--dim", "36", "--heads", "6", "--kv-heads", "3", "--head-dim", "10", "--hidden", "70"],

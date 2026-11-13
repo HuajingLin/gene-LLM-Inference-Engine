@@ -165,6 +165,10 @@ def main() -> int:
                                                                           "--dtype", "bf16", "--dim", 48, "--heads", 4, "--kv-heads", 2,
                                                                           "--head-dim", 16, "--rope-theta", 1000000, "--eps", "1e-6",
                                                                           "--eos-id", "1,2", "--seed", 4, "--max-pos", 96],
+            "llama3: Llama 3 split tokenizer (3-digit runs), rope scaling, bf16 tied": ["--with-tokenizer", 220, "--tokenizer-variant", "llama3",
+                                                                                         "--dtype", "bf16", "--dim", 64, "--heads", 4, "--kv-heads", 2,
+                                                                                         "--head-dim", 16, "--rope-theta", 500000, "--rope-scaling", "8,1,4,32",
+                                                                                         "--eos-id", "1,2", "--seed", 5, "--max-pos", 96],
             "padded vocabulary, ids unknown to the tokenizer": ["--with-tokenizer", 100, "--untied", "--vocab-pad", 4,
                                                                 "--pad-sinks", "--seed", 3, "--eos-id", 1, "--max-pos", 96],
         }

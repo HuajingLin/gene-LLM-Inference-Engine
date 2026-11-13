@@ -33,19 +33,32 @@ def softmax(x: np.ndarray) -> np.ndarray:
     return e / e.sum()
 
 
-def rope_freqs(head_size: int, theta: float = 10000.0) -> np.ndarray:
-    """Rotation frequency of each 2-D vector k of a head: 1 / theta^(2k/head_size)."""
-    return 1.0 / (float(theta) ** (np.arange(0, head_size, 2, dtype=np.float64) / head_size))
+def rope_freqs(head_size: int, theta: float = 10000.0, scaling: dict | None = None) -> np.ndarray:
+    """Rotation frequency of each 2-D vector k of a head: 1 / theta^(2k/head_size).
+
+    `scaling` is the "llama3" rope_scaling dict of config.json (factor, low_freq_factor, high_freq_factor,
+    original_max_position_embeddings), applied the way Hugging Face's _compute_llama3_parameters does."""
+    freqs = 1.0 / (float(theta) ** (np.arange(0, head_size, 2, dtype=np.float64) / head_size))
+    if not scaling:
+        return freqs
+    factor, low, high = float(scaling["factor"]), float(scaling["low_freq_factor"]), float(scaling["high_freq_factor"])
+    original = float(scaling["original_max_position_embeddings"])
+    wavelen = 2 * np.pi / freqs
+    scaled = np.where(wavelen > original / low, freqs / factor, freqs)
+    smooth = (original / wavelen - low) / (high - low)
+    smoothed = (1 - smooth) * scaled / factor + smooth * scaled
+    medium = ~(wavelen < original / high) & ~(wavelen > original / low)
+    return np.where(medium, smoothed, scaled)
 
 
 def apply_rope(v: np.ndarray, pos: int, head_size: int, theta: float = 10000.0,
-               style: str = "interleaved") -> np.ndarray:
+               style: str = "interleaved", scaling: dict | None = None) -> np.ndarray:
     """Rotary position embedding of every head of `v`; the frequencies restart in every head.
 
     style "interleaved" (llama2.c):   vector k = (x[2k], x[2k+1])
     style "half_split" (Hugging Face): vector k = (x[k], x[k + head_size/2])   ("rotate_half")
     """
-    angle = pos * rope_freqs(head_size, theta)
+    angle = pos * rope_freqs(head_size, theta, scaling)
     cos, sin = np.cos(angle).astype(np.float32), np.sin(angle).astype(np.float32)
     heads = np.asarray(v, dtype=np.float32).reshape(-1, head_size)
     out = np.empty_like(heads)
@@ -103,8 +116,8 @@ class Model:
             if c.qk_norm:   # Qwen3: RMSNorm over every head of q and k, before RoPE
                 q = np.concatenate([rmsnorm(q[h * hs:(h + 1) * hs], w["q_norm"][l], eps) for h in range(c.n_heads)])
                 k = np.concatenate([rmsnorm(k[h * hs:(h + 1) * hs], w["k_norm"][l], eps) for h in range(c.n_kv_heads)])
-            q = apply_rope(q, pos, hs, theta, style)
-            k = apply_rope(k, pos, hs, theta, style)
+            q = apply_rope(q, pos, hs, theta, style, c.rope_scaling)
+            k = apply_rope(k, pos, hs, theta, style, c.rope_scaling)
 
             self.key_cache[l, pos] = k
             self.value_cache[l, pos] = v

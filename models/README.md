@@ -12,3 +12,6 @@ hf download HuggingFaceTB/SmolLM2-135M --local-dir models/SmolLM2-135M
 
 # Qwen3-06.B
 hf download Qwen/Qwen3-0.6B --local-dir models/Qwen3-0.6B
+
+# Llama-3.2-1B
+hf download meta-llama/Llama-3.2-1B --local-dir models/Llama-3.2-1B

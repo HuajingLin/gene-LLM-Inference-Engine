@@ -184,6 +184,43 @@ def check_errors_and_options(exe: str, good: Path, tmp: Path, failures: list[str
         pre_tokenizer={"type": "Sequence", "pretokenizers": [dict(qwen_split, pattern={"Regex": QWEN2_PATTERN}, behavior="Removed"), byte_level]})), "Isolated")
     expect_failure("Split followed by the GPT-2 regex", variant("split3", lambda t: t.update(
         pre_tokenizer={"type": "Sequence", "pretokenizers": [dict(qwen_split, pattern={"Regex": QWEN2_PATTERN}), dict(byte_level, use_regex=True)]})), "use_regex")
+    # The Llama 3 post_processor (Sequence[ByteLevel, TemplateProcessing "<bos> $A"]) is accepted; variations of it are not.
+    llama = tmp / "llama3_dir"
+    subprocess.run([sys.executable, MAKE_TOKENIZER, "--out", str(llama), "--variant", "llama3", "--ignore-merges"], check=True, capture_output=True)
+
+    def llama_variant(name, mutate, config=None):
+        d = tmp / f"case_{name}"
+        shutil.copytree(llama, d)
+        tj = json.loads((d / "tokenizer.json").read_text(encoding="utf-8"))
+        mutate(tj)
+        (d / "tokenizer.json").write_text(json.dumps(tj, ensure_ascii=False), encoding="utf-8")
+        if config is not None:
+            (d / "config.json").write_text(json.dumps(config), encoding="utf-8")
+        return d
+
+    template_of = lambda t: t["post_processor"]["processors"][1]
+    info = run(exe, llama, "info").stdout.decode()
+    if "bos id: 0" not in info:
+        failures.append(f"the BOS id of the post_processor template was not taken without a config.json: {info!r}")
+    if "default: yes" not in info or "default: no" not in run(exe, good, "info").stdout.decode():
+        failures.append("info does not report whether the original tokenizer adds BOS by default")
+    plain = batch(exe, llama, "encode-batch", ["ab 123456"])[0]
+    with_bos = batch(exe, llama, "encode-batch", ["ab 123456"], "--bos")[0]
+    if with_bos != [0] + plain:
+        failures.append("--bos with the Llama 3 post_processor did not prepend the template's token")
+    expect_failure("template: extra token", llama_variant("t1", lambda t: template_of(t)["single"].append(template_of(t)["single"][0])), "post_processor")
+    expect_failure("template: no token", llama_variant("t2", lambda t: template_of(t).update(single=[template_of(t)["single"][1]])), "post_processor")
+    expect_failure("template: wrong sequence", llama_variant("t3", lambda t: template_of(t)["single"][1]["Sequence"].update(id="B")), "post_processor")
+    expect_failure("template: no special_tokens", llama_variant("t4", lambda t: template_of(t).update(special_tokens={})), "post_processor")
+    expect_failure("template: two ids", llama_variant("t9", lambda t: template_of(t)["special_tokens"][next(iter(template_of(t)["special_tokens"]))].update(ids=[0, 1])), "post_processor")
+    nest = lambda inner: {"type": "Sequence", "processors": [inner]}
+    expect_failure("post_processor nested too deeply", llama_variant("t10", lambda t: t.update(post_processor=nest(nest(nest(nest(
+        {"type": "ByteLevel", "add_prefix_space": True, "trim_offsets": False, "use_regex": True})))))), "post_processor")
+    expect_failure("template: two templates", llama_variant("t5", lambda t: t["post_processor"]["processors"].append(template_of(t))), "post_processor")
+    expect_failure("template: other processor", llama_variant("t6", lambda t: t["post_processor"]["processors"].append({"type": "RobertaProcessing"})), "post_processor")
+    expect_failure("template disagrees with config.json", llama_variant("t7", lambda t: None, {"bos_token_id": 1}), "bos_token_id")
+    if run(exe, llama_variant("t8", lambda t: None, {"bos_token_id": 0}), "info").returncode != 0:
+        failures.append("a config.json that agrees with the template was rejected")
     expect_failure("post-processor", variant("post", lambda t: t.update(post_processor={"type": "TemplateProcessing"})), "post_processor")
     expect_failure("decoder", variant("dec", lambda t: t.update(decoder={"type": "Metaspace"})), "decoder")
     expect_failure("pre-tokenizer Split", variant("pre", lambda t: t.update(pre_tokenizer={"type": "Split"})), "pre_tokenizer")
@@ -265,7 +302,7 @@ def main() -> int:
     with tempfile.TemporaryDirectory() as tmp_s:
         tmp = Path(tmp_s)
         for name, flags in (("sequence", ["--variant", "sequence"]), ("bytelevel", ["--variant", "bytelevel"]),
-                            ("noregex", ["--variant", "noregex"]), ("qwen2", ["--variant", "qwen2"]),
+                            ("noregex", ["--variant", "noregex"]), ("qwen2", ["--variant", "qwen2"]), ("llama3", ["--variant", "llama3", "--ignore-merges"]),
                             ("sequence+ignore_merges", ["--variant", "sequence", "--ignore-merges"])):
             d = tmp / f"tok_{name.replace('+', '_')}"
             subprocess.run([sys.executable, MAKE_TOKENIZER, "--out", str(d), "--merges", "300", *flags],

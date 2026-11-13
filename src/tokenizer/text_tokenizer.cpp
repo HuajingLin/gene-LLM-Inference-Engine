@@ -32,6 +32,7 @@ public:
 
     std::string kind() const override { return "huggingface"; }
     int vocab_size() const override { return tok_.vocab_size(); }
+    bool bos_by_default_not_added() const override { return tok_.template_adds_bos() && !add_bos_; }
     std::vector<int> encode_prompt(const std::string& text) const override {
         std::vector<int> ids = tok_.encode(text, add_bos_);
         if (ids.empty()) {  // the model cannot run on nothing: start from BOS

@@ -87,6 +87,7 @@ struct Config {
     float rope_theta = 10000.0f;                   // RoPE base frequency
     float rms_norm_eps = 1e-5f;                    // RMSNorm epsilon
     RopeStyle rope_style = RopeStyle::Interleaved;
+    RopeScaling rope_scaling;                      // rope_scaling of type "llama3" (Llama 3.1 / 3.2); disabled by default
     bool qk_norm = false;                          // RMSNorm on every q and k head before RoPE (Qwen3)
 
     int head_size() const { return head_dim; }

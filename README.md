@@ -1,5 +1,7 @@
 # Gene LLM Engine
-Lightweight LLM Inference Engine
+GeneInfer is a from-scratch C++17 LLM inference engine for the CPU. It runs Qwen3-0.6B and Llama-3.2-1B with a paged KV cache, continuous batching and prefix caching, and its Llama-3.2-1B output matches Hugging Face token for token.
+
+All numbers come from one laptop (i7-1185G7, 16 GB, about 18.5 GB/s DRAM bandwidth), 4 threads. 
 
 ```diff
 # Models used
@@ -90,8 +92,10 @@ the 1-request run takes 0.83 s against 1.81 s without, and the 4-request run tak
 			Multi-token	Per-token
 Prefill, run 1		158.8 tok/s	110.4 tok/s
 Prefill, run 2		155.0 tok/s	111.1 tok/s
-Decode         	     28.2 tok/s	28.2 tok/s
+Decode         	          28.2 tok/s	     28.2 tok/s
 ```
+### Stage 4.5 Llama-3.2-1B support
+PASS  (433 texts: ids, pieces, round trip and decoding match the reference, 433/433 identical to Hugging Face)
 
 ## Project Structure
 ```

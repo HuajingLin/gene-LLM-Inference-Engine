@@ -91,12 +91,14 @@ void add(float* a, const float* b, int n);
 // `n` is the full vector length (attn_dim for q, kv_dim for k) and must be a multiple of
 // head_size; head_size must be even.
 void rope(float* v, int n, int pos, int head_size, float theta = 10000.0f,
-          RopeStyle style = RopeStyle::Interleaved);
+          RopeStyle style = RopeStyle::Interleaved, const RopeScaling* scaling = nullptr);
 
 // rope() in two steps, so that the trigonometry can be done once per position instead of once per head, layer
 // and call. rope_table_row() computes cos and sin of the head_size/2 rotation angles of position `pos`;
 // rope_apply() rotates v with them. rope_apply(rope_table_row(pos)) gives exactly the bits of rope(pos).
-void rope_table_row(float* cos_out, float* sin_out, int pos, int head_size, float theta = 10000.0f);
+// `scaling` (optional, null = none) applies the llama3 frequency scaling; without it the frequencies are 1 / theta^(2k/head_size).
+void rope_table_row(float* cos_out, float* sin_out, int pos, int head_size, float theta = 10000.0f,
+                    const RopeScaling* scaling = nullptr);
 void rope_apply(float* v, int n, const float* cos_row, const float* sin_row, int head_size,
                 RopeStyle style = RopeStyle::Interleaved);
 

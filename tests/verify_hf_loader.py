@@ -52,6 +52,8 @@ VARIANTS = {
     "qwen3 (q_norm / k_norm), f32": ["--qwen3"],
     "qwen3 bf16 untied, head_dim 16 > dim / heads": ["--qwen3", "--dtype", "bf16", "--untied", "--dim", "48", "--heads", "4", "--kv-heads", "2", "--head-dim", "16", "--hidden", "96"],
     "qwen3 with odd-address bf16 and extra tensors": ["--qwen3", "--dtype", "bf16", "--header-pad", "1", "--extras"],
+    "llama3 rope scaling (Llama 3.2 values)": ["--rope-theta", "500000", "--rope-scaling", "32,1,4,8192"],
+    "llama3 rope scaling, small original context, bf16": ["--dtype", "bf16", "--rope-theta", "500000", "--rope-scaling", "4,1,4,64"],
 }
 
 
@@ -96,6 +98,14 @@ def check_model(exe: str, directory: Path, f32_weights: bool = False) -> list[st
     for key in ("rope_theta", "rms_norm_eps"):
         if np.float32(float(cfg_out[key])) != want[key]:
             errors.append(f"config.{key}: C++ {cfg_out[key]}, expected {want[key]}")
+    sc = want["rope_scaling"]
+    if cfg_out.get("rope_scaling") != ("llama3" if sc else "none"):
+        errors.append(f"config.rope_scaling: C++ {cfg_out.get('rope_scaling')}, expected {'llama3' if sc else 'none'}")
+    elif sc:
+        for key, name in (("factor", "factor"), ("low_freq_factor", "low_freq_factor"), ("high_freq_factor", "high_freq_factor"),
+                          ("original_max_position_embeddings", "original_max_position")):
+            if float(cfg_out[f"rope_scaling_{name}"]) != float(sc[key]):
+                errors.append(f"config.rope_scaling {key}: C++ {cfg_out[f'rope_scaling_{name}']}, expected {sc[key]}")
     if cfg_out.get("shared_classifier") != str(int(want["shared_classifier"])):
         errors.append(f"config.shared_classifier: C++ {cfg_out.get('shared_classifier')}")
     if cfg_out.get("wcls_is_embedding") != str(int(want["shared_classifier"])):
@@ -198,7 +208,16 @@ def corrupt_cases(good: Path, tmp: Path):
     d = fresh("not_object"); (d / "config.json").write_text("[1,2]"); yield "config.json is not an object", d, "object"
     d = fresh("qwen"); edit_config(d, model_type="mistral"); yield "unsupported model_type", d, "model_type"
     d = fresh("qk"); edit_config(d, model_type="qwen3"); yield "qwen3 config without q_norm tensors", d, "q_norm"
-    d = fresh("scaling"); edit_config(d, rope_scaling={"type": "llama3"}); yield "rope_scaling", d, "rope_scaling"
+    good_scaling = {"rope_type": "llama3", "factor": 8.0, "low_freq_factor": 1.0, "high_freq_factor": 4.0,
+                    "original_max_position_embeddings": 64}
+    d = fresh("scaling"); edit_config(d, rope_scaling={"type": "llama3"}); yield "llama3 rope_scaling without its numbers", d, "rope_scaling.factor"
+    d = fresh("scal_yarn"); edit_config(d, rope_scaling=dict(good_scaling, rope_type="yarn")); yield "rope_scaling yarn", d, "'yarn'"
+    d = fresh("scal_lin"); edit_config(d, rope_scaling={"type": "linear", "factor": 2.0}); yield "rope_scaling linear", d, "'linear'"
+    d = fresh("scal_notype"); edit_config(d, rope_scaling={"factor": 2.0}); yield "rope_scaling without a type", d, "rope_scaling type"
+    d = fresh("scal_obj"); edit_config(d, rope_scaling=[1]); yield "rope_scaling is not an object", d, "rope_scaling is not an object"
+    d = fresh("scal_f"); edit_config(d, rope_scaling=dict(good_scaling, factor=0.5)); yield "rope_scaling factor < 1", d, "factor must be >= 1"
+    d = fresh("scal_lh"); edit_config(d, rope_scaling=dict(good_scaling, low_freq_factor=4.0)); yield "rope_scaling low >= high", d, "low_freq_factor < high_freq_factor"
+    d = fresh("scal_o"); edit_config(d, rope_scaling=dict(good_scaling, original_max_position_embeddings=12.5)); yield "rope_scaling original context not an integer", d, "original_max_position_embeddings"
     d = fresh("act"); edit_config(d, hidden_act="gelu"); yield "unsupported activation", d, "hidden_act"
     d = fresh("bias"); edit_config(d, attention_bias=True); yield "attention bias", d, "attention_bias"
     d = fresh("nolayers"); cfg = json.loads((d / "config.json").read_text()); del cfg["num_hidden_layers"]

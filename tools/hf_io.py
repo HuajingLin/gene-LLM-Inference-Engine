@@ -91,6 +91,17 @@ def read_hf_config(directory: str | Path) -> dict:
     return json.loads((Path(directory) / "config.json").read_text(encoding="utf-8"))
 
 
+def llama3_scaling(scaling):
+    """The rope_scaling dict when it is of type llama3, else None (the Python reference supports nothing else)."""
+    if not scaling:
+        return None
+    kind = scaling.get("rope_type", scaling.get("type"))
+    if kind in (None, "default"):
+        return None
+    assert kind == "llama3", f"rope_scaling type {kind!r} is not implemented in the reference"
+    return {k: scaling[k] for k in ("factor", "low_freq_factor", "high_freq_factor", "original_max_position_embeddings")}
+
+
 def derived_config(cfg: dict) -> dict:
     """What the C++ loader is expected to derive from config.json (defaults included)."""
     dim, heads = cfg["hidden_size"], cfg["num_attention_heads"]
@@ -105,6 +116,7 @@ def derived_config(cfg: dict) -> dict:
         "rms_norm_eps": np.float32(cfg.get("rms_norm_eps", 1e-6)),
         "rope_style": "half_split", "shared_classifier": bool(cfg.get("tie_word_embeddings", False)),
         "qk_norm": cfg.get("model_type") == "qwen3",
+        "rope_scaling": llama3_scaling(cfg.get("rope_scaling")),
     }
 
 
@@ -149,7 +161,7 @@ def read_hf_model(directory: str | Path):
                     n_kv_heads=d["n_kv_heads"], vocab_size=d["vocab_size"], seq_len=d["seq_len"],
                     shared_classifier=d["shared_classifier"], head_dim=d["head_dim"],
                     rope_theta=float(d["rope_theta"]), rms_norm_eps=float(d["rms_norm_eps"]),
-                    rope_style="half_split", qk_norm=d["qk_norm"])
+                    rope_style="half_split", qk_norm=d["qk_norm"], rope_scaling=d["rope_scaling"])
     st = read_safetensors(directory / "model.safetensors")
     f32 = lambda name: st[name].as_float32()    # noqa: E731
     tensors = {"token_embedding": f32("model.embed_tokens.weight"), "rms_final": f32("model.norm.weight")}

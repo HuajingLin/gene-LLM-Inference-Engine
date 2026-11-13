@@ -20,6 +20,8 @@ public:
 
     virtual std::string kind() const = 0;   // "llama2.c" or "huggingface"
     virtual int vocab_size() const = 0;
+    // True when the original (Hugging Face) tokenizer puts BOS in front of a prompt by default but this object was not asked to.
+    virtual bool bos_by_default_not_added() const { return false; }
 
     // Prompt text -> the token ids the model is fed first.
     // Throws std::runtime_error if a prompt cannot be encoded (e.g. empty prompt and no BOS token).
