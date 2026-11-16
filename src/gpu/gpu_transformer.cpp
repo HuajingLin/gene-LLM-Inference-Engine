@@ -282,15 +282,15 @@ void GpuTransformer::run(const int* tokens, int m, int pos0, bool want_logits) {
         float* v_new = values_l + sz(pos0) * sz(kv_dim);
 
         // ---------------- attention block ----------------
-        dev_->rmsnorm(xb_, x_, lw.rms_att, m, dim, eps);
+        dev_->rmsnorm(xb_, x_, lw.rms_att, m, dim, eps, partial_);
         lap(Norm);
         matmul(q_, attn_dim, lw.wq, xb_, dim, m, attn_dim, dim);
         matmul(k_new, kv_dim, lw.wk, xb_, dim, m, kv_dim, dim);
         matmul(v_new, kv_dim, lw.wv, xb_, dim, m, kv_dim, dim);
         lap(QkvProj, matrix_bytes(lw.wq, attn_dim, dim, m) + 2 * matrix_bytes(lw.wk, kv_dim, dim, m));
         if (cfg_.qk_norm) {   // Qwen3: every q and k head is RMS-normalized before RoPE
-            dev_->rmsnorm(q_, q_, lw.q_norm, m * n_heads, head_size, eps);
-            dev_->rmsnorm(k_new, k_new, lw.k_norm, m * cfg_.n_kv_heads, head_size, eps);
+            dev_->rmsnorm(q_, q_, lw.q_norm, m * n_heads, head_size, eps, partial_);
+            dev_->rmsnorm(k_new, k_new, lw.k_norm, m * cfg_.n_kv_heads, head_size, eps, partial_);
             lap(Norm);
         }
         dev_->rope(q_, attn_dim, m, attn_dim, cos_dev_, sin_dev_, head_size, half_split);
@@ -305,7 +305,7 @@ void GpuTransformer::run(const int* tokens, int m, int pos0, bool want_logits) {
         if (traced) trace_row("attn_out", l, x_);
 
         // ---------------- feed-forward block (SwiGLU) ----------------
-        dev_->rmsnorm(xb_, x_, lw.rms_ffn, m, dim, eps);
+        dev_->rmsnorm(xb_, x_, lw.rms_ffn, m, dim, eps, partial_);
         lap(Norm);
         matmul(hb_, hidden, lw.w1, xb_, dim, m, hidden, dim);
         matmul(hb2_, hidden, lw.w3, xb_, dim, m, hidden, dim);
@@ -324,7 +324,7 @@ void GpuTransformer::run(const int* tokens, int m, int pos0, bool want_logits) {
         dev_->sync();   // so that a caller timing this call measures the work, not just its launch
         return;
     }
-    dev_->rmsnorm(xb_, x_ + sz(m - 1) * sz(dim), rms_final_, 1, dim, eps);
+    dev_->rmsnorm(xb_, x_ + sz(m - 1) * sz(dim), rms_final_, 1, dim, eps, partial_);
     lap(Norm);
     if (traced) trace_row("final_norm", -1, xb_);
     matmul(logits_dev_, cfg_.vocab_size, wcls_, xb_, dim, 1, cfg_.vocab_size, dim);

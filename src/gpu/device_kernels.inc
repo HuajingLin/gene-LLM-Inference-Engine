@@ -43,22 +43,45 @@ struct EmbedKernel {
 };
 
 // ---------------------------------------------------------------------------------------------------------------
-// rmsnorm: index = vector. One thread reads its whole vector, then writes it (so out == x is fine).
-struct RmsnormKernel {
+// rmsnorm, step 1: index = (vector, s). Thread s adds the squares of the elements s, s + 32, s + 64, ... (the same
+// split into 32 partial sums as matmul: one thread adding a whole vector alone takes far longer than the launch).
+struct RmsnormPartialKernel {
+    struct Args {
+        float* partial;   // [nvec, kPartials]
+        const float* x;
+        int size;
+    };
+    static GI_DEV void body(long i, const Args& a) {
+        const int s = static_cast<int>(i % kPartials);
+        const float* x = a.x + (i / kPartials) * a.size;
+        float acc = 0.0f;
+        for (int j = s; j < a.size; j += kPartials) acc = fmaf(x[j], x[j], acc);
+        a.partial[i] = acc;
+    }
+};
+
+// rmsnorm, step 2: index = (vector, element). Every thread adds the 32 partial sums of its vector pairwise and
+// scales its own element; it reads x[i] before it writes out[i], so out == x is fine.
+struct RmsnormScaleKernel {
     struct Args {
         float* out;
         const float* x;
         const float* weight;
+        const float* partial;
         int size;
         float eps;
     };
-    static GI_DEV void body(long v, const Args& a) {
-        const float* x = a.x + v * a.size;
-        float* out = a.out + v * a.size;
-        float sum_sq = 0.0f;
-        for (int i = 0; i < a.size; ++i) sum_sq = fmaf(x[i], x[i], sum_sq);
-        const float scale = 1.0f / sqrtf(sum_sq / static_cast<float>(a.size) + a.eps);
-        for (int i = 0; i < a.size; ++i) out[i] = a.weight[i] * (scale * x[i]);
+    static GI_DEV void body(long i, const Args& a) {
+        const long vec = i / a.size;
+        const int d = static_cast<int>(i % a.size);
+        const float* p = a.partial + vec * kPartials;
+        float v[kPartials];
+        for (int q = 0; q < kPartials; ++q) v[q] = p[q];
+        for (int width = kPartials / 2; width >= 1; width /= 2) {
+            for (int q = 0; q < width; ++q) v[q] = v[q] + v[q + width];
+        }
+        const float scale = 1.0f / sqrtf(v[0] / static_cast<float>(a.size) + a.eps);
+        a.out[i] = a.weight[d] * (scale * a.x[i]);
     }
 };
 
@@ -301,12 +324,13 @@ struct SiluMulKernel {
 // ---------------------------------------------------------------------------------------------------------------
 // The operations of DeviceOps (host functions: they only launch kernels).
 
-// GI_DEV_MATMUL=wide selects the wide partial-sum kernel (see MatmulWideKernel); anything else, or nothing: narrow.
+// GI_DEV_MATMUL=narrow selects the one-weight-per-step kernel; wide (the default) the 16-byte kernel where the
+// shape allows it. Measured on a Tesla T4 with Llama-3.2-1B: wide decodes about 1.5 times as fast.
 static bool gi_matmul_wide() {
     static const bool wide = [] {
         const char* v = getenv("GI_DEV_MATMUL");
-        if (!v || !*v || strcmp(v, "narrow") == 0) return false;
-        if (strcmp(v, "wide") == 0) return true;
+        if (!v || !*v || strcmp(v, "wide") == 0) return true;
+        if (strcmp(v, "narrow") == 0) return false;
         throw std::runtime_error(std::string("GI_DEV_MATMUL must be narrow or wide, got ") + v);
     }();
     return wide;
@@ -317,9 +341,11 @@ static void op_embed(float* x, const void* table, int bf16, const int* tokens, i
     launch<EmbedKernel>(a, static_cast<long>(m) * dim);
 }
 
-static void op_rmsnorm(float* out, const float* x, const float* weight, int nvec, int size, float eps) {
-    const RmsnormKernel::Args a{out, x, weight, size, eps};
-    launch<RmsnormKernel>(a, nvec);
+static void op_rmsnorm(float* out, const float* x, const float* weight, int nvec, int size, float eps, float* partial) {
+    const RmsnormPartialKernel::Args p{partial, x, size};
+    launch<RmsnormPartialKernel>(p, static_cast<long>(nvec) * kPartials);
+    const RmsnormScaleKernel::Args a{out, x, weight, partial, size, eps};
+    launch<RmsnormScaleKernel>(a, static_cast<long>(nvec) * size);
 }
 
 static void op_matmul(float* out, long out_stride, const void* W, int bf16, const float* x, long x_stride, int ntok,

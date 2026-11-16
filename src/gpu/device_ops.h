@@ -31,14 +31,14 @@ struct DeviceOps {
     void (*embed)(float* x, const void* table, int bf16, const int* tokens, int m, int dim);
 
     // RMSNorm of nvec consecutive vectors of `size` values: out = weight * x / sqrt(mean(x^2) + eps). The same
-    // weight vector is used for every vector. out == x is allowed.
-    void (*rmsnorm)(float* out, const float* x, const float* weight, int nvec, int size, float eps);
+    // weight vector is used for every vector. out == x is allowed. `partial` is scratch for kPartials * nvec floats.
+    void (*rmsnorm)(float* out, const float* x, const float* weight, int nvec, int size, float eps, float* partial);
 
     // out[t * out_stride + r] = sum_c W[r, c] * x[t * x_stride + c] for t < ntok, r < rows. `partial` is scratch
     // for kPartials * ntok * rows floats. The value of every output element does not depend on ntok.
     // Two kernels compute the partial sums: "narrow" (a thread reads one weight per step) and "wide" (a thread reads
     // 16 bytes of weights per step: 8 bfloat16 or 4 float32 values). The environment variable GI_DEV_MATMUL picks
-    // one (default narrow); wide needs cols to be a multiple of 8 (bf16) or 4 (f32) and otherwise falls back. The
+    // one (default wide); wide needs cols to be a multiple of 8 (bf16) or 4 (f32) and otherwise falls back. The
     // two add in a different order, so their results differ in the last bits.
     void (*matmul)(float* out, long out_stride, const void* W, int bf16, const float* x, long x_stride, int ntok,
                    int rows, int cols, float* partial);

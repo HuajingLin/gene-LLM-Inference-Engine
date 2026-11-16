@@ -160,7 +160,7 @@ void check_embed(Rng& rng) {
 void check_rmsnorm(Rng& rng) {
     Group g("rmsnorm");
     for (int in_place = 0; in_place < 2; ++in_place) {
-        for (int size : {1, 7, 64, 100}) {
+        for (int size : {1, 7, 31, 32, 33, 64, 100, 300}) {
             for (float eps : {1e-5f, 0.05f}) {
                 const int nvec = 5;
                 const std::size_t n = static_cast<std::size_t>(nvec) * size;
@@ -169,7 +169,8 @@ void check_rmsnorm(Rng& rng) {
                 const std::vector<float> w = random_floats(rng, size);
                 const Buf dx(x), dw(w);
                 const Buf dout(std::vector<float>(n + size, kSentinel));
-                dev->rmsnorm(in_place ? dx.f() : dout.f(), dx.f(), dw.f(), nvec, size, eps);
+                const Buf scratch(std::vector<float>(static_cast<std::size_t>(gpu::kPartials) * nvec, kSentinel));
+                dev->rmsnorm(in_place ? dx.f() : dout.f(), dx.f(), dw.f(), nvec, size, eps, scratch.f());
                 std::vector<double> want(n + size, 0.0);
                 std::vector<char> is_out(n + size, 0);
                 for (int v = 0; v < nvec; ++v) {

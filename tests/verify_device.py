@@ -67,7 +67,7 @@ def main() -> int:
     ap.add_argument("--tol", type=float, default=1e-4, help="device vs NumPy and vs the CPU model")
     ap.add_argument("--tol-emu", type=float, default=1e-5, help="cuda vs the host emulation")
     ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--matmul", default="narrow", choices=["narrow", "wide"], help="the device's matmul kernel (GI_DEV_MATMUL)")
+    ap.add_argument("--matmul", default="wide", choices=["narrow", "wide"], help="the device's matmul kernel (GI_DEV_MATMUL)")
     args = ap.parse_args()
     os.environ["GI_DEV_MATMUL"] = args.matmul
     fwd = Path(args.build) / "gi_forward"
@@ -217,6 +217,13 @@ def main() -> int:
         d = tmp / "suite_14"   # bf16, dim 64
         vocab = read_hf_model(d).config.vocab_size
         both = {mm: forward(fwd, d, [3, 1, 4, 1, 5, 9, 2, 6], [], {**dev, "GI_DEV_MATMUL": mm})[0] for mm in ("narrow", "wide")}
+        with tempfile.TemporaryDirectory() as t2:   # no GI_DEV_MATMUL at all: the default kernel is the wide one
+            env = {k: v for k, v in os.environ.items() if k != "GI_DEV_MATMUL"}
+            pd = subprocess.run([str(fwd), str(d), t2, "--max-seq-len", "8", "--device", args.device, "3", "1", "4", "1", "5", "9", "2", "6"],
+                                capture_output=True, env=env)
+            default = np.fromfile(Path(t2) / "logits.f32", dtype="<f4") if pd.returncode == 0 else np.empty(0, dtype="<f4")
+        if default.tobytes() != both["wide"].tobytes():
+            failures.append("[matmul] the default matmul kernel is not the wide one")
         counts["errors"] += 1
         if both["narrow"].size == 0 or both["narrow"].size != both["wide"].size:
             failures.append("[matmul] a run with GI_DEV_MATMUL failed")
