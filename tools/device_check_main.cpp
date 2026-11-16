@@ -190,7 +190,7 @@ void check_rmsnorm(Rng& rng) {
 void check_matmul(Rng& rng) {
     Group g("matmul");
     for (int bf16 = 0; bf16 < 2; ++bf16) {
-        for (int cols : {1, 31, 32, 33, 100}) {
+        for (int cols : {1, 31, 32, 33, 100, 264, 520}) {   // 264, 520: several 16-byte groups per thread of the wide kernel
             for (int rows : {1, 5, 13}) {
                 for (int ntok : {1, 7, 8, 9, 17}) {
                     const int out_stride = rows + 3, x_stride = cols + 2;

@@ -22,7 +22,7 @@ static GI_DEV float gi_widen_bf16(unsigned short bits) {
     return v.f;
 }
 
-constexpr int kTokChunk = 8;   // tokens that share one pass over a weight row in matmul
+constexpr int kTokChunk = kTokensPerPass;   // tokens that share one pass over a weight row in matmul
 
 // ---------------------------------------------------------------------------------------------------------------
 // embed: index = (row, d)
@@ -96,6 +96,59 @@ struct MatmulPartialKernel {
             for (int c = s; c < a.cols; c += kPartials) {
                 const float wv = w[c];
                 for (int t = 0; t < k; ++t) acc[t] = fmaf(wv, x0[static_cast<long>(t) * a.x_stride + c], acc[t]);
+            }
+        }
+        for (int t = 0; t < k; ++t) {
+            a.partial[(static_cast<long>(t0 + t) * a.rows + r) * kPartials + s] = acc[t];
+        }
+    }
+};
+
+// The wide variant of step 1. Thread s of a row takes the column groups s, s + 32, s + 64, ...; a group is 16 bytes
+// of weights (8 bfloat16 or 4 float32 values) fetched with ONE aligned 16-byte load, so a warp reads 512
+// neighbouring bytes per step instead of 64 or 128. Inside a group the columns are added in increasing order.
+// Requires: cols a multiple of the group size (then every row starts on a 16-byte boundary of the matrix).
+struct alignas(16) GiWord4 {
+    unsigned int w[4];
+};
+
+struct MatmulWideKernel {
+    typedef MatmulPartialKernel::Args Args;
+    static GI_DEV void body(long i, const Args& a) {
+        const int s = static_cast<int>(i % kPartials);
+        const long rest = i / kPartials;
+        const int r = static_cast<int>(rest % a.rows);
+        const int t0 = static_cast<int>(rest / a.rows) * kTokChunk;
+        const int k = a.ntok - t0 < kTokChunk ? a.ntok - t0 : kTokChunk;
+        float acc[kTokChunk];
+        for (int t = 0; t < kTokChunk; ++t) acc[t] = 0.0f;
+        const float* x0 = a.x + static_cast<long>(t0) * a.x_stride;
+        const int per_group = a.bf16 ? 8 : 4;
+        const int groups = a.cols / per_group;
+        const long row_bytes = static_cast<long>(r) * a.cols * (a.bf16 ? 2 : 4);
+        const GiWord4* w = reinterpret_cast<const GiWord4*>(static_cast<const char*>(a.W) + row_bytes);
+        for (int g = s; g < groups; g += kPartials) {
+#ifdef __CUDACC__
+            const GiWord4 v = w[g];   // one aligned 16-byte load
+#else
+            GiWord4 v;                // the emulation copies the same bytes without type punning
+            memcpy(&v, w + g, sizeof v);
+#endif
+            const int c0 = g * per_group;
+            if (a.bf16) {
+                for (int j = 0; j < 8; ++j) {   // value j: the low or high half of word j / 2 (little-endian)
+                    const float wv = gi_widen_bf16(static_cast<unsigned short>((v.w[j >> 1] >> ((j & 1) * 16)) & 0xFFFFu));
+                    for (int t = 0; t < k; ++t) acc[t] = fmaf(wv, x0[static_cast<long>(t) * a.x_stride + c0 + j], acc[t]);
+                }
+            } else {
+                for (int j = 0; j < 4; ++j) {
+                    union {
+                        unsigned int u;
+                        float f;
+                    } bits;
+                    bits.u = v.w[j];
+                    for (int t = 0; t < k; ++t) acc[t] = fmaf(bits.f, x0[static_cast<long>(t) * a.x_stride + c0 + j], acc[t]);
+                }
             }
         }
         for (int t = 0; t < k; ++t) {
@@ -248,6 +301,17 @@ struct SiluMulKernel {
 // ---------------------------------------------------------------------------------------------------------------
 // The operations of DeviceOps (host functions: they only launch kernels).
 
+// GI_DEV_MATMUL=wide selects the wide partial-sum kernel (see MatmulWideKernel); anything else, or nothing: narrow.
+static bool gi_matmul_wide() {
+    static const bool wide = [] {
+        const char* v = getenv("GI_DEV_MATMUL");
+        if (!v || !*v || strcmp(v, "narrow") == 0) return false;
+        if (strcmp(v, "wide") == 0) return true;
+        throw std::runtime_error(std::string("GI_DEV_MATMUL must be narrow or wide, got ") + v);
+    }();
+    return wide;
+}
+
 static void op_embed(float* x, const void* table, int bf16, const int* tokens, int m, int dim) {
     const EmbedKernel::Args a{x, table, tokens, bf16, dim};
     launch<EmbedKernel>(a, static_cast<long>(m) * dim);
@@ -262,7 +326,8 @@ static void op_matmul(float* out, long out_stride, const void* W, int bf16, cons
                       int rows, int cols, float* partial) {
     const MatmulPartialKernel::Args p{partial, W, x, x_stride, bf16, ntok, rows, cols};
     const long chunks = (ntok + kTokChunk - 1) / kTokChunk;
-    launch<MatmulPartialKernel>(p, chunks * rows * kPartials);
+    if (gi_matmul_wide() && cols % (bf16 ? 8 : 4) == 0) launch<MatmulWideKernel>(p, chunks * rows * kPartials);
+    else launch<MatmulPartialKernel>(p, chunks * rows * kPartials);
     const MatmulReduceKernel::Args r{out, out_stride, partial, rows};
     launch<MatmulReduceKernel>(r, static_cast<long>(ntok) * rows);
 }

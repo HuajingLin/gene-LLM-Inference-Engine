@@ -36,6 +36,11 @@ public:
     virtual int max_seq_len() const = 0;
     virtual void set_trace(TraceFn fn) = 0;
     virtual std::string description() const = 0;   // one line: where and how it computes
+
+    // Optional per-operation timing (device models; the CPU model has ForwardProfile and gi_bench --profile).
+    // While it is on, a device waits after every operation, which makes the whole pass a little slower.
+    virtual void set_profiling(bool) {}
+    virtual std::string profile_report() const { return std::string(); }   // empty when nothing was measured
 };
 
 // device: "cpu" (or empty), "cuda", "emu" (host emulation of the device kernels, for tests). An empty name means

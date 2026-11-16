@@ -36,6 +36,10 @@ struct DeviceOps {
 
     // out[t * out_stride + r] = sum_c W[r, c] * x[t * x_stride + c] for t < ntok, r < rows. `partial` is scratch
     // for kPartials * ntok * rows floats. The value of every output element does not depend on ntok.
+    // Two kernels compute the partial sums: "narrow" (a thread reads one weight per step) and "wide" (a thread reads
+    // 16 bytes of weights per step: 8 bfloat16 or 4 float32 values). The environment variable GI_DEV_MATMUL picks
+    // one (default narrow); wide needs cols to be a multiple of 8 (bf16) or 4 (f32) and otherwise falls back. The
+    // two add in a different order, so their results differ in the last bits.
     void (*matmul)(float* out, long out_stride, const void* W, int bf16, const float* x, long x_stride, int ntok,
                    int rows, int cols, float* partial);
 
@@ -54,7 +58,8 @@ struct DeviceOps {
     void (*silu_mul)(float* a, const float* b, long n);   // a = silu(a) * b
 };
 
-constexpr int kPartials = 32;   // partial sums per output element of matmul (one warp of GPU threads)
+constexpr int kPartials = 32;        // partial sums per output element of matmul (one warp of GPU threads)
+constexpr int kTokensPerPass = 8;   // tokens of a matmul that share one pass over the weights
 
 const DeviceOps* emu_ops();    // always available
 const DeviceOps* cuda_ops();   // nullptr when the library was built without CUDA

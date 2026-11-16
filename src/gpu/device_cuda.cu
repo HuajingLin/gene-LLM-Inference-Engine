@@ -6,6 +6,9 @@
 
 #include <math.h>
 
+#include <stdlib.h>
+#include <string.h>
+
 #include <cstddef>
 #include <stdexcept>
 #include <string>

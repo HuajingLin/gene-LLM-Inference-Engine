@@ -9,6 +9,7 @@
 // forward_batch() and forward() give the same values for a position whatever the batch size.
 #pragma once
 
+#include <chrono>
 #include <cstddef>
 #include <string>
 #include <vector>
@@ -36,6 +37,9 @@ public:
     void set_trace(TraceFn fn) override { trace_ = std::move(fn); }
     std::string description() const override;
 
+    void set_profiling(bool on) override;
+    std::string profile_report() const override;
+
     int max_batch() const { return max_batch_; }
     std::size_t device_bytes() const { return device_bytes_; }   // everything allocated on the device
     std::size_t weight_bytes() const { return weight_bytes_; }   // of which weights
@@ -60,6 +64,17 @@ private:
     void matmul(float* out, long out_stride, const DMat& w, const float* x, long x_stride, int ntok, int rows, int cols);
     void run(const int* tokens, int m, int pos0, bool want_logits);
     void trace_row(const char* tag, int layer, const float* device_row);
+
+    enum Section { Transfer, Embed, Norm, QkvProj, Rope, Attention, OutProj, FfnGateUp, Activation, FfnDown, Residual,
+                   Classifier, Download, kSections };
+    void lap(Section s, std::size_t weight_bytes = 0);   // with profiling: wait for the device, book the time since the last lap
+    static std::size_t matrix_bytes(const DMat& w, int rows, int cols, int ntok);
+
+    bool profiling_ = false;
+    std::chrono::steady_clock::time_point lap_start_;
+    double section_seconds_[kSections] = {};
+    double section_weight_bytes_[kSections] = {};
+    long profiled_positions_ = 0, profiled_passes_ = 0;
 
     const gpu::DeviceOps* dev_;
     Config cfg_;

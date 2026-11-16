@@ -67,7 +67,9 @@ def main() -> int:
     ap.add_argument("--tol", type=float, default=1e-4, help="device vs NumPy and vs the CPU model")
     ap.add_argument("--tol-emu", type=float, default=1e-5, help="cuda vs the host emulation")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--matmul", default="narrow", choices=["narrow", "wide"], help="the device's matmul kernel (GI_DEV_MATMUL)")
     args = ap.parse_args()
+    os.environ["GI_DEV_MATMUL"] = args.matmul
     fwd = Path(args.build) / "gi_forward"
     gen = Path(args.build) / "gi_generate"
     check = Path(args.build) / "gi_device_check"
@@ -197,6 +199,7 @@ def main() -> int:
         expect_error("token id too large", [], dev, "out of range", seq=(1, vocab, 2))
         expect_error("token id too large in a batch", ["--prefill", "3"], dev, "out of range", seq=(1, 2, vocab))
         expect_error("negative token id", [], dev, "out of range", seq=(1, -1, 2))
+        expect_error("bad matmul kernel name", [], {**dev, "GI_DEV_MATMUL": "huge"}, "GI_DEV_MATMUL")
         expect_error("bad emulation order", [], {"GI_DEVICE": "emu", "GI_EMU_ORDER": "sideways"}, "GI_EMU_ORDER")
         _, stderr, code = forward(fwd, d, [1, 2, 3], ["--device", "cuda"], {})
         if args.device == "emu" and code != 0:   # a build without CUDA must say so
@@ -209,6 +212,18 @@ def main() -> int:
         counts["errors"] += 1
         if ca != 0 or cb != 0 or a.tobytes() != b.tobytes():
             failures.append("[errors] --device cpu did not override GI_DEVICE")
+
+        # The two matmul kernels are really two: other bits, same values. And the profile reports every operation.
+        d = tmp / "suite_14"   # bf16, dim 64
+        vocab = read_hf_model(d).config.vocab_size
+        both = {mm: forward(fwd, d, [3, 1, 4, 1, 5, 9, 2, 6], [], {**dev, "GI_DEV_MATMUL": mm})[0] for mm in ("narrow", "wide")}
+        counts["errors"] += 1
+        if both["narrow"].size == 0 or both["narrow"].size != both["wide"].size:
+            failures.append("[matmul] a run with GI_DEV_MATMUL failed")
+        elif both["narrow"].tobytes() == both["wide"].tobytes():
+            failures.append("[matmul] GI_DEV_MATMUL=wide gives the same bits as narrow: the switch does nothing")
+        elif not err(both["wide"], both["narrow"]) < args.tol_emu:
+            failures.append(f"[matmul] wide and narrow differ by {err(both['wide'], both['narrow']):.2e}")
 
         # 5: generation
         for i, flags in enumerate((["--dtype", "bf16"], ["--qwen3", "--tokenizer-variant", "qwen2"],
@@ -229,12 +244,29 @@ def main() -> int:
                 if outs["cpu"][0] == 0 and outs[args.device][0] == 0 and outs["cpu"][1] != outs[args.device][1]:
                     failures.append(f"[generation] model {i}, prompt {prompt!r}: greedy text differs from the CPU's")
 
+        d = tmp / "gen_0"
+        gen_cmd = [str(gen), "--model", str(d), "--prompt", "ab", "--steps", "12", "--temperature", "0", "--quiet"]
+        for device, needle in ((args.device, "device profile:"), ("cpu", "no profile")):
+            p = subprocess.run([*gen_cmd, "--device", device, "--profile"], capture_output=True)
+            report = p.stderr.decode(errors="replace")
+            counts["errors"] += 1
+            if p.returncode != 0 or needle not in report:
+                failures.append(f"[profile] --profile on {device}: {report.strip()[:160]!r}")
+            elif device != "cpu":
+                missing = [n for n in ("rmsnorm", "q/k/v projections", "attention", "ffn gate+up", "ffn down", "classifier", "download")
+                           if n not in report]
+                if missing or "12 positions" not in report:
+                    failures.append(f"[profile] report lacks {missing} or the position count: {report.strip()[:200]!r}")
+                plain = subprocess.run([*gen_cmd, "--device", device], capture_output=True)
+                if plain.stdout != p.stdout:
+                    failures.append("[profile] profiling changes the generated text")
+
     if failures:
         print("\nFAIL")
         for f in failures[:20]:
             print("  -", f)
         return 1
-    print(f"PASS  (device '{args.device}': " + ", ".join(f"{v} {k}" for k, v in counts.items() if v) + " checks)")
+    print(f"PASS  (device '{args.device}', {args.matmul} matmul: " + ", ".join(f"{v} {k}" for k, v in counts.items() if v) + " checks)")
     return 0
 
 

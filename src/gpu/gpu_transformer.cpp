@@ -150,6 +150,52 @@ void GpuTransformer::matmul(float* out, long out_stride, const DMat& w, const fl
     dev_->matmul(out, out_stride, w.data, w.bf16, x, x_stride, ntok, rows, cols, partial_);
 }
 
+void GpuTransformer::set_profiling(bool on) {
+    profiling_ = on;
+    for (int s = 0; s < kSections; ++s) section_seconds_[s] = section_weight_bytes_[s] = 0.0;
+    profiled_positions_ = profiled_passes_ = 0;
+}
+
+void GpuTransformer::lap(Section s, std::size_t weight_bytes) {
+    if (!profiling_) return;
+    dev_->sync();
+    const auto now = std::chrono::steady_clock::now();
+    section_seconds_[s] += std::chrono::duration<double>(now - lap_start_).count();
+    section_weight_bytes_[s] += static_cast<double>(weight_bytes);
+    lap_start_ = now;
+}
+
+// Weight bytes one matmul reads: the matrix once per group of tokens that share a pass over it.
+std::size_t GpuTransformer::matrix_bytes(const DMat& w, int rows, int cols, int ntok) {
+    const std::size_t passes = (sz(ntok) + sz(gpu::kTokensPerPass) - 1) / sz(gpu::kTokensPerPass);
+    return sz(rows) * sz(cols) * (w.bf16 ? 2 : 4) * passes;
+}
+
+std::string GpuTransformer::profile_report() const {
+    if (profiled_positions_ == 0) return std::string();
+    static const char* const names[kSections] = {
+        "upload (tokens, rope rows)", "embedding lookup", "rmsnorm", "q/k/v projections", "rope", "attention",
+        "output projection", "ffn gate+up", "silu * up", "ffn down", "residual adds", "classifier (logits)", "download (logits)"};
+    double total = 0.0;
+    for (int s = 0; s < kSections; ++s) total += section_seconds_[s];
+    char line[200];
+    std::snprintf(line, sizeof line, "device profile: %ld positions in %ld passes, %.3f ms per position (the device waits after every operation)\n",
+                  profiled_positions_, profiled_passes_, total * 1e3 / static_cast<double>(profiled_positions_));
+    std::string out = line;
+    std::snprintf(line, sizeof line, "  %-28s %12s %7s %14s\n", "operation", "ms/position", "share", "weights GB/s");
+    out += line;
+    for (int s = 0; s < kSections; ++s) {
+        const double ms = section_seconds_[s] * 1e3 / static_cast<double>(profiled_positions_);
+        char rate[32] = "";
+        if (section_weight_bytes_[s] > 0.0 && section_seconds_[s] > 0.0) {
+            std::snprintf(rate, sizeof rate, "%.1f", section_weight_bytes_[s] / section_seconds_[s] / 1e9);
+        }
+        std::snprintf(line, sizeof line, "  %-28s %12.3f %6.1f%% %14s\n", names[s], ms, total > 0.0 ? 100.0 * section_seconds_[s] / total : 0.0, rate);
+        out += line;
+    }
+    return out;
+}
+
 void GpuTransformer::trace_row(const char* tag, int layer, const float* device_row) {
     dev_->download(trace_buf_.data(), device_row, sz(cfg_.dim) * sizeof(float));
     trace_(tag, layer, trace_buf_.data(), cfg_.dim);
@@ -205,6 +251,12 @@ void GpuTransformer::run(const int* tokens, int m, int pos0, bool want_logits) {
     const std::size_t half = sz(head_size / 2);
     const bool traced = static_cast<bool>(trace_) && m == 1;
 
+    if (profiling_) {
+        dev_->sync();
+        lap_start_ = std::chrono::steady_clock::now();
+        profiled_positions_ += m;
+        ++profiled_passes_;
+    }
     // Rotary cos/sin rows: computed on the host in double precision exactly as for the CPU model, then uploaded.
     while (rope_rows_ < pos0 + m) {
         rope_cos_.resize((sz(rope_rows_) + 1) * half);
@@ -216,8 +268,10 @@ void GpuTransformer::run(const int* tokens, int m, int pos0, bool want_logits) {
     dev_->upload(cos_dev_, rope_cos_.data() + sz(pos0) * half, sz(m) * half * sizeof(float));
     dev_->upload(sin_dev_, rope_sin_.data() + sz(pos0) * half, sz(m) * half * sizeof(float));
     dev_->upload(tokens_dev_, tokens, sz(m) * sizeof(int));
+    lap(Transfer);
 
     dev_->embed(x_, embedding_.data, embedding_.bf16, tokens_dev_, m, dim);
+    lap(Embed);
     if (traced) trace_row("embedding", -1, x_);
 
     for (int l = 0; l < cfg_.n_layers; ++l) {
@@ -229,27 +283,39 @@ void GpuTransformer::run(const int* tokens, int m, int pos0, bool want_logits) {
 
         // ---------------- attention block ----------------
         dev_->rmsnorm(xb_, x_, lw.rms_att, m, dim, eps);
+        lap(Norm);
         matmul(q_, attn_dim, lw.wq, xb_, dim, m, attn_dim, dim);
         matmul(k_new, kv_dim, lw.wk, xb_, dim, m, kv_dim, dim);
         matmul(v_new, kv_dim, lw.wv, xb_, dim, m, kv_dim, dim);
+        lap(QkvProj, matrix_bytes(lw.wq, attn_dim, dim, m) + 2 * matrix_bytes(lw.wk, kv_dim, dim, m));
         if (cfg_.qk_norm) {   // Qwen3: every q and k head is RMS-normalized before RoPE
             dev_->rmsnorm(q_, q_, lw.q_norm, m * n_heads, head_size, eps);
             dev_->rmsnorm(k_new, k_new, lw.k_norm, m * cfg_.n_kv_heads, head_size, eps);
+            lap(Norm);
         }
         dev_->rope(q_, attn_dim, m, attn_dim, cos_dev_, sin_dev_, head_size, half_split);
         dev_->rope(k_new, kv_dim, m, kv_dim, cos_dev_, sin_dev_, head_size, half_split);
+        lap(Rope);
         dev_->attention(ao_, q_, keys_l, values_l, m, pos0, n_heads, head_size, kv_mul, kv_dim, inv_scale, scores_);
+        lap(Attention);
         matmul(xb2_, dim, lw.wo, ao_, attn_dim, m, dim, attn_dim);
+        lap(OutProj, matrix_bytes(lw.wo, dim, attn_dim, m));
         dev_->add(x_, xb2_, static_cast<long>(m) * dim);
+        lap(Residual);
         if (traced) trace_row("attn_out", l, x_);
 
         // ---------------- feed-forward block (SwiGLU) ----------------
         dev_->rmsnorm(xb_, x_, lw.rms_ffn, m, dim, eps);
+        lap(Norm);
         matmul(hb_, hidden, lw.w1, xb_, dim, m, hidden, dim);
         matmul(hb2_, hidden, lw.w3, xb_, dim, m, hidden, dim);
+        lap(FfnGateUp, 2 * matrix_bytes(lw.w1, hidden, dim, m));
         dev_->silu_mul(hb_, hb2_, static_cast<long>(m) * hidden);
+        lap(Activation);
         matmul(xb_, dim, lw.w2, hb_, hidden, m, dim, hidden);
+        lap(FfnDown, matrix_bytes(lw.w2, dim, hidden, m));
         dev_->add(x_, xb_, static_cast<long>(m) * dim);
+        lap(Residual);
         if (traced) trace_row("ffn_out", l, x_);
     }
     length_ = pos0 + m;
@@ -259,9 +325,12 @@ void GpuTransformer::run(const int* tokens, int m, int pos0, bool want_logits) {
         return;
     }
     dev_->rmsnorm(xb_, x_ + sz(m - 1) * sz(dim), rms_final_, 1, dim, eps);
+    lap(Norm);
     if (traced) trace_row("final_norm", -1, xb_);
     matmul(logits_dev_, cfg_.vocab_size, wcls_, xb_, dim, 1, cfg_.vocab_size, dim);
+    lap(Classifier, matrix_bytes(wcls_, cfg_.vocab_size, dim, 1));
     dev_->download(logits_.data(), logits_dev_, sz(cfg_.vocab_size) * sizeof(float));
+    lap(Download);
 }
 
 }  // namespace geneinfer

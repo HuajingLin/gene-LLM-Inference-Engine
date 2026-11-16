@@ -7,6 +7,10 @@
 //     has written shows up in the results;
 //   - GI_EMU_ORDER=reverse or GI_EMU_ORDER=shuffle runs the indices of every launch backwards or in a scrambled
 //     order. On a GPU they run all at once, so a correct kernel gives the same bits in any order.
+#include <math.h>
+#include <stdlib.h>
+#include <string.h>
+
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
