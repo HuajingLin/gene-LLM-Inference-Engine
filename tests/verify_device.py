@@ -73,7 +73,7 @@ def main() -> int:
     ap.add_argument("--tol-emu", type=float, default=1e-5, help="cuda vs the host emulation")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--engine-seeds", type=int, default=3, help="seeds of the engine sweep (verify_engine.py --seeds)")
-    ap.add_argument("--matmul", default="wide", choices=["narrow", "wide"], help="the device's matmul kernel (GI_DEV_MATMUL)")
+    ap.add_argument("--matmul", default="auto", choices=["auto", "tile", "wide", "narrow"], help="the device's matmul kernel (GI_DEV_MATMUL)")
     args = ap.parse_args()
     os.environ["GI_DEV_MATMUL"] = args.matmul
     fwd = Path(args.build) / "gi_forward"
@@ -151,6 +151,15 @@ def main() -> int:
                     g = got.reshape(-1, vocab) if got.size == base[prefill - 1:].size else None
                     e = err(g, base[prefill - 1:]) if g is not None else float("inf")
                     failures.append(f"[{label}] {' '.join(extra)}: logits differ from token by token (error {e:.2e})")
+            # The tile and the wide matmul kernels give the same bits, token by token and in batches.
+            ref_wide = forward(fwd, d, seq, [], {**dev, "GI_DEV_MATMUL": "wide"})[0]
+            for mm in ("tile", "auto"):
+                for extra in ([], ["--prefill", "150", "--max-batch", "23"], ["--prefill", "64"]):
+                    got = forward(fwd, d, seq, extra, {**dev, "GI_DEV_MATMUL": mm})[0]
+                    counts["batching"] += 1
+                    first = int(extra[1]) - 1 if extra else 0
+                    if got.size == 0 or got.tobytes() != ref_wide.reshape(len(seq), vocab)[first:].tobytes():
+                        failures.append(f"[{label}] GI_DEV_MATMUL={mm} {' '.join(extra)}: bits differ from the wide kernel")
             # The block size of the paged KV cache changes nothing, not even the last bit.
             for bsize in (1, 3, 7, 64, 1000):
                 for extra in ([], ["--prefill", "150", "--max-batch", "23"]):
@@ -245,13 +254,17 @@ def main() -> int:
         d = tmp / "suite_14"   # bf16, dim 64
         vocab = read_hf_model(d).config.vocab_size
         both = {mm: forward(fwd, d, [3, 1, 4, 1, 5, 9, 2, 6], [], {**dev, "GI_DEV_MATMUL": mm})[0] for mm in ("narrow", "wide")}
+        vocab = read_hf_model(d).config.vocab_size
         with tempfile.TemporaryDirectory() as t2:   # no GI_DEV_MATMUL at all: the default kernel is the wide one
             env = {k: v for k, v in os.environ.items() if k != "GI_DEV_MATMUL"}
             pd = subprocess.run([str(fwd), str(d), t2, "--max-seq-len", "8", "--device", args.device, "3", "1", "4", "1", "5", "9", "2", "6"],
                                 capture_output=True, env=env)
             default = np.fromfile(Path(t2) / "logits.f32", dtype="<f4") if pd.returncode == 0 else np.empty(0, dtype="<f4")
         if default.tobytes() != both["wide"].tobytes():
-            failures.append("[matmul] the default matmul kernel is not the wide one")
+            failures.append("[matmul] the default matmul kernels do not give the bits of the wide one")
+        tile = forward(fwd, d, [3, 1, 4, 1, 5, 9, 2, 6], ["--prefill", "8"], {**dev, "GI_DEV_MATMUL": "tile"})[0]
+        if tile.tobytes() != both["wide"][-tile.size:].tobytes() or tile.size == 0:
+            failures.append("[matmul] the tile kernel does not give the bits of the wide one")
         counts["errors"] += 1
         if both["narrow"].size == 0 or both["narrow"].size != both["wide"].size:
             failures.append("[matmul] a run with GI_DEV_MATMUL failed")
@@ -279,6 +292,11 @@ def main() -> int:
                 if outs["cpu"][0] == 0 and outs[args.device][0] == 0 and outs["cpu"][1] != outs[args.device][1]:
                     failures.append(f"[generation] model {i}, prompt {prompt!r}: greedy text differs from the CPU's")
 
+        p = subprocess.run([str(Path(args.build) / "gi_serve_bench"), "--model", str(tmp / "suite_14"), "--device", args.device, "--concurrency", "1,3",
+                            "--prompt-tokens", "20", "--decode-tokens", "5", "--runs", "1", "--profile"], capture_output=True, text=True)
+        counts["errors"] += 1
+        if p.returncode != 0 or p.stdout.count("device profile:") != 2 or p.stdout.count("identical to running alone") != 2:
+            failures.append(f"[profile] gi_serve_bench --profile: {(p.stdout + p.stderr).strip()[-300:]}")
         d = tmp / "gen_0"
         gen_cmd = [str(gen), "--model", str(d), "--prompt", "ab", "--steps", "12", "--temperature", "0", "--quiet"]
         for device, needle in ((args.device, "device profile:"), ("cpu", "no profile")):

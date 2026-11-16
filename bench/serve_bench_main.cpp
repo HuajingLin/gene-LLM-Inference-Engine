@@ -3,6 +3,7 @@
 //   gi_serve_bench --model DIR_OR_FILE [--concurrency 1,2,4,8] [--prompt-tokens 16] [--decode-tokens 64]
 //                  [--runs 3] [--max-seq-len N] [--threads N] [--weights native|f32|int8] [--block-size B]
 //                  [--device cpu|cuda|emu]   (default: the environment variable GI_DEVICE, else cpu)
+//                  [--profile]               per-operation timing of a device model after every level (slows it a little)
 //                  [--shared-prefix N] [--warm-cache] [--no-prefix-cache]
 //
 // For every concurrency level C the same C synthetic requests (random prompt tokens, greedy sampling, no end token,
@@ -56,7 +57,7 @@ private:
     std::fprintf(stderr,
                  "usage: gi_serve_bench --model M [--concurrency 1,2,4,8] [--prompt-tokens N] [--decode-tokens N] [--runs N]\n"
                  "                      [--max-seq-len N] [--threads N] [--weights native|f32|int8] [--block-size B]\n"
-                 "                      [--device cpu|cuda|emu] [--shared-prefix N] [--warm-cache] [--no-prefix-cache]\n");
+                 "                      [--device cpu|cuda|emu] [--shared-prefix N] [--warm-cache] [--no-prefix-cache] [--profile]\n");
     std::exit(2);
 }
 
@@ -75,7 +76,7 @@ double median(std::vector<double> v) {
 int main(int argc, char** argv) {
     std::string model_path, weights_arg, conc_arg = "1,2,4,8", device;
     int prompt_tokens = 16, decode_tokens = 64, runs = 3, max_seq_len = 0, n_threads = 0, block_size = 0, shared_prefix = 0;
-    bool warm_cache = false, prefix_cache = true;
+    bool warm_cache = false, prefix_cache = true, profile = false;
     for (int i = 1; i < argc; ++i) {
         const std::string f = argv[i];
         auto value = [&]() -> std::string {
@@ -95,6 +96,7 @@ int main(int argc, char** argv) {
         else if (f == "--weights") weights_arg = value();
         else if (f == "--block-size") block_size = std::atoi(value().c_str());
         else if (f == "--device") device = value();
+        else if (f == "--profile") profile = true;
         else usage_error("unknown option " + f);
     }
     if (model_path.empty()) usage_error("--model is required");
@@ -176,6 +178,7 @@ int main(int argc, char** argv) {
             ec.prefix_cache = prefix_cache;
             std::unique_ptr<Engine> warm;
             if (warm_cache) warm = std::make_unique<Engine>(model, tok, ec);
+            if (profile) model.set_profiling(true);   // restarts the counters; the device then waits after every operation
             for (int run = -1; run < runs; ++run) {   // run -1 is the unmeasured warm-up
                 std::unique_ptr<Engine> fresh;
                 if (!warm_cache) fresh = std::make_unique<Engine>(model, tok, ec);
@@ -197,6 +200,11 @@ int main(int argc, char** argv) {
             if (base_tps == 0.0) base_tps = tps;
             std::printf("%-11d %-10.3f %-12.1f %-14.1f %-12.2f %-10.2f %-14ld %s\n", c, wall, tps, tps / c, rows_per_pass, tps / base_tps,
                         cached_positions, same ? "identical to running alone" : "DIFFER");
+            if (profile) {
+                const std::string report = model.profile_report();
+                std::printf("%s", report.empty() ? "  (no profile: --profile needs a device model)\n" : report.c_str());
+                model.set_profiling(false);
+            }
         }
         std::printf("(tokens/s counts generated tokens only; wall time includes the prompts.)\n");
         return all_same ? 0 : 1;

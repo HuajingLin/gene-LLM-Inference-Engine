@@ -193,9 +193,10 @@ void check_matmul(Rng& rng) {
     Group g("matmul");
     for (int bf16 = 0; bf16 < 2; ++bf16) {
         for (int cols : {1, 31, 32, 33, 100, 264, 520}) {   // 264, 520: several 16-byte groups per thread of the wide kernel
-            for (int rows : {1, 5, 13}) {
+            for (int rows : {1, 4, 5, 13}) {
                 for (int ntok : {1, 7, 8, 9, 17}) {
-                    const int out_stride = rows + 3, x_stride = cols + 2;
+                    // rows 5: an odd stride (the tile kernel must fall back); else a multiple of 4 floats.
+                    const int out_stride = rows + 3, x_stride = rows == 5 ? cols + 3 : (cols + 5) / 4 * 4;
                     const std::vector<float> W = random_floats(rng, static_cast<std::size_t>(rows) * cols);
                     std::vector<std::uint16_t> W16(W.size());
                     for (std::size_t i = 0; i < W.size(); ++i) W16[i] = narrow(W[i]);

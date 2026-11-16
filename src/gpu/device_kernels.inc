@@ -22,6 +22,14 @@ static GI_DEV float gi_widen_bf16(unsigned short bits) {
     return v.f;
 }
 
+#ifndef __CUDACC__
+// The GPU reads 16 bytes at once only from 16-byte boundaries. The emulation copies bytes and would not care, so it
+// checks the address instead: a kernel that would do an unaligned load on the GPU fails here.
+static inline void gi_emu_check_aligned(const void* p) {
+    if (reinterpret_cast<std::uintptr_t>(p) % 16 != 0) throw std::logic_error("emu device: unaligned 16-byte load");
+}
+#endif
+
 constexpr int kTokChunk = kTokensPerPass;   // tokens that share one pass over a weight row in matmul
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -154,6 +162,7 @@ struct MatmulWideKernel {
 #ifdef __CUDACC__
             const GiWord4 v = w[g];   // one aligned 16-byte load
 #else
+            gi_emu_check_aligned(w + g);
             GiWord4 v;                // the emulation copies the same bytes without type punning
             memcpy(&v, w + g, sizeof v);
 #endif
@@ -176,6 +185,104 @@ struct MatmulWideKernel {
         }
         for (int t = 0; t < k; ++t) {
             a.partial[(static_cast<long>(t0 + t) * a.rows + r) * kPartials + s] = acc[t];
+        }
+    }
+};
+
+// The tile variant of step 1: index = (token chunk, group of kTileRows rows, s). One thread now holds a small tile of
+// the product in registers: per 16 bytes of columns it loads the activations of up to 8 tokens ONCE (16-byte loads)
+// and uses them for kTileRows weight rows, so there are a few loads per hundreds of multiply-adds instead of one
+// load per multiply-add. Every (token, row, s) sum is the same chain of operations as in the wide kernel: the two
+// give the same bits. Requires, besides the wide kernel's condition, activations that start on a 16-byte boundary
+// with a row stride that is a multiple of 4 floats.
+constexpr int kTileRows = 4;
+
+static GI_DEV void gi_load4(const float* p, float* out) {
+#ifdef __CUDACC__
+    struct alignas(16) Float4 {
+        float f[4];
+    };
+    const Float4 v = *reinterpret_cast<const Float4*>(p);   // one aligned 16-byte load
+    out[0] = v.f[0];
+    out[1] = v.f[1];
+    out[2] = v.f[2];
+    out[3] = v.f[3];
+#else
+    gi_emu_check_aligned(p);
+    memcpy(out, p, 4 * sizeof(float));
+#endif
+}
+
+// nr rows (r0 ..), k tokens (t0 ..). Called with constant nr, k and bf16 for the common shapes, so that the loops
+// have fixed lengths there.
+static GI_DEV void gi_tile_body(const MatmulPartialKernel::Args& a, int s, int r0, int nr, int t0, int k, int bf16) {
+    float acc[kTileRows][kTokChunk];
+    for (int rr = 0; rr < kTileRows; ++rr) {
+        for (int t = 0; t < kTokChunk; ++t) acc[rr][t] = 0.0f;
+    }
+    const int per_group = bf16 ? 8 : 4;
+    const int groups = a.cols / per_group;
+    const long row_bytes = static_cast<long>(a.cols) * (bf16 ? 2 : 4);
+    const char* w0 = static_cast<const char*>(a.W) + static_cast<long>(r0) * row_bytes;
+    const float* x0 = a.x + static_cast<long>(t0) * a.x_stride;
+    for (int g = s; g < groups; g += kPartials) {
+        float xv[kTokChunk][8];
+        for (int t = 0; t < k; ++t) {
+            const float* xt = x0 + static_cast<long>(t) * a.x_stride + static_cast<long>(g) * per_group;
+            gi_load4(xt, xv[t]);
+            if (bf16) gi_load4(xt + 4, xv[t] + 4);
+        }
+        for (int rr = 0; rr < nr; ++rr) {
+            const GiWord4* wp = reinterpret_cast<const GiWord4*>(w0 + static_cast<long>(rr) * row_bytes) + g;
+#ifdef __CUDACC__
+            const GiWord4 v = *wp;
+#else
+            gi_emu_check_aligned(wp);
+            GiWord4 v;
+            memcpy(&v, wp, sizeof v);
+#endif
+            if (bf16) {
+                for (int j = 0; j < 8; ++j) {
+                    const float wv = gi_widen_bf16(static_cast<unsigned short>((v.w[j >> 1] >> ((j & 1) * 16)) & 0xFFFFu));
+                    for (int t = 0; t < k; ++t) acc[rr][t] = fmaf(wv, xv[t][j], acc[rr][t]);
+                }
+            } else {
+                for (int j = 0; j < 4; ++j) {
+                    union {
+                        unsigned int u;
+                        float f;
+                    } bits;
+                    bits.u = v.w[j];
+                    for (int t = 0; t < k; ++t) acc[rr][t] = fmaf(bits.f, xv[t][j], acc[rr][t]);
+                }
+            }
+        }
+    }
+    for (int rr = 0; rr < nr; ++rr) {
+        for (int t = 0; t < k; ++t) {
+            a.partial[(static_cast<long>(t0 + t) * a.rows + r0 + rr) * kPartials + s] = acc[rr][t];
+        }
+    }
+}
+
+struct MatmulTileKernel {
+    typedef MatmulPartialKernel::Args Args;
+    static GI_DEV void body(long i, const Args& a) {
+        const int s = static_cast<int>(i % kPartials);
+        const long rest = i / kPartials;
+        const int row_groups = (a.rows + kTileRows - 1) / kTileRows;
+        const int r0 = static_cast<int>(rest % row_groups) * kTileRows;
+        const int t0 = static_cast<int>(rest / row_groups) * kTokChunk;
+        const int nr = a.rows - r0 < kTileRows ? a.rows - r0 : kTileRows;
+        const int k = a.ntok - t0 < kTokChunk ? a.ntok - t0 : kTokChunk;
+        if (a.bf16) {
+            if (nr == kTileRows && k == kTokChunk) gi_tile_body(a, s, r0, kTileRows, t0, kTokChunk, 1);
+            else if (nr == kTileRows && k == 1) gi_tile_body(a, s, r0, kTileRows, t0, 1, 1);
+            else gi_tile_body(a, s, r0, nr, t0, k, 1);
+        } else {
+            if (nr == kTileRows && k == kTokChunk) gi_tile_body(a, s, r0, kTileRows, t0, kTokChunk, 0);
+            else if (nr == kTileRows && k == 1) gi_tile_body(a, s, r0, kTileRows, t0, 1, 0);
+            else gi_tile_body(a, s, r0, nr, t0, k, 0);
         }
     }
 };
@@ -354,16 +461,25 @@ struct SiluMulKernel {
 // ---------------------------------------------------------------------------------------------------------------
 // The operations of DeviceOps (host functions: they only launch kernels).
 
-// GI_DEV_MATMUL=narrow selects the one-weight-per-step kernel; wide (the default) the 16-byte kernel where the
-// shape allows it. Measured on a Tesla T4 with Llama-3.2-1B: wide decodes about 1.5 times as fast.
-static bool gi_matmul_wide() {
-    static const bool wide = [] {
+// GI_DEV_MATMUL picks the kernel of the partial sums:
+//   narrow  one weight per step
+//   wide    16 bytes of weights per step (falls back to narrow when the column count does not allow it)
+//   tile    wide, with 4 rows x up to 8 tokens per thread (falls back to wide when the activations are not aligned)
+//   auto    (default) tile for several tokens, wide for one
+// wide and tile give the same bits; narrow adds in another order. Measured on a Tesla T4 with Llama-3.2-1B: wide
+// decodes about 1.5 times as fast as narrow.
+enum GiMatmulMode { kMatmulNarrow, kMatmulWide, kMatmulTile, kMatmulAuto };
+
+static GiMatmulMode gi_matmul_mode() {
+    static const GiMatmulMode mode = [] {
         const char* v = getenv("GI_DEV_MATMUL");
-        if (!v || !*v || strcmp(v, "wide") == 0) return true;
-        if (strcmp(v, "narrow") == 0) return false;
-        throw std::runtime_error(std::string("GI_DEV_MATMUL must be narrow or wide, got ") + v);
+        if (!v || !*v || strcmp(v, "auto") == 0) return kMatmulAuto;
+        if (strcmp(v, "tile") == 0) return kMatmulTile;
+        if (strcmp(v, "wide") == 0) return kMatmulWide;
+        if (strcmp(v, "narrow") == 0) return kMatmulNarrow;
+        throw std::runtime_error(std::string("GI_DEV_MATMUL must be auto, tile, wide or narrow, got ") + v);
     }();
-    return wide;
+    return mode;
 }
 
 static void op_embed(float* x, const void* table, int bf16, const int* tokens, int m, int dim) {
@@ -382,8 +498,17 @@ static void op_matmul(float* out, long out_stride, const void* W, int bf16, cons
                       int rows, int cols, float* partial) {
     const MatmulPartialKernel::Args p{partial, W, x, x_stride, bf16, ntok, rows, cols};
     const long chunks = (ntok + kTokChunk - 1) / kTokChunk;
-    if (gi_matmul_wide() && cols % (bf16 ? 8 : 4) == 0) launch<MatmulWideKernel>(p, chunks * rows * kPartials);
-    else launch<MatmulPartialKernel>(p, chunks * rows * kPartials);
+    const GiMatmulMode mode = gi_matmul_mode();
+    const bool wide_ok = mode != kMatmulNarrow && cols % (bf16 ? 8 : 4) == 0;
+    const bool tile_ok = wide_ok && x_stride % 4 == 0 && reinterpret_cast<std::uintptr_t>(x) % 16 == 0;
+    if (tile_ok && (mode == kMatmulTile || (mode == kMatmulAuto && ntok > 1))) {
+        const long row_groups = (rows + kTileRows - 1) / kTileRows;
+        launch<MatmulTileKernel>(p, chunks * row_groups * kPartials);
+    } else if (wide_ok) {
+        launch<MatmulWideKernel>(p, chunks * rows * kPartials);
+    } else {
+        launch<MatmulPartialKernel>(p, chunks * rows * kPartials);
+    }
     const MatmulReduceKernel::Args r{out, out_stride, partial, rows};
     launch<MatmulReduceKernel>(r, static_cast<long>(ntok) * rows);
 }
