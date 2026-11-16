@@ -73,7 +73,7 @@ def main() -> int:
     ap.add_argument("--tol-emu", type=float, default=1e-5, help="cuda vs the host emulation")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--engine-seeds", type=int, default=3, help="seeds of the engine sweep (verify_engine.py --seeds)")
-    ap.add_argument("--matmul", default="auto", choices=["auto", "tile", "wide", "narrow"], help="the device's matmul kernel (GI_DEV_MATMUL)")
+    ap.add_argument("--matmul", default="tile", choices=["tile", "wide", "narrow"], help="the device's matmul kernel (GI_DEV_MATMUL)")
     args = ap.parse_args()
     os.environ["GI_DEV_MATMUL"] = args.matmul
     fwd = Path(args.build) / "gi_forward"
@@ -153,7 +153,7 @@ def main() -> int:
                     failures.append(f"[{label}] {' '.join(extra)}: logits differ from token by token (error {e:.2e})")
             # The tile and the wide matmul kernels give the same bits, token by token and in batches.
             ref_wide = forward(fwd, d, seq, [], {**dev, "GI_DEV_MATMUL": "wide"})[0]
-            for mm in ("tile", "auto"):
+            for mm in ("tile",):
                 for extra in ([], ["--prefill", "150", "--max-batch", "23"], ["--prefill", "64"]):
                     got = forward(fwd, d, seq, extra, {**dev, "GI_DEV_MATMUL": mm})[0]
                     counts["batching"] += 1
@@ -262,6 +262,19 @@ def main() -> int:
             default = np.fromfile(Path(t2) / "logits.f32", dtype="<f4") if pd.returncode == 0 else np.empty(0, dtype="<f4")
         if default.tobytes() != both["wide"].tobytes():
             failures.append("[matmul] the default matmul kernels do not give the bits of the wide one")
+        # GI_DEV_PARTIALS changes the order of the additions (other bits, same values); GI_DEV_TILE_ROWS changes nothing.
+        by_p = {pp: forward(fwd, d, [3, 1, 4, 1, 5, 9, 2, 6], ["--prefill", "5"], {**dev, "GI_DEV_MATMUL": "tile", "GI_DEV_PARTIALS": pp})[0]
+                for pp in ("8", "16", "32")}
+        counts["errors"] += 1
+        if any(v.size == 0 for v in by_p.values()) or len({v.tobytes() for v in by_p.values()}) != 3:
+            failures.append("[matmul] GI_DEV_PARTIALS 8, 16 and 32 do not give three different sets of bits")
+        elif max(err(by_p["8"], by_p["32"]), err(by_p["16"], by_p["32"])) >= args.tol_emu:
+            failures.append("[matmul] GI_DEV_PARTIALS changes the values")
+        rows8 = forward(fwd, d, [3, 1, 4, 1, 5, 9, 2, 6], ["--prefill", "5"], {**dev, "GI_DEV_MATMUL": "tile", "GI_DEV_PARTIALS": "16", "GI_DEV_TILE_ROWS": "8"})[0]
+        if rows8.tobytes() != by_p["16"].tobytes():
+            failures.append("[matmul] GI_DEV_TILE_ROWS=8 changes the bits")
+        expect_error("bad partial count", [], {**dev, "GI_DEV_PARTIALS": "12"}, "GI_DEV_PARTIALS")
+        expect_error("bad tile rows", [], {**dev, "GI_DEV_TILE_ROWS": "6"}, "GI_DEV_TILE_ROWS")
         tile = forward(fwd, d, [3, 1, 4, 1, 5, 9, 2, 6], ["--prefill", "8"], {**dev, "GI_DEV_MATMUL": "tile"})[0]
         if tile.tobytes() != both["wide"][-tile.size:].tobytes() or tile.size == 0:
             failures.append("[matmul] the tile kernel does not give the bits of the wide one")

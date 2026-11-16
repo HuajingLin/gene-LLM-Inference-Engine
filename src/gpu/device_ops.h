@@ -48,8 +48,8 @@ struct DeviceOps {
 
     // out[t * out_stride + r] = sum_c W[r, c] * x[t * x_stride + c] for t < ntok, r < rows. `partial` is scratch
     // for kPartials * ntok * rows floats. The value of every output element does not depend on ntok.
-    // Three kernels compute the partial sums, chosen by the environment variable GI_DEV_MATMUL: narrow, wide, tile,
-    // or auto (the default: tile for several tokens, wide for one); see device_kernels.inc. wide and tile give the
+    // Three kernels compute the partial sums, chosen by the environment variable GI_DEV_MATMUL: narrow, wide or tile
+    // (the default); see device_kernels.inc. wide and tile give the
     // same bits; narrow adds in another order, so its results differ in the last bits.
     void (*matmul)(float* out, long out_stride, const void* W, int bf16, const float* x, long x_stride, int ntok,
                    int rows, int cols, float* partial);

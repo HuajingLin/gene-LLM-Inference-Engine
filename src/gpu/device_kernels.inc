@@ -100,17 +100,20 @@ struct RmsnormScaleKernel {
 // one (token, row, s) is always the same chain of fused multiply-adds, whatever the number of tokens.
 struct MatmulPartialKernel {
     struct Args {
-        float* partial;   // [ntok, rows, kPartials]
+        float* partial;   // [ntok, rows, 1 << log2p]
         const void* W;
         const float* x;
         long x_stride;
         int bf16, ntok, rows, cols;
+        int log2p;        // the partial sums per output element are 2^log2p (8, 16 or 32)
     };
     static GI_DEV void body(long i, const Args& a) {
-        const int s = static_cast<int>(i % kPartials);
-        const long rest = i / kPartials;
-        const int r = static_cast<int>(rest % a.rows);
-        const int t0 = static_cast<int>(rest / a.rows) * kTokChunk;
+        const unsigned u = static_cast<unsigned>(i);   // 32-bit index math: 64-bit division is slow on a GPU
+        const int np = 1 << a.log2p;
+        const int s = static_cast<int>(u & static_cast<unsigned>(np - 1));
+        const unsigned rest = u >> a.log2p;
+        const int r = static_cast<int>(rest % static_cast<unsigned>(a.rows));
+        const int t0 = static_cast<int>(rest / static_cast<unsigned>(a.rows)) * kTokChunk;
         const int k = a.ntok - t0 < kTokChunk ? a.ntok - t0 : kTokChunk;
         float acc[kTokChunk];
         for (int t = 0; t < kTokChunk; ++t) acc[t] = 0.0f;
@@ -118,19 +121,19 @@ struct MatmulPartialKernel {
         const long row_off = static_cast<long>(r) * a.cols;
         if (a.bf16) {
             const unsigned short* w = static_cast<const unsigned short*>(a.W) + row_off;
-            for (int c = s; c < a.cols; c += kPartials) {
+            for (int c = s; c < a.cols; c += np) {
                 const float wv = gi_widen_bf16(w[c]);
                 for (int t = 0; t < k; ++t) acc[t] = fmaf(wv, x0[static_cast<long>(t) * a.x_stride + c], acc[t]);
             }
         } else {
             const float* w = static_cast<const float*>(a.W) + row_off;
-            for (int c = s; c < a.cols; c += kPartials) {
+            for (int c = s; c < a.cols; c += np) {
                 const float wv = w[c];
                 for (int t = 0; t < k; ++t) acc[t] = fmaf(wv, x0[static_cast<long>(t) * a.x_stride + c], acc[t]);
             }
         }
         for (int t = 0; t < k; ++t) {
-            a.partial[(static_cast<long>(t0 + t) * a.rows + r) * kPartials + s] = acc[t];
+            a.partial[(static_cast<long>(t0 + t) * a.rows + r) * np + s] = acc[t];
         }
     }
 };
@@ -146,10 +149,12 @@ struct alignas(16) GiWord4 {
 struct MatmulWideKernel {
     typedef MatmulPartialKernel::Args Args;
     static GI_DEV void body(long i, const Args& a) {
-        const int s = static_cast<int>(i % kPartials);
-        const long rest = i / kPartials;
-        const int r = static_cast<int>(rest % a.rows);
-        const int t0 = static_cast<int>(rest / a.rows) * kTokChunk;
+        const unsigned u = static_cast<unsigned>(i);   // 32-bit index math: 64-bit division is slow on a GPU
+        const int np = 1 << a.log2p;
+        const int s = static_cast<int>(u & static_cast<unsigned>(np - 1));
+        const unsigned rest = u >> a.log2p;
+        const int r = static_cast<int>(rest % static_cast<unsigned>(a.rows));
+        const int t0 = static_cast<int>(rest / static_cast<unsigned>(a.rows)) * kTokChunk;
         const int k = a.ntok - t0 < kTokChunk ? a.ntok - t0 : kTokChunk;
         float acc[kTokChunk];
         for (int t = 0; t < kTokChunk; ++t) acc[t] = 0.0f;
@@ -158,7 +163,7 @@ struct MatmulWideKernel {
         const int groups = a.cols / per_group;
         const long row_bytes = static_cast<long>(r) * a.cols * (a.bf16 ? 2 : 4);
         const GiWord4* w = reinterpret_cast<const GiWord4*>(static_cast<const char*>(a.W) + row_bytes);
-        for (int g = s; g < groups; g += kPartials) {
+        for (int g = s; g < groups; g += np) {
 #ifdef __CUDACC__
             const GiWord4 v = w[g];   // one aligned 16-byte load
 #else
@@ -184,18 +189,17 @@ struct MatmulWideKernel {
             }
         }
         for (int t = 0; t < k; ++t) {
-            a.partial[(static_cast<long>(t0 + t) * a.rows + r) * kPartials + s] = acc[t];
+            a.partial[(static_cast<long>(t0 + t) * a.rows + r) * np + s] = acc[t];
         }
     }
 };
 
-// The tile variant of step 1: index = (token chunk, group of kTileRows rows, s). One thread now holds a small tile of
+// The tile variant of step 1: index = (token chunk, group of R rows, s). One thread now holds a small tile of
 // the product in registers: per 16 bytes of columns it loads the activations of up to 8 tokens ONCE (16-byte loads)
-// and uses them for kTileRows weight rows, so there are a few loads per hundreds of multiply-adds instead of one
+// and uses them for R weight rows, so there are a few loads per hundreds of multiply-adds instead of one
 // load per multiply-add. Every (token, row, s) sum is the same chain of operations as in the wide kernel: the two
 // give the same bits. Requires, besides the wide kernel's condition, activations that start on a 16-byte boundary
 // with a row stride that is a multiple of 4 floats.
-constexpr int kTileRows = 4;
 
 static GI_DEV void gi_load4(const float* p, float* out) {
 #ifdef __CUDACC__
@@ -215,9 +219,11 @@ static GI_DEV void gi_load4(const float* p, float* out) {
 
 // nr rows (r0 ..), k tokens (t0 ..). Called with constant nr, k and bf16 for the common shapes, so that the loops
 // have fixed lengths there.
+template <int R>
 static GI_DEV void gi_tile_body(const MatmulPartialKernel::Args& a, int s, int r0, int nr, int t0, int k, int bf16) {
-    float acc[kTileRows][kTokChunk];
-    for (int rr = 0; rr < kTileRows; ++rr) {
+    const int np = 1 << a.log2p;
+    float acc[R][kTokChunk];
+    for (int rr = 0; rr < R; ++rr) {
         for (int t = 0; t < kTokChunk; ++t) acc[rr][t] = 0.0f;
     }
     const int per_group = bf16 ? 8 : 4;
@@ -225,7 +231,7 @@ static GI_DEV void gi_tile_body(const MatmulPartialKernel::Args& a, int s, int r
     const long row_bytes = static_cast<long>(a.cols) * (bf16 ? 2 : 4);
     const char* w0 = static_cast<const char*>(a.W) + static_cast<long>(r0) * row_bytes;
     const float* x0 = a.x + static_cast<long>(t0) * a.x_stride;
-    for (int g = s; g < groups; g += kPartials) {
+    for (int g = s; g < groups; g += np) {
         float xv[kTokChunk][8];
         for (int t = 0; t < k; ++t) {
             const float* xt = x0 + static_cast<long>(t) * a.x_stride + static_cast<long>(g) * per_group;
@@ -260,51 +266,55 @@ static GI_DEV void gi_tile_body(const MatmulPartialKernel::Args& a, int s, int r
     }
     for (int rr = 0; rr < nr; ++rr) {
         for (int t = 0; t < k; ++t) {
-            a.partial[(static_cast<long>(t0 + t) * a.rows + r0 + rr) * kPartials + s] = acc[rr][t];
+            a.partial[(static_cast<long>(t0 + t) * a.rows + r0 + rr) * np + s] = acc[rr][t];
         }
     }
 }
 
+template <int R>   // R: weight rows per thread (4 or 8)
 struct MatmulTileKernel {
     typedef MatmulPartialKernel::Args Args;
     static GI_DEV void body(long i, const Args& a) {
-        const int s = static_cast<int>(i % kPartials);
-        const long rest = i / kPartials;
-        const int row_groups = (a.rows + kTileRows - 1) / kTileRows;
-        const int r0 = static_cast<int>(rest % row_groups) * kTileRows;
+        const unsigned u = static_cast<unsigned>(i);
+        const int s = static_cast<int>(u & ((1u << a.log2p) - 1u));
+        const unsigned rest = u >> a.log2p;
+        const unsigned row_groups = static_cast<unsigned>((a.rows + R - 1) / R);
+        const int r0 = static_cast<int>(rest % row_groups) * R;
         const int t0 = static_cast<int>(rest / row_groups) * kTokChunk;
-        const int nr = a.rows - r0 < kTileRows ? a.rows - r0 : kTileRows;
+        const int nr = a.rows - r0 < R ? a.rows - r0 : R;
         const int k = a.ntok - t0 < kTokChunk ? a.ntok - t0 : kTokChunk;
         if (a.bf16) {
-            if (nr == kTileRows && k == kTokChunk) gi_tile_body(a, s, r0, kTileRows, t0, kTokChunk, 1);
-            else if (nr == kTileRows && k == 1) gi_tile_body(a, s, r0, kTileRows, t0, 1, 1);
-            else gi_tile_body(a, s, r0, nr, t0, k, 1);
+            if (nr == R && k == kTokChunk) gi_tile_body<R>(a, s, r0, R, t0, kTokChunk, 1);
+            else if (nr == R && k == 1) gi_tile_body<R>(a, s, r0, R, t0, 1, 1);
+            else gi_tile_body<R>(a, s, r0, nr, t0, k, 1);
         } else {
-            if (nr == kTileRows && k == kTokChunk) gi_tile_body(a, s, r0, kTileRows, t0, kTokChunk, 0);
-            else if (nr == kTileRows && k == 1) gi_tile_body(a, s, r0, kTileRows, t0, 1, 0);
-            else gi_tile_body(a, s, r0, nr, t0, k, 0);
+            if (nr == R && k == kTokChunk) gi_tile_body<R>(a, s, r0, R, t0, kTokChunk, 0);
+            else if (nr == R && k == 1) gi_tile_body<R>(a, s, r0, R, t0, 1, 0);
+            else gi_tile_body<R>(a, s, r0, nr, t0, k, 0);
         }
     }
 };
 
-// matmul, step 2: index = (token, row). Adds the 32 partial sums pairwise (16 + 16, 8 + 8, ...).
+// matmul, step 2: index = (token, row). Adds the partial sums pairwise (for 32: 16 + 16, 8 + 8, ...).
 struct MatmulReduceKernel {
     struct Args {
         float* out;
         long out_stride;
         const float* partial;
-        int rows;
+        int rows, log2p;
     };
     static GI_DEV void body(long j, const Args& a) {
-        const long t = j / a.rows;
-        const long r = j % a.rows;
-        const float* p = a.partial + j * kPartials;
+        const unsigned u = static_cast<unsigned>(j);
+        const unsigned t = u / static_cast<unsigned>(a.rows);
+        const unsigned r = u % static_cast<unsigned>(a.rows);
+        const int np = 1 << a.log2p;
+        const float* p = a.partial + (j << a.log2p);
         float v[kPartials];
-        for (int q = 0; q < kPartials; ++q) v[q] = p[q];
-        for (int width = kPartials / 2; width >= 1; width /= 2) {
+        for (int q = 0; q < np; ++q) v[q] = p[q];
+        for (int width = np / 2; width >= 1; width /= 2) {
             for (int q = 0; q < width; ++q) v[q] = v[q] + v[q + width];
         }
-        a.out[t * a.out_stride + r] = v[0];
+        a.out[static_cast<long>(t) * a.out_stride + r] = v[0];
     }
 };
 
@@ -464,20 +474,19 @@ struct SiluMulKernel {
 // GI_DEV_MATMUL picks the kernel of the partial sums:
 //   narrow  one weight per step
 //   wide    16 bytes of weights per step (falls back to narrow when the column count does not allow it)
-//   tile    wide, with 4 rows x up to 8 tokens per thread (falls back to wide when the activations are not aligned)
-//   auto    (default) tile for several tokens, wide for one
-// wide and tile give the same bits; narrow adds in another order. Measured on a Tesla T4 with Llama-3.2-1B: wide
-// decodes about 1.5 times as fast as narrow.
-enum GiMatmulMode { kMatmulNarrow, kMatmulWide, kMatmulTile, kMatmulAuto };
+//   tile    (default) wide, with 4 rows x up to 8 tokens per thread (falls back to wide when the activations are
+//           not aligned)
+// wide and tile give the same bits; narrow adds in another order. Measured on a Tesla T4 with Llama-3.2-1B
+// (bfloat16): single-sequence decode 32 tok/s narrow, 59 wide, 78 tile; 32 concurrent requests 33 tok/s wide, 137 tile.
+enum GiMatmulMode { kMatmulNarrow, kMatmulWide, kMatmulTile };
 
 static GiMatmulMode gi_matmul_mode() {
     static const GiMatmulMode mode = [] {
         const char* v = getenv("GI_DEV_MATMUL");
-        if (!v || !*v || strcmp(v, "auto") == 0) return kMatmulAuto;
-        if (strcmp(v, "tile") == 0) return kMatmulTile;
+        if (!v || !*v || strcmp(v, "tile") == 0) return kMatmulTile;
         if (strcmp(v, "wide") == 0) return kMatmulWide;
         if (strcmp(v, "narrow") == 0) return kMatmulNarrow;
-        throw std::runtime_error(std::string("GI_DEV_MATMUL must be auto, tile, wide or narrow, got ") + v);
+        throw std::runtime_error(std::string("GI_DEV_MATMUL must be tile, wide or narrow, got ") + v);
     }();
     return mode;
 }
@@ -494,22 +503,53 @@ static void op_rmsnorm(float* out, const float* x, const float* weight, int nvec
     launch<RmsnormScaleKernel>(a, static_cast<long>(nvec) * size);
 }
 
+// Two tuning knobs of matmul, read once from the environment:
+//   GI_DEV_PARTIALS   8, 16 or 32 (default): partial sums, that is threads, per output element. Fewer partial sums
+//                     mean fewer threads that each run longer. Changes the order of the additions (last bits).
+//   GI_DEV_TILE_ROWS  4 (default) or 8: weight rows per thread of the tile kernel. Does not change any result.
+static int gi_env_choice(const char* name, int fallback, int a, int b, int c) {
+    const char* v = getenv(name);
+    if (!v || !*v) return fallback;
+    const int n = atoi(v);
+    if (n != a && n != b && n != c) {
+        throw std::runtime_error(std::string(name) + " must be " + std::to_string(a) + (b != a ? ", " + std::to_string(b) : std::string()) +
+                                 " or " + std::to_string(c) + ", got " + v);
+    }
+    return n;
+}
+
+static int gi_matmul_log2p() {
+    static const int log2p = [] {
+        const int p = gi_env_choice("GI_DEV_PARTIALS", 32, 8, 16, 32);
+        return p == 8 ? 3 : p == 16 ? 4 : 5;
+    }();
+    return log2p;
+}
+
+static int gi_tile_rows() {
+    static const int rows = gi_env_choice("GI_DEV_TILE_ROWS", 4, 4, 4, 8);
+    return rows;
+}
+
 static void op_matmul(float* out, long out_stride, const void* W, int bf16, const float* x, long x_stride, int ntok,
                       int rows, int cols, float* partial) {
-    const MatmulPartialKernel::Args p{partial, W, x, x_stride, bf16, ntok, rows, cols};
+    const int log2p = gi_matmul_log2p();
+    const long np = 1L << log2p;
+    const MatmulPartialKernel::Args p{partial, W, x, x_stride, bf16, ntok, rows, cols, log2p};
     const long chunks = (ntok + kTokChunk - 1) / kTokChunk;
+    if (chunks * rows * np >= 2147483647L) throw std::runtime_error("device matmul: too many threads for one launch");
     const GiMatmulMode mode = gi_matmul_mode();
     const bool wide_ok = mode != kMatmulNarrow && cols % (bf16 ? 8 : 4) == 0;
     const bool tile_ok = wide_ok && x_stride % 4 == 0 && reinterpret_cast<std::uintptr_t>(x) % 16 == 0;
-    if (tile_ok && (mode == kMatmulTile || (mode == kMatmulAuto && ntok > 1))) {
-        const long row_groups = (rows + kTileRows - 1) / kTileRows;
-        launch<MatmulTileKernel>(p, chunks * row_groups * kPartials);
+    if (tile_ok && mode == kMatmulTile) {
+        if (gi_tile_rows() == 8) launch<MatmulTileKernel<8> >(p, chunks * ((rows + 7) / 8) * np);
+        else launch<MatmulTileKernel<4> >(p, chunks * ((rows + 3) / 4) * np);
     } else if (wide_ok) {
-        launch<MatmulWideKernel>(p, chunks * rows * kPartials);
+        launch<MatmulWideKernel>(p, chunks * rows * np);
     } else {
-        launch<MatmulPartialKernel>(p, chunks * rows * kPartials);
+        launch<MatmulPartialKernel>(p, chunks * rows * np);
     }
-    const MatmulReduceKernel::Args r{out, out_stride, partial, rows};
+    const MatmulReduceKernel::Args r{out, out_stride, partial, rows, log2p};
     launch<MatmulReduceKernel>(r, static_cast<long>(ntok) * rows);
 }
 
