@@ -13,8 +13,11 @@ The device kernels are one source (src/gpu/device_kernels.inc) compiled twice: f
                   On a GPU all indices run at once, so a kernel whose result depends on their order is wrong.
   3. batching     prefill in batches of many sizes (around the kernel's 8-token chunks and the batch limit), on
                   top of an existing cache or not: bit-identical to feeding the tokens one by one
-  3b. paging      the KV cache is a block pool on the device: any block size gives the same bits; several sequences
-                  interleaved on one pool, shared prefix blocks with copy-on-write, and an exhausted pool (gi_multiseq)
+  3b. paging      the KV cache is a block pool on the device: any block size gives the same bits
+  3c. sequences   verify_multiseq.py on the device: sequences interleaved on one pool, rows of several sequences in
+                  one pass (forward_rows), shared prefix blocks with copy-on-write, exhausted pools
+  3d. engine      verify_engine.py on the device: continuous batching with preemption and the prefix cache; every
+                  request equals generate() alone; gi_serve_bench outputs identical at every concurrency
   4. restart      a new sequence after an old one (stale keys and values in the cache): bit-identical
   5. generation   greedy text from gi_generate equals the CPU's
   6. errors       unknown device, int8 weights, a position gap, a token id out of range
@@ -69,6 +72,7 @@ def main() -> int:
     ap.add_argument("--tol", type=float, default=1e-4, help="device vs NumPy and vs the CPU model")
     ap.add_argument("--tol-emu", type=float, default=1e-5, help="cuda vs the host emulation")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--engine-seeds", type=int, default=3, help="seeds of the engine sweep (verify_engine.py --seeds)")
     ap.add_argument("--matmul", default="wide", choices=["narrow", "wide"], help="the device's matmul kernel (GI_DEV_MATMUL)")
     args = ap.parse_args()
     os.environ["GI_DEV_MATMUL"] = args.matmul
@@ -78,7 +82,7 @@ def main() -> int:
     multiseq = Path(args.build) / "gi_multiseq"
     dev = {"GI_DEVICE": args.device}
     failures: list[str] = []
-    counts = {"operations": 0, "reference": 0, "order": 0, "batching": 0, "paging": 0, "restart": 0, "generation": 0, "errors": 0, "cuda-vs-emu": 0}
+    counts = {"operations": 0, "reference": 0, "order": 0, "batching": 0, "paging": 0, "sequences": 0, "engine": 0, "restart": 0, "generation": 0, "errors": 0, "cuda-vs-emu": 0}
 
     with tempfile.TemporaryDirectory() as tmp_s:
         tmp = Path(tmp_s)
@@ -157,20 +161,6 @@ def main() -> int:
                         failures.append(f"[{label}] block size {bsize} {' '.join(extra)}: {stderr.strip()}")
                     elif got.tobytes() != base[first:].tobytes():
                         failures.append(f"[{label}] block size {bsize} {' '.join(extra)}: logits differ from block size 16")
-            # Several sequences on one pool (gi_multiseq): interleaved steps, batches and rewinds, shared prefixes with
-            # copy-on-write, and a pool that runs out; every logits row bit-identical to the sequence running alone.
-            ctx = 40
-            for bsize in (1, 3, 4, 16, 64):
-                per = (ctx + bsize - 1) // bsize
-                runs = [(["--kv-blocks", str(3 * per + 3), "--seed", str(s)], "interleave") for s in (1, 2)]
-                runs += [(["--kv-blocks", str(6 * per + 6), "--seed", str(s), "--mode", "cow"], "cow") for s in (1, 2, 3)]
-                runs += [(["--kv-blocks", str(nb), "--seed", "7", "--mode", "exhaust"], "exhaust") for nb in (1, 2, 5) if nb * bsize <= ctx]
-                for extra, what in runs:
-                    p = subprocess.run([str(multiseq), str(d), "--max-seq-len", str(ctx), "--block-size", str(bsize), "--device", args.device, *extra],
-                                       capture_output=True, text=True)
-                    counts["paging"] += 1
-                    if p.returncode != 0 or not p.stdout.rstrip().endswith("PASS"):
-                        failures.append(f"[{label}] gi_multiseq {what} block size {bsize} {' '.join(extra)}: {(p.stdout + p.stderr).strip()[-200:]}")
             for extra in ([], ["--prefill", "150"], ["--prefill", "20", "--max-batch", "6"]):
                 got, stderr, code = forward(fwd, d, seq, ["--decoy", *extra], dev)
                 counts["restart"] += 1
@@ -206,6 +196,17 @@ def main() -> int:
                 counts["operations"] += 1
                 if p.returncode != 0:
                     failures.append(f"[operations] gi_device_check with kernel indices in {order} order failed")
+
+        # 3c, 3d: the multi-sequence and engine suites on the device
+        for script, extra, key in (("verify_multiseq.py", [], "sequences"), ("verify_engine.py", ["--seeds", str(args.engine_seeds)], "engine")):
+            p = subprocess.run([sys.executable, str(HERE / script), "--build", args.build, "--device", args.device, *extra],
+                               capture_output=True, text=True)
+            last = (p.stdout.strip().splitlines() or [""])[-1]
+            if p.returncode != 0 or not last.startswith("PASS"):
+                failures.append(f"[{key}] {script} --device {args.device}: {(p.stdout + p.stderr).strip()[-400:]}")
+            else:
+                counts[key] += int(last.split(",")[1].split()[0]) if key == "sequences" else int(last.split("(")[1].split()[0])
+                print(f"{key}: {last}")
 
         # 6: errors
         d = tmp / "suite_01"   # bf16, tied

@@ -17,7 +17,7 @@ struct Engine::Job {
     EngineResult result;
 };
 
-Engine::Engine(Transformer& model, const TextTokenizer& tokenizer, const EngineConfig& config)
+Engine::Engine(SequenceModel& model, const TextTokenizer& tokenizer, const EngineConfig& config)
     : model_(model), tokenizer_(tokenizer), cfg_(config) {
     if (cfg_.max_running < 1) throw std::invalid_argument("Engine: max_running must be >= 1");
     if (cfg_.step_rows < 0 || cfg_.prefill_chunk < 0) throw std::invalid_argument("Engine: step_rows and prefill_chunk must be >= 0");
@@ -122,7 +122,7 @@ bool Engine::step() {
     const int bs = model_.kv_pool().block_size();
     for (;;) {
         // ---- build the pass: generating requests first (one row each), then prompt chunks, oldest first ----
-        std::vector<Transformer::StepRow> rows;
+        std::vector<SequenceModel::StepRow> rows;
         std::vector<int> job_rows(running_.size(), 0);
         std::vector<int> job_logit(running_.size(), -1);   // index of the job's row among the rows that return logits
         int logit_rows = 0;

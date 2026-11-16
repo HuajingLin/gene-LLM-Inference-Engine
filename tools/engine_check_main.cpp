@@ -21,6 +21,7 @@
 #include <string>
 #include <vector>
 
+#include "gpu/gpu_transformer.h"
 #include "model/transformer.h"
 #include "runtime/engine.h"
 #include "runtime/generator.h"
@@ -60,6 +61,7 @@ int main(int argc, char** argv) {
     }
     try {
         int ctx = 0, bs = 0, nblocks = 0, nreq = 6, max_running = 4, step_rows = 0, chunk = 0;
+        std::string device = "cpu";
         unsigned seed = 1;
         bool staggered = false, oversize = false, wide = false, prefix_cache = true;
         int shared_prefix = 0;
@@ -83,7 +85,8 @@ int main(int argc, char** argv) {
             }
             if (i + 1 >= argc) throw std::runtime_error(a + " needs a value");
             const std::string v = argv[++i];
-            if (a == "--max-seq-len") ctx = std::stoi(v);
+            if (a == "--device") device = v;
+            else if (a == "--max-seq-len") ctx = std::stoi(v);
             else if (a == "--block-size") bs = std::stoi(v);
             else if (a == "--kv-blocks") nblocks = std::stoi(v);
             else if (a == "--seed") seed = static_cast<unsigned>(std::stoul(v));
@@ -96,8 +99,16 @@ int main(int argc, char** argv) {
         }
         const Checkpoint ck = Checkpoint::load(argv[1]);
         const auto tok = std::make_unique<WideTokenizer>(load_hf_tokenizer(argv[1], false), wide);
-        Transformer ref_model(ck, ctx);                       // roomy pool: one full context
-        Transformer model(ck, ctx, 0, 0, bs, nblocks);        // the pool under test
+        std::unique_ptr<SequenceModel> ref_ptr, model_ptr;   // a roomy pool (one full context) and the pool under test
+        if (device == "cpu") {
+            ref_ptr = std::make_unique<Transformer>(ck, ctx);
+            model_ptr = std::make_unique<Transformer>(ck, ctx, 0, 0, bs, nblocks);
+        } else {
+            ref_ptr = std::make_unique<GpuTransformer>(ck, gpu::device_by_name(device), ctx);
+            model_ptr = std::make_unique<GpuTransformer>(ck, gpu::device_by_name(device), ctx, 0, bs, nblocks);
+        }
+        SequenceModel& ref_model = *ref_ptr;
+        SequenceModel& model = *model_ptr;
         const int vocab = model.config().vocab_size;
         std::mt19937 rng(seed);
 

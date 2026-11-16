@@ -1,6 +1,6 @@
 // engine.h - serving several requests at once on one model: request queue, scheduler, continuous batching.
 //
-// Every step() builds ONE forward pass (Transformer::forward_rows) out of rows of the running requests: a request that
+// Every step() builds ONE forward pass (SequenceModel::forward_rows) out of rows of the running requests: a request that
 // is generating contributes one row (its last token), a request that is still reading its prompt contributes a chunk
 // of prompt tokens. Requests join and leave between steps, so the batch never waits for its slowest member. All
 // weights are read once per pass for all rows, which is what makes decoding several requests cheaper per token.
@@ -22,7 +22,7 @@
 #include <vector>
 
 #include "model/prefix_cache.h"
-#include "model/transformer.h"
+#include "model/model.h"
 #include "sampler/sampler.h"
 #include "tokenizer/text_tokenizer.h"
 
@@ -72,7 +72,7 @@ struct EngineStats {
 
 class Engine {
 public:
-    Engine(Transformer& model, const TextTokenizer& tokenizer, const EngineConfig& config = {});
+    Engine(SequenceModel& model, const TextTokenizer& tokenizer, const EngineConfig& config = {});
     ~Engine();
 
     // Queues a request and returns its id (0, 1, 2 ...). Throws std::invalid_argument for an empty prompt, a prompt
@@ -100,7 +100,7 @@ private:
     void finish(Job& job, const std::string& error);
     void cache_new_blocks(Job& job);
 
-    Transformer& model_;
+    SequenceModel& model_;
     const TextTokenizer& tokenizer_;
     EngineConfig cfg_;
     std::vector<std::unique_ptr<Job>> jobs_;   // by id

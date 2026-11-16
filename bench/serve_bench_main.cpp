@@ -2,6 +2,7 @@
 //
 //   gi_serve_bench --model DIR_OR_FILE [--concurrency 1,2,4,8] [--prompt-tokens 16] [--decode-tokens 64]
 //                  [--runs 3] [--max-seq-len N] [--threads N] [--weights native|f32|int8] [--block-size B]
+//                  [--device cpu|cuda|emu]   (default: the environment variable GI_DEVICE, else cpu)
 //                  [--shared-prefix N] [--warm-cache] [--no-prefix-cache]
 //
 // For every concurrency level C the same C synthetic requests (random prompt tokens, greedy sampling, no end token,
@@ -26,6 +27,7 @@
 #include <vector>
 
 #include "loader/checkpoint.h"
+#include "gpu/gpu_transformer.h"
 #include "model/transformer.h"
 #include "runtime/engine.h"
 #include "tokenizer/text_tokenizer.h"
@@ -53,8 +55,14 @@ private:
     std::fprintf(stderr, "gi_serve_bench: %s\n", msg.c_str());
     std::fprintf(stderr,
                  "usage: gi_serve_bench --model M [--concurrency 1,2,4,8] [--prompt-tokens N] [--decode-tokens N] [--runs N]\n"
-                 "                      [--max-seq-len N] [--threads N] [--weights native|f32|int8] [--block-size B]\n");
+                 "                      [--max-seq-len N] [--threads N] [--weights native|f32|int8] [--block-size B]\n"
+                 "                      [--device cpu|cuda|emu] [--shared-prefix N] [--warm-cache] [--no-prefix-cache]\n");
     std::exit(2);
+}
+
+int n_threads_used(SequenceModel& model) {
+    const Transformer* cpu = dynamic_cast<const Transformer*>(&model);
+    return cpu ? cpu->threads() : 0;
 }
 
 double median(std::vector<double> v) {
@@ -65,7 +73,7 @@ double median(std::vector<double> v) {
 }  // namespace
 
 int main(int argc, char** argv) {
-    std::string model_path, weights_arg, conc_arg = "1,2,4,8";
+    std::string model_path, weights_arg, conc_arg = "1,2,4,8", device;
     int prompt_tokens = 16, decode_tokens = 64, runs = 3, max_seq_len = 0, n_threads = 0, block_size = 0, shared_prefix = 0;
     bool warm_cache = false, prefix_cache = true;
     for (int i = 1; i < argc; ++i) {
@@ -86,9 +94,14 @@ int main(int argc, char** argv) {
         else if (f == "--threads") n_threads = std::atoi(value().c_str());
         else if (f == "--weights") weights_arg = value();
         else if (f == "--block-size") block_size = std::atoi(value().c_str());
+        else if (f == "--device") device = value();
         else usage_error("unknown option " + f);
     }
     if (model_path.empty()) usage_error("--model is required");
+    if (device.empty()) {
+        const char* env = std::getenv("GI_DEVICE");
+        device = (env && *env) ? env : "cpu";
+    }
     if (prompt_tokens < 1 || decode_tokens < 1 || runs < 1) usage_error("--prompt-tokens, --decode-tokens and --runs must be >= 1");
     std::vector<int> levels;
     {
@@ -118,7 +131,10 @@ int main(int argc, char** argv) {
         if (max_seq_len < total) usage_error("--max-seq-len is shorter than prompt + decode tokens");
         const int bs = block_size > 0 ? block_size : 16;
         const int per_request = (total + bs - 1) / bs;
-        Transformer model(ck, max_seq_len, n_threads, 0, bs, cmax * per_request + 1);
+        std::unique_ptr<SequenceModel> model_ptr;
+        if (device == "cpu") model_ptr = std::make_unique<Transformer>(ck, max_seq_len, n_threads, 0, bs, cmax * per_request + 1);
+        else model_ptr = std::make_unique<GpuTransformer>(ck, gpu::device_by_name(device), max_seq_len, 0, bs, cmax * per_request + 1);
+        SequenceModel& model = *model_ptr;
         NullTokenizer tok(vocab);
 
         std::mt19937 rng(7);
@@ -132,8 +148,8 @@ int main(int argc, char** argv) {
             r.sampler.temperature = 0.0f;
         }
 
-        std::printf("model: %s | %d threads | prompt %d + decode %d tokens per request | block size %d | max rows per pass %d\n",
-                    model_path.c_str(), model.threads(), prompt_tokens, decode_tokens, bs, model.max_batch());
+        std::printf("model: %s | %s | prompt %d + decode %d tokens per request | block size %d | max rows per pass %d\n",
+                    model_path.c_str(), device == "cpu" ? (std::to_string(n_threads_used(model)) + " threads").c_str() : model.description().c_str(), prompt_tokens, decode_tokens, bs, model.max_batch());
         std::printf("%-11s %-10s %-12s %-14s %-12s %-10s %-14s %s\n", "concurrent", "wall (s)", "tokens/s", "tok/s/request", "rows/pass", "speedup", "cached pos.", "outputs");
 
         std::vector<std::vector<int>> baseline(static_cast<std::size_t>(cmax));   // from the C = 1 style run, per request

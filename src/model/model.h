@@ -59,6 +59,21 @@ public:
     // If the pool has no free block left, std::runtime_error is thrown and the sequence is unchanged.
     virtual const float* forward(Sequence& seq, int token, int pos, bool compute_logits = true) = 0;
     virtual const float* forward_batch(Sequence& seq, const int* tokens, int n, int pos0, bool compute_logits = true) = 0;
+
+    // One forward pass over rows that belong to different sequences (continuous batching). Every row is one token of
+    // one sequence; a sequence may own several consecutive rows (a prefill chunk). A row is processed at position
+    // seq->length() + (number of earlier rows of the same sequence), so the rows of a sequence must be listed in order.
+    // Afterwards every sequence has grown by its number of rows. Returns the logits of the rows with want_logits, one
+    // vocab_size row each in row order (valid until the next call), or nullptr if no row asks for logits. Every
+    // row gets the values it would get with its sequence running alone. 1 <= n <= max_batch(). If the pool cannot
+    // hold all new positions, std::runtime_error is thrown and no sequence has changed.
+    struct StepRow {
+        Sequence* seq;
+        int token;
+        bool want_logits;
+    };
+    virtual const float* forward_rows(const StepRow* rows, int n) = 0;
+    virtual int max_batch() const = 0;   // the most rows of one pass
 };
 
 // device: "cpu" (or empty), "cuda", "emu" (host emulation of the device kernels, for tests). An empty name means

@@ -2,7 +2,6 @@
 //
 //   gi_multiseq <model> --max-seq-len N [--block-size B] [--kv-blocks K] [--seed S] [--mode interleave|rows|cow|exhaust|rows_exhaust] [--device cpu|cuda|emu]
 //
-// On a device (--device cuda or emu) the modes interleave, cow and exhaust run; rows and rows_exhaust need the CPU.
 // interleave: three sequences (random token streams) are run alone to get reference logits, then run again in a
 //   random interleaving of single-token steps and small batches on one shared pool, with random rewinds
 //   (re-running earlier positions). Every logits row must be bit-identical to the reference.
@@ -110,7 +109,7 @@ void interleave(SequenceModel& m, std::mt19937& rng, int vocab, int ctx) {
     std::printf("ok interleave: %d single steps, %d batches, %d rewinds\n", steps, batches, rewinds);
 }
 
-void rows_mode(Transformer& m, std::mt19937& rng, int vocab, int ctx) {
+void rows_mode(SequenceModel& m, std::mt19937& rng, int vocab, int ctx) {
     const int nseq = 4;
     std::vector<std::vector<int>> toks;
     std::vector<std::vector<std::vector<float>>> ref;
@@ -123,7 +122,7 @@ void rows_mode(Transformer& m, std::mt19937& rng, int vocab, int ctx) {
     std::vector<int> done(nseq, 0);
     int passes = 0, rows_total = 0, checked = 0;
     for (;;) {
-        std::vector<Transformer::StepRow> rows;
+        std::vector<SequenceModel::StepRow> rows;
         std::vector<std::pair<int, int>> origin;   // sequence, position of each row
         std::vector<int> take(nseq, 0);
         // visit the sequences in random order; each contributes 0 .. 6 consecutive rows
@@ -171,7 +170,7 @@ void rows_mode(Transformer& m, std::mt19937& rng, int vocab, int ctx) {
         const std::vector<int> t = random_tokens(rng, ctx, vocab);
         m.forward_batch(full, t.data(), ctx - 1, 0, false);
         Sequence other = m.new_sequence();
-        const Transformer::StepRow two[2] = {{&full, t[0], true}, {&full, t[1], true}};
+        const SequenceModel::StepRow two[2] = {{&full, t[0], true}, {&full, t[1], true}};
         bool threw = false;
         try {
             m.forward_rows(two, 2);
@@ -179,19 +178,19 @@ void rows_mode(Transformer& m, std::mt19937& rng, int vocab, int ctx) {
             threw = true;
         }
         expect(threw && full.length() == ctx - 1, "a pass running past the context was not refused cleanly");
-        const Transformer::StepRow last[2] = {{&full, t[ctx - 1], true}, {&other, t[0], true}};
+        const SequenceModel::StepRow last[2] = {{&full, t[ctx - 1], true}, {&other, t[0], true}};
         const float* l = m.forward_rows(last, 2);   // exactly the last position: allowed
         expect(l != nullptr && full.length() == ctx && other.length() == 1, "the last position of the context was refused");
         expect(same(l, run_alone(m, t, vocab)[static_cast<std::size_t>(ctx - 1)]), "logits at the last position differ");
         threw = false;
         try {
-            const Transformer::StepRow one = {&full, t[0], true};
+            const SequenceModel::StepRow one = {&full, t[0], true};
             m.forward_rows(&one, 1);
         } catch (const std::out_of_range&) {
             threw = true;
         }
         expect(threw, "a row beyond the last position was accepted");
-        const Transformer::StepRow bad = {&other, vocab, true};
+        const SequenceModel::StepRow bad = {&other, vocab, true};
         threw = false;
         try {
             m.forward_rows(&bad, 1);
@@ -200,7 +199,7 @@ void rows_mode(Transformer& m, std::mt19937& rng, int vocab, int ctx) {
         }
         expect(threw && other.length() == 1, "a token id outside the vocabulary was accepted");
         {
-            std::vector<Transformer::StepRow> many(static_cast<std::size_t>(m.max_batch()) + 1, Transformer::StepRow{&other, t[0], false});
+            std::vector<SequenceModel::StepRow> many(static_cast<std::size_t>(m.max_batch()) + 1, SequenceModel::StepRow{&other, t[0], false});
             threw = false;
             try {
                 m.forward_rows(many.data(), static_cast<int>(many.size()));
@@ -220,7 +219,7 @@ void rows_mode(Transformer& m, std::mt19937& rng, int vocab, int ctx) {
     std::printf("ok rows: %d passes, %d rows, %d logits rows checked\n", passes, rows_total, checked);
 }
 
-void rows_exhaust(Transformer& m, std::mt19937& rng, int vocab) {
+void rows_exhaust(SequenceModel& m, std::mt19937& rng, int vocab) {
     KvPool& pool = m.kv_pool();
     const int bs = pool.block_size();
     Sequence a = m.new_sequence();
@@ -235,7 +234,7 @@ void rows_exhaust(Transformer& m, std::mt19937& rng, int vocab) {
     for (int i = 0; i < fill; ++i) m.forward(a, t[static_cast<std::size_t>(i)], i, false);
     expect(pool.free_blocks() == 1, "setup: expected one free block");
     // a pass that needs two new blocks (one for a, one for b, but a also crosses into a second): a gets bs rows, b gets 1
-    std::vector<Transformer::StepRow> rows;
+    std::vector<SequenceModel::StepRow> rows;
     for (int i = 0; i < bs + 1; ++i) rows.push_back({&a, t[static_cast<std::size_t>(fill + i)], false});
     rows.push_back({&b, t[0], true});
     if (static_cast<int>(rows.size()) > m.max_batch()) return;   // not testable with this batch size
@@ -252,7 +251,7 @@ void rows_exhaust(Transformer& m, std::mt19937& rng, int vocab) {
            "a refused forward_rows kept blocks reserved");
     // a smaller pass still works afterwards and matches the reference
     const auto refb = run_alone(m, {t[0]}, vocab);
-    const Transformer::StepRow one = {&b, t[0], true};
+    const SequenceModel::StepRow one = {&b, t[0], true};
     const float* l = m.forward_rows(&one, 1);
     expect(l != nullptr && same(l, refb[0]), "forward_rows after a refused pass gives wrong logits");
     std::printf("ok rows_exhaust: refused cleanly, state unchanged, still usable\n");
@@ -293,16 +292,11 @@ void cow_mode(SequenceModel& m, std::mt19937& rng, int vocab, int ctx) {
         } else if (variant == 1) {
             const float* l = m.forward_batch(sb, b.data() + m_rewind, static_cast<int>(b.size()) - m_rewind, m_rewind, true);
             expect(same(l, ref_b.back()), "B (forward_batch) differs from its reference after copy-on-write");
-        } else if (Transformer* cpu = dynamic_cast<Transformer*>(&m)) {
-            std::vector<Transformer::StepRow> rows;
+        } else {
+            std::vector<SequenceModel::StepRow> rows;
             for (std::size_t i = static_cast<std::size_t>(m_rewind); i < b.size(); ++i) rows.push_back({&sb, b[i], i + 1 == b.size()});
-            const float* l = cpu->forward_rows(rows.data(), static_cast<int>(rows.size()));
+            const float* l = m.forward_rows(rows.data(), static_cast<int>(rows.size()));
             expect(l != nullptr && same(l, ref_b.back()), "B (forward_rows) differs from its reference after copy-on-write");
-        } else {   // a device model has no forward_rows yet: single steps and one batch mixed
-            const std::size_t split = static_cast<std::size_t>(m_rewind) + 2;
-            for (std::size_t i = static_cast<std::size_t>(m_rewind); i < split; ++i) m.forward(sb, b[i], static_cast<int>(i), false);
-            const float* l = m.forward_batch(sb, b.data() + split, static_cast<int>(b.size() - split), static_cast<int>(split), true);
-            expect(same(l, ref_b.back()), "B (steps + batch) differs from its reference after copy-on-write");
         }
         expect(sb.block_table()[(m_rewind) / bs] != sa.block_table()[m_rewind / bs], "B still shares the block it wrote into");
         // A goes on and must not have seen B's writes
@@ -399,13 +393,11 @@ int main(int argc, char** argv) {
         if (device == "cpu") model = std::make_unique<Transformer>(ck, ctx, 0, 0, bs, nblocks);
         else model = std::make_unique<GpuTransformer>(ck, gpu::device_by_name(device), ctx, 0, bs, nblocks);
         SequenceModel& m = *model;
-        Transformer* cpu = dynamic_cast<Transformer*>(model.get());
-        if (!cpu && (mode == "rows" || mode == "rows_exhaust")) throw std::runtime_error("mode " + mode + " needs --device cpu");
         std::mt19937 rng(seed);
         const int vocab = m.config().vocab_size;
         if (mode == "interleave") interleave(m, rng, vocab, m.max_seq_len());
-        else if (mode == "rows") rows_mode(*cpu, rng, vocab, m.max_seq_len());
-        else if (mode == "rows_exhaust") rows_exhaust(*cpu, rng, vocab);
+        else if (mode == "rows") rows_mode(m, rng, vocab, m.max_seq_len());
+        else if (mode == "rows_exhaust") rows_exhaust(m, rng, vocab);
         else if (mode == "cow") cow_mode(m, rng, vocab, m.max_seq_len());
         else if (mode == "exhaust") exhaust(m, rng, vocab);
         else throw std::runtime_error("unknown mode " + mode);

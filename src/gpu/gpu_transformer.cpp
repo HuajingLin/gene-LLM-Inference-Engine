@@ -109,9 +109,12 @@ GpuTransformer::GpuTransformer(const Checkpoint& checkpoint, const gpu::DeviceOp
         q_ = dalloc_floats(batch * attn);
         ao_ = dalloc_floats(batch * attn);
         logits_dev_ = dalloc_floats(vocab);
-        // matmul scratch: the widest product of a batch, or the classifier for one row.
+        rlogits_dev_ = dalloc_floats(batch * vocab);
+        wanted_rows_.resize(batch);
+        // matmul scratch: the widest product of a batch, or the classifier for one group of rows (the classifier of
+        // many rows runs in groups of kTokensPerPass, so that its scratch stays small).
         const std::size_t widest = std::max(std::max(hidden, attn), std::max(dim, kv));
-        partial_ = dalloc_floats(sz(gpu::kPartials) * std::max(batch * widest, vocab));
+        partial_ = dalloc_floats(sz(gpu::kPartials) * std::max(batch * widest, std::min(batch, sz(gpu::kTokensPerPass)) * vocab));
         scores_ = dalloc_floats(batch * sz(cfg_.n_heads) * sz(ctx_len_));   // attention scores of one batch
         cos_dev_ = dalloc_floats(batch * (head / 2));
         sin_dev_ = dalloc_floats(batch * (head / 2));
@@ -287,9 +290,47 @@ const float* GpuTransformer::forward_batch(Sequence& seq, const int* tokens, int
     return compute_logits ? logits_.data() : nullptr;
 }
 
+const float* GpuTransformer::forward_rows(const StepRow* rows, int n) {
+    if (n < 1 || n > max_batch_) {
+        throw std::invalid_argument("forward_rows: " + std::to_string(n) + " rows, expected 1 .. " + std::to_string(max_batch_));
+    }
+    std::vector<int> tokens(sz(n));
+    std::vector<unsigned char> want(sz(n));
+    int k = 0;
+    for (int i = 0; i < n; ++i) {
+        const StepRow& r = rows[i];
+        if (r.seq == nullptr || &r.seq->pool() != kv_.get()) throw std::invalid_argument("forward_rows: bad or foreign sequence");
+        if (r.token < 0 || r.token >= cfg_.vocab_size) {
+            throw std::out_of_range("forward_rows: token id " + std::to_string(r.token) + " out of range");
+        }
+        int pos = r.seq->length();
+        for (int j = 0; j < i; ++j) pos += (rows[j].seq == r.seq) ? 1 : 0;
+        if (pos >= ctx_len_) {
+            throw std::out_of_range("forward_rows: position " + std::to_string(pos) + " exceeds the context length " +
+                                    std::to_string(ctx_len_));
+        }
+        row_seq_[sz(i)] = r.seq;
+        row_pos_[sz(i)] = pos;
+        tokens[sz(i)] = r.token;
+        want[sz(i)] = r.want_logits ? 1 : 0;
+        k += r.want_logits ? 1 : 0;
+    }
+    // Reserve every new position first; on failure give the blocks back so that nothing has changed.
+    bool ok = true;
+    for (int i = 0; i < n && ok; ++i) ok = row_seq_[sz(i)]->prepare_write(row_pos_[sz(i)], row_pos_[sz(i)]);
+    if (!ok) {
+        for (int i = 0; i < n; ++i) row_seq_[sz(i)]->truncate(row_seq_[sz(i)]->length());
+        throw std::runtime_error("forward_rows: the KV pool has no free block left");
+    }
+    run_rows(tokens.data(), row_seq_.data(), row_pos_.data(), n, false, want.data());
+    for (int i = 0; i < n; ++i) row_seq_[sz(i)]->set_length(row_pos_[sz(i)] + 1);   // later rows of a sequence overwrite earlier values
+    return k > 0 ? rlogits_.data() : nullptr;
+}
+
 // One pass over m rows. Everything between the uploads (token ids, rotary rows, block tables) and the download of
 // the logits stays on the device.
-void GpuTransformer::run_rows(const int* tokens, Sequence* const* seqs, const int* positions, int m, bool want_logits) {
+void GpuTransformer::run_rows(const int* tokens, Sequence* const* seqs, const int* positions, int m, bool want_logits,
+                              const unsigned char* row_logits) {
     const int dim = cfg_.dim, hidden = cfg_.hidden_dim, attn_dim = cfg_.attn_dim(), kv_dim = cfg_.kv_dim();
     const int head_size = cfg_.head_size(), n_heads = cfg_.n_heads, kv_mul = cfg_.kv_mul();
     const float inv_scale = 1.0f / std::sqrt(static_cast<float>(head_size));
@@ -384,6 +425,33 @@ void GpuTransformer::run_rows(const int* tokens, Sequence* const* seqs, const in
         if (traced) trace_row("ffn_out", l, x_);
     }
 
+    if (row_logits) {   // logits for any subset of the rows
+        int k = 0;
+        for (int i = 0; i < m; ++i) {
+            if (row_logits[i]) wanted_rows_[sz(k++)] = i;
+        }
+        if (k == 0) {
+            dev_->sync();
+            return;
+        }
+        // Final norm of all rows, the wanted ones gathered next to each other (embed is a row gather), then the
+        // classifier over them in groups that share one pass over its weights.
+        dev_->rmsnorm(xb_, x_, rms_final_, m, dim, eps, partial_);
+        dev_->upload(tokens_dev_, wanted_rows_.data(), sz(k) * sizeof(int));
+        dev_->embed(xb2_, xb_, 0, tokens_dev_, k, dim);
+        lap(Norm);
+        std::size_t bytes = 0;
+        for (int c = 0; c < k; c += gpu::kTokensPerPass) {
+            const int group = std::min(gpu::kTokensPerPass, k - c);
+            matmul(rlogits_dev_ + sz(c) * sz(cfg_.vocab_size), cfg_.vocab_size, wcls_, xb2_ + sz(c) * sz(dim), dim, group, cfg_.vocab_size, dim);
+            bytes += matrix_bytes(wcls_, cfg_.vocab_size, dim, group);
+        }
+        lap(Classifier, bytes);
+        if (rlogits_.size() < sz(k) * sz(cfg_.vocab_size)) rlogits_.resize(sz(k) * sz(cfg_.vocab_size));
+        dev_->download(rlogits_.data(), rlogits_dev_, sz(k) * sz(cfg_.vocab_size) * sizeof(float));
+        lap(Download);
+        return;
+    }
     if (!want_logits) {
         dev_->sync();   // so that a caller timing this call measures the work, not just its launch
         return;

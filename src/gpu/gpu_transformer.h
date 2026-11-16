@@ -42,6 +42,7 @@ public:
     const float* forward_batch(const int* tokens, int n, int pos0, bool compute_logits = true) override;
     const float* forward(Sequence& seq, int token, int pos, bool compute_logits = true) override;
     const float* forward_batch(Sequence& seq, const int* tokens, int n, int pos0, bool compute_logits = true) override;
+    const float* forward_rows(const StepRow* rows, int n) override;
     KvPool& kv_pool() override { return *kv_; }
 
     const Config& config() const override { return cfg_; }
@@ -52,7 +53,7 @@ public:
     void set_profiling(bool on) override;
     std::string profile_report() const override;
 
-    int max_batch() const { return max_batch_; }
+    int max_batch() const override { return max_batch_; }
     std::size_t device_bytes() const { return device_bytes_; }   // everything allocated on the device
     std::size_t weight_bytes() const { return weight_bytes_; }   // of which weights
 
@@ -75,8 +76,10 @@ private:
     const float* upload_vector(const float* v, std::size_t n);
     void matmul(float* out, long out_stride, const DMat& w, const float* x, long x_stride, int ntok, int rows, int cols);
     // m rows in one pass: row i is tokens[i] at positions[i] of seqs[i] (blocks reserved and writable). Rows of one
-    // sequence come in increasing position order. Logits of the last row if want_logits.
-    void run_rows(const int* tokens, Sequence* const* seqs, const int* positions, int m, bool want_logits);
+    // sequence come in increasing position order. Logits of the last row if want_logits (into logits_); with
+    // row_logits, of every row whose flag is set instead (into rlogits_, in row order).
+    void run_rows(const int* tokens, Sequence* const* seqs, const int* positions, int m, bool want_logits,
+                  const unsigned char* row_logits = nullptr);
     void trace_row(const char* tag, int layer, const float* device_row);
 
     enum Section { Transfer, Embed, Norm, QkvProj, Rope, Attention, OutProj, FfnGateUp, Activation, FfnDown, Residual,
@@ -113,6 +116,9 @@ private:
     std::vector<float> row_cos_, row_sin_;     // [max_batch, head_size / 2] rows gathered for one pass
     float *x_ = nullptr, *xb_ = nullptr, *xb2_ = nullptr, *hb_ = nullptr, *hb2_ = nullptr, *q_ = nullptr, *ao_ = nullptr;
     float* logits_dev_ = nullptr;
+    float* rlogits_dev_ = nullptr;             // [max_batch, vocab] logits of the rows of forward_rows
+    std::vector<float> rlogits_;               // their host copy, grown on demand
+    std::vector<int> wanted_rows_;
     float* partial_ = nullptr;
     float* scores_ = nullptr;                         // [max_batch, n_heads, ctx_len]
     float *cos_dev_ = nullptr, *sin_dev_ = nullptr;   // [max_batch, head_size / 2]

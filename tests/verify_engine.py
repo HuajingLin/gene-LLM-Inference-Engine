@@ -27,6 +27,7 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--build", required=True)
     ap.add_argument("--seeds", type=int, default=8)
+    ap.add_argument("--device", default="cpu", help="cpu, cuda or emu (passed to gi_engine_check and gi_serve_bench)")
     args = ap.parse_args()
     exe = Path(args.build) / "gi_engine_check"
     maker = ROOT / "tools" / "make_dummy_hf.py"
@@ -51,7 +52,7 @@ def main() -> int:
                 for seed in range(1, args.seeds + 1):
                     for pool in ("roomy", "tight", "very tight"):
                         nb = {"roomy": 8 * per, "tight": max(per + 1, 3 * per // 2), "very tight": per}[pool]
-                        cmd = [str(exe), str(d), "--max-seq-len", str(ctx), "--block-size", str(bs), "--kv-blocks", str(nb),
+                        cmd = [str(exe), str(d), "--device", args.device, "--max-seq-len", str(ctx), "--block-size", str(bs), "--kv-blocks", str(nb),
                                "--seed", str(seed), "--requests", str(rng.randint(3, 9)), "--max-running", str(rng.randint(1, 6)),
                                "--step-rows", str(rng.choice([0, 1, 3, 8, 64])), "--chunk", str(rng.choice([0, 1, 5, 16]))]
                         if rng.random() < 0.5:
@@ -72,7 +73,7 @@ def main() -> int:
                             m = re.search(r"prefix cache: (\d+) positions reused in \d+ admissions, (\d+) blocks evicted", p.stdout)
                             reused += int(m.group(1)); evicting += 1 if int(m.group(2)) > 0 else 0
             for bs in (1, 4):
-                cmd = [str(exe), str(d), "--max-seq-len", str(ctx), "--block-size", str(bs), "--kv-blocks", str(12 // bs + 2),
+                cmd = [str(exe), str(d), "--device", args.device, "--max-seq-len", str(ctx), "--block-size", str(bs), "--kv-blocks", str(12 // bs + 2),
                        "--seed", "2", "--requests", "2", "--oversize"]
                 p = subprocess.run(cmd, capture_output=True, text=True)
                 runs += 1
@@ -85,7 +86,7 @@ def main() -> int:
         bench_model = Path(t2) / "m"
         subprocess.run([sys.executable, str(maker), "--out", str(bench_model), "--seed", "3", "--max-pos", "96"], capture_output=True, check=True)
         for extra, want_cached in ((["--shared-prefix", "40", "--warm-cache"], True), (["--shared-prefix", "40", "--warm-cache", "--no-prefix-cache"], False), ([], False)):
-            cmd = [str(bench), "--model", str(bench_model), "--concurrency", "1,3", "--prompt-tokens", "48", "--decode-tokens", "6",
+            cmd = [str(bench), "--model", str(bench_model), "--device", args.device, "--concurrency", "1,3", "--prompt-tokens", "48", "--decode-tokens", "6",
                    "--runs", "1", "--max-seq-len", "64", *extra]
             p = subprocess.run(cmd, capture_output=True, text=True)
             runs += 1

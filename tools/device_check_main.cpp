@@ -494,6 +494,29 @@ void check_api(const std::string& model_dir) {
         Sequence foreign = other.new_sequence();
         expect_throw("forward on a sequence of another pool", [&] { model.forward(foreign, 1, 0); });
         expect_throw("forward_batch on a sequence of another pool", [&] { model.forward_batch(foreign, tokens.data(), 2, 0); });
+        {
+            GpuTransformer rows_model(ck, dev, ctx, 5, 4, 12);   // room for several sequences
+            Sequence own = rows_model.new_sequence();
+            const SequenceModel::StepRow mixed[2] = {{&own, 1, true}, {&foreign, 1, true}};
+            expect_throw("forward_rows with a sequence of another pool", [&] { rows_model.forward_rows(mixed, 2); });
+            if (own.length() != 0 || own.n_blocks() != 0) {
+                ++failures;
+                std::printf("FAIL api: a refused forward_rows changed a sequence\n");
+            }
+            // Twelve rows of three sequences in one pass, every row asking for logits (more than one classifier group).
+            Sequence s1 = rows_model.new_sequence(), s2 = rows_model.new_sequence();
+            std::vector<SequenceModel::StepRow> rows;
+            for (int i = 0; i < 4; ++i) {
+                rows.push_back({&own, tokens[static_cast<std::size_t>(i)], true});
+                rows.push_back({&s1, tokens[static_cast<std::size_t>(i)], true});
+                rows.push_back({&s2, tokens[static_cast<std::size_t>(i)], true});
+            }
+            // max_batch is 5 here: too many rows are refused, five are fine.
+            expect_throw("more rows than max_batch", [&] { rows_model.forward_rows(rows.data(), 12); });
+            const float* l = rows_model.forward_rows(rows.data(), 5);   // own: positions 0, 1; s1: 0, 1; s2: 0
+            const int row_pos[5] = {0, 0, 0, 1, 1};
+            for (int r = 0; r < 5; ++r) same("forward_rows, three sequences", l ? l + static_cast<std::size_t>(r) * vocab : nullptr, row_pos[r]);
+        }
         Sequence a = other.new_sequence(), b = other.new_sequence();
         const int na = ctx / 2, nb = ctx / 2 - 4;   // block size 4: together they leave exactly one block free
         for (int pos = 0; pos < na; ++pos) {

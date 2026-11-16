@@ -61,7 +61,7 @@ public:
                          int block_size = 0, int kv_blocks = 0);
     ~Transformer() override;
     int threads() const;
-    int max_batch() const { return max_batch_; }
+    int max_batch() const override { return max_batch_; }
 
     // The paged KV cache. Sequences created on it can be run independently of each other; the plain forward()
     // and forward_batch() below use one built-in sequence (position 0 starts it again).
@@ -94,20 +94,8 @@ public:
     const float* forward_batch(const int* tokens, int n, int pos0, bool compute_logits = true) override;
     const float* forward_batch(Sequence& seq, const int* tokens, int n, int pos0, bool compute_logits = true) override;
 
-    // One forward pass over rows that belong to different sequences (continuous batching). Every row is one token of
-    // one sequence; a sequence may own several consecutive rows (a prefill chunk). A row is processed at position
-    // seq->length() + (number of earlier rows of the same sequence), so the rows of a sequence must be listed in order.
-    // All matrix weights are read once for all rows. Afterwards every sequence has grown by its number of rows.
-    // Returns the logits of the rows with want_logits, one vocab_size row each in row order (valid until the next
-    // call), or nullptr if no row asks for logits. Results are bit-identical to feeding each sequence alone.
-    // 1 <= n <= max_batch(). If the pool cannot hold all new positions, std::runtime_error is thrown and no
-    // sequence has changed (blocks reserved on the way are given back).
-    struct StepRow {
-        Sequence* seq;
-        int token;
-        bool want_logits;
-    };
-    const float* forward_rows(const StepRow* rows, int n);   // same rules as above; seq.length() == pos0 + n afterwards
+    // Rows of different sequences in one pass (see SequenceModel): bit-identical to feeding each sequence alone.
+    const float* forward_rows(const StepRow* rows, int n) override;   // same rules as above; seq.length() == pos0 + n afterwards
 
     const Config& config() const override { return cfg_; }
     int max_seq_len() const override { return ctx_len_; }
