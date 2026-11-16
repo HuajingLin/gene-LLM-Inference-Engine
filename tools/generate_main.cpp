@@ -19,6 +19,7 @@
 //   --bos                Hugging Face models only: put the BOS token in front of the prompt
 //                        (like transformers, nothing is added by default)
 //   --no-echo            do not print the prompt, only the generated text
+//   --device D           cpu, cuda or emu (default: the environment variable GI_DEVICE, else cpu)
 //   --quiet              do not print the statistics line (written to stderr)
 //   --dump-tokens FILE   write prompt token ids (line 1) and generated token ids (line 2)
 //
@@ -47,7 +48,7 @@ namespace {
 [[noreturn]] void usage_error(const std::string& msg) {
     std::fprintf(stderr, "error: %s\n", msg.c_str());
     std::fprintf(stderr,
-                 "usage: gi_generate --model M [--tokenizer T] [--prompt TEXT] [--steps N] [--max-seq-len N] [--threads N] [--weights KIND]\n"
+                 "usage: gi_generate --model M [--tokenizer T] [--prompt TEXT] [--steps N] [--max-seq-len N] [--threads N] [--weights KIND] [--device D]\n"
                  "                   [--temperature F] [--top-k N] [--top-p F] [--seed N]\n"
                  "                   [--bos] [--no-echo] [--quiet] [--dump-tokens FILE]\n"
                  "  M is a llama2.c .bin file (then --tokenizer is required) or a Hugging Face model directory.\n");
@@ -80,7 +81,7 @@ std::uint64_t parse_seed(const std::string& v) {
 int main(int argc, char** argv) {
     std::string model_path, tokenizer_path, prompt, dump_path;
     int steps = 0, max_seq_len = 0, n_threads = 0;
-    std::string weights_arg;
+    std::string weights_arg, device;
     bool echo = true, quiet = false, seed_given = false, bos = false;
     SamplerConfig scfg;
     scfg.temperature = 0.8f;
@@ -98,6 +99,7 @@ int main(int argc, char** argv) {
         else if (flag == "--steps") steps = static_cast<int>(parse_int(flag, value()));
         else if (flag == "--max-seq-len") max_seq_len = static_cast<int>(parse_int(flag, value()));
         else if (flag == "--weights") weights_arg = value();
+        else if (flag == "--device") device = value();
         else if (flag == "--threads") n_threads = static_cast<int>(parse_int(flag, value()));
         else if (flag == "--temperature") scfg.temperature = static_cast<float>(parse_double(flag, value()));
         else if (flag == "--top-k") scfg.top_k = static_cast<int>(parse_int(flag, value()));
@@ -142,7 +144,9 @@ int main(int argc, char** argv) {
                                      " tokens but the model only " + std::to_string(ck.config().vocab_size) +
                                      ": they do not belong together");
         }
-        Transformer model(ck, max_seq_len, n_threads);
+        const std::unique_ptr<Model> model_ptr = make_model(ck, device, max_seq_len, n_threads);
+        Model& model = *model_ptr;
+        if (!quiet && model.description().compare(0, 4, "cpu:") != 0) std::fprintf(stderr, "%s\n", model.description().c_str());
         Sampler sampler(scfg, ck.config().vocab_size);
 
         const std::vector<int> ids = tok.encode_prompt(prompt);
