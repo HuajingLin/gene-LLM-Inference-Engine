@@ -28,6 +28,9 @@ add_library(geneinfer STATIC
   src/model/kv_cache.cpp
   src/model/prefix_cache.cpp
   src/model/transformer.cpp
+  src/model/model.cpp
+  src/gpu/device_host.cpp
+  src/gpu/gpu_transformer.cpp
   src/sampler/sampler.cpp
   src/runtime/engine.cpp
   src/runtime/generator.cpp
@@ -40,6 +43,16 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$" AND CMAKE_CXX_COMPILE
   set_source_files_properties(src/kernels/kernels_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma")
   set_source_files_properties(src/kernels/kernels_avx512.cpp PROPERTIES COMPILE_OPTIONS "-mavx512f;-mavx512vl;-mavx2;-mfma")
   target_compile_definitions(geneinfer PUBLIC GI_HAVE_X86_SIMD=1)
+endif()
+# Optional GPU backend: cmake -DGI_CUDA=ON (needs the CUDA toolkit). Without it the device kernels still build as
+# a host emulation ("emu" device) so that they can be tested anywhere.
+option(GI_CUDA "Build the CUDA device backend" OFF)
+if(GI_CUDA)
+  enable_language(CUDA)
+  set(CMAKE_CUDA_STANDARD 17)
+  set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+  target_sources(geneinfer PRIVATE src/gpu/device_cuda.cu)
+  target_compile_definitions(geneinfer PUBLIC GI_HAVE_CUDA=1)
 endif()
 find_package(Threads REQUIRED)
 target_link_libraries(geneinfer PUBLIC Threads::Threads)
@@ -104,11 +117,14 @@ target_link_libraries(gi_engine_check PRIVATE geneinfer)
 add_executable(gi_prefixcache_check tools/prefixcache_check_main.cpp)
 target_link_libraries(gi_prefixcache_check PRIVATE geneinfer)
 
-foreach(tgt geneinfer gi_inspect gi_tokenize gi_kernel_check gi_forward gi_generate gi_sampler_check gi_bench gi_kernel_bench gi_pool_check gi_quant_dump gi_json_check gi_dtype_check gi_hf_tokenize gi_unicode_check gi_kvpool_check gi_multiseq gi_engine_check gi_serve_bench gi_prefixcache_check)
+add_executable(gi_device_check tools/device_check_main.cpp)
+target_link_libraries(gi_device_check PRIVATE geneinfer)
+
+foreach(tgt geneinfer gi_device_check gi_inspect gi_tokenize gi_kernel_check gi_forward gi_generate gi_sampler_check gi_bench gi_kernel_bench gi_pool_check gi_quant_dump gi_json_check gi_dtype_check gi_hf_tokenize gi_unicode_check gi_kvpool_check gi_multiseq gi_engine_check gi_serve_bench gi_prefixcache_check)
   if(MSVC)
     target_compile_options(${tgt} PRIVATE /W4 /utf-8)
     target_compile_definitions(${tgt} PRIVATE _CRT_SECURE_NO_WARNINGS)
   else()
-    target_compile_options(${tgt} PRIVATE -Wall -Wextra -Wpedantic)
+    target_compile_options(${tgt} PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-Wall;-Wextra;-Wpedantic>)
   endif()
 endforeach()

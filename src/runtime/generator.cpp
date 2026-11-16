@@ -7,7 +7,7 @@
 
 namespace geneinfer {
 
-GenerateResult generate(Transformer& model, const TextTokenizer& tokenizer, Sampler& sampler,
+GenerateResult generate(Model& model, const TextTokenizer& tokenizer, Sampler& sampler,
                         const std::vector<int>& prompt_tokens, int max_positions,
                         const PieceCallback& on_piece) {
     using Clock = std::chrono::steady_clock;

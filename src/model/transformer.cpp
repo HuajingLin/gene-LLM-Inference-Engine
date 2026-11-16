@@ -146,6 +146,10 @@ Transformer::~Transformer() = default;
 
 int Transformer::threads() const { return pool_ ? pool_->size() : 1; }
 
+std::string Transformer::description() const {
+    return std::string("cpu: ") + kernels::isa_name(kernels::active_isa()) + " kernels, " + std::to_string(threads()) + " thread(s)";
+}
+
 // Runs several independent matrix-vector products with one synchronization of the pool. Each product is cut
 // into slices of consecutive rows, one per thread; slice starts are multiples of 4, which is the row blocking of
 // the kernels, so every row is computed exactly as in a single-threaded run (bit-identical results). A product

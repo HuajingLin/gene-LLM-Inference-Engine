@@ -1,6 +1,8 @@
 // forward_main.cpp - feeds a token sequence through the model and dumps the results.
 //
-//   gi_forward <model> <out_dir> [--max-seq-len N] [--prefill P] [--head H] [--max-batch B] <token_id> [<token_id> ...]
+//   gi_forward <model> <out_dir> [--max-seq-len N] [--prefill P] [--head H] [--max-batch B] [--device D] <token_id> [<token_id> ...]
+//
+// --device cpu | cuda | emu picks where the model runs (default: the environment variable GI_DEVICE, else cpu).
 //
 // <model> is a llama2.c file or a Hugging Face model directory. --max-seq-len caps the context
 // (and with it the KV cache memory); it must be at least the number of tokens.
@@ -15,6 +17,7 @@
 // rest one by one; with --head H the first H of those P tokens are fed one by one before the batch, which then
 // starts at position H (tests a batch on top of an existing KV cache). The logits file then holds the rows of positions P-1 .. n-1 (batch processing only returns
 // the logits of its last token), and no activation files are written.
+// --decoy first feeds the tokens in reverse order and then starts again at position 0 (the results must not change).
 // It also prints the average time per forward() call.
 #include <chrono>
 #include <cstdio>
@@ -22,10 +25,11 @@
 #include <exception>
 #include <filesystem>
 #include <fstream>
+#include <memory>
 #include <string>
 #include <vector>
 
-#include "model/transformer.h"
+#include "model/model.h"
 
 using namespace geneinfer;
 namespace fs = std::filesystem;
@@ -53,13 +57,19 @@ int main(int argc, char** argv) {
 
         std::vector<int> tokens;
         int max_seq_len = 0, prefill = 0, max_batch = 0, head = 0, pos_shift = 0;
-        bool traced = false;
+        bool traced = false, decoy = false;
+        std::string device;
         for (int i = 3; i < argc; ++i) {
             const std::string a = argv[i];
             if (a == "--max-seq-len" || a == "--prefill" || a == "--max-batch" || a == "--head" || a == "--pos-shift") {
                 if (i + 1 >= argc) throw std::runtime_error(a + " needs a value");
                 const int v = std::atoi(argv[++i]);
                 (a == "--max-seq-len" ? max_seq_len : a == "--prefill" ? prefill : a == "--head" ? head : a == "--pos-shift" ? pos_shift : max_batch) = v;
+            } else if (a == "--device") {
+                if (i + 1 >= argc) throw std::runtime_error(a + " needs a value");
+                device = argv[++i];
+            } else if (a == "--decoy") {
+                decoy = true;    // test hook: first feed the tokens in reverse order, then start again at position 0
             } else if (a == "--traced") {
                 traced = true;   // test hook: a trace callback makes forward_batch take its token-by-token path
             } else {
@@ -71,7 +81,8 @@ int main(int argc, char** argv) {
 
         if (head < 0 || (head > 0 && head >= prefill)) throw std::runtime_error("--head must be smaller than --prefill");
         if (prefill < 0 || prefill > n) throw std::runtime_error("--prefill must be between 0 and the number of tokens");
-        Transformer model(ck, max_seq_len, 0, max_batch);
+        const std::unique_ptr<Model> model_ptr = make_model(ck, device, max_seq_len, 0, max_batch);
+        Model& model = *model_ptr;
         if (n > model.max_seq_len()) {
             throw std::runtime_error("sequence of " + std::to_string(n) +
                                      " tokens exceeds the context length " +
@@ -94,6 +105,9 @@ int main(int argc, char** argv) {
         std::ofstream logits_file(out_dir / "logits.f32", std::ios::binary);
         if (!logits_file) throw std::runtime_error("cannot write logits.f32");
 
+        if (decoy) {   // leaves other keys and values in the cache; a new sequence must not see them
+            for (int pos = 0; pos < n; ++pos) model.forward(tokens[static_cast<std::size_t>(n - 1 - pos)], pos, false);
+        }
         const auto start = std::chrono::steady_clock::now();
         int first = 0;
         if (prefill > 0) {

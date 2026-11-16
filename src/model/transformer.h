@@ -20,17 +20,10 @@
 
 #include "loader/checkpoint.h"
 #include "model/kv_cache.h"
+#include "model/model.h"
 #include "util/thread_pool.h"
 
 namespace geneinfer {
-
-// Optional callback to inspect intermediate activations (used by tests and for debugging).
-// `layer` is -1 for tensors that do not belong to a layer. Tags:
-//   "embedding"  (dim)   token embedding, before layer 0
-//   "attn_out"   (dim)   residual stream after the attention block of `layer`
-//   "ffn_out"    (dim)   residual stream after the feed-forward block of `layer`
-//   "final_norm" (dim)   after the final RMSNorm, right before the classifier
-using TraceFn = std::function<void(const char* tag, int layer, const float* data, int size)>;
 
 // Optional per-section timing of forward(): attach one with Transformer::set_profile(). Each section is the
 // time between two checkpoints of the forward pass, so the sections add up to the whole call. Costs one clock
@@ -46,7 +39,7 @@ struct ForwardProfile {
     std::chrono::steady_clock::time_point last;
 };
 
-class Transformer {
+class Transformer : public Model {
 public:
     // The weights are not copied: they point into the checkpoint's memory mapping, so the
     // Checkpoint object must stay alive as long as this Transformer is used.
@@ -66,7 +59,7 @@ public:
     // one sequence of max_seq_len positions). Results do not depend on the block size.
     explicit Transformer(const Checkpoint& checkpoint, int max_seq_len = 0, int n_threads = 0, int max_batch = 0,
                          int block_size = 0, int kv_blocks = 0);
-    ~Transformer();
+    ~Transformer() override;
     int threads() const;
     int max_batch() const { return max_batch_; }
 
@@ -83,7 +76,7 @@ public:
     // While feeding a prompt, the logits of all but the last position are never used. Pass
     // compute_logits = false for those: the final norm and the (large) classifier matrix
     // product are skipped and nullptr is returned. The KV cache is updated either way.
-    const float* forward(int token, int pos, bool compute_logits = true);
+    const float* forward(int token, int pos, bool compute_logits = true) override;
 
     // The same on an explicit sequence. `pos` may be at most seq.length(): the next free position appends, an
     // earlier one rewinds the sequence to it (the later positions are forgotten); a larger one would leave a gap
@@ -99,7 +92,7 @@ public:
     // limited by memory bandwidth, prefill with batching by arithmetic.
     // pos0 may be > 0 when earlier positions are already in the cache. While a trace callback is set, the tokens
     // are processed one by one so that the trace sees every token (same results, no speedup).
-    const float* forward_batch(const int* tokens, int n, int pos0, bool compute_logits = true);
+    const float* forward_batch(const int* tokens, int n, int pos0, bool compute_logits = true) override;
     const float* forward_batch(Sequence& seq, const int* tokens, int n, int pos0, bool compute_logits = true);
 
     // One forward pass over rows that belong to different sequences (continuous batching). Every row is one token of
@@ -117,14 +110,15 @@ public:
     };
     const float* forward_rows(const StepRow* rows, int n);   // same rules as above; seq.length() == pos0 + n afterwards
 
-    const Config& config() const { return cfg_; }
-    int max_seq_len() const { return ctx_len_; }
+    const Config& config() const override { return cfg_; }
+    int max_seq_len() const override { return ctx_len_; }
+    std::string description() const override;
 
     // Memory owned by this object (the weights are not included: they live in the mmap).
     std::size_t kv_cache_bytes() const;  // the whole KV pool (keys + values, all layers, all blocks)
     std::size_t scratch_bytes() const;   // activation buffers, attention scores, logits
 
-    void set_trace(TraceFn fn) { trace_ = std::move(fn); }
+    void set_trace(TraceFn fn) override { trace_ = std::move(fn); }
     void set_profile(ForwardProfile* profile) { profile_ = profile; }   // nullptr switches it off
 
 private:

@@ -5,7 +5,7 @@
 #include <string>
 #include <vector>
 
-#include "model/transformer.h"
+#include "model/model.h"
 #include "sampler/sampler.h"
 #include "tokenizer/text_tokenizer.h"
 
@@ -34,7 +34,7 @@ using PieceCallback = std::function<void(const std::string& piece)>;
 // End tokens inside the prompt do not stop anything: only sampled tokens are checked.
 // With temperature 0 this loop produces exactly the tokens of tools/ref.py.
 // Throws std::invalid_argument if the prompt is empty or does not fit in the context.
-GenerateResult generate(Transformer& model, const TextTokenizer& tokenizer, Sampler& sampler,
+GenerateResult generate(Model& model, const TextTokenizer& tokenizer, Sampler& sampler,
                         const std::vector<int>& prompt_tokens, int max_positions,
                         const PieceCallback& on_piece = nullptr);
 
