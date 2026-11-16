@@ -9,6 +9,7 @@
 // With --model, the GpuTransformer API is exercised too (position gaps, rewinding, batch limits) and the bytes it
 // put on the device are printed (weight_bytes=..., device_bytes=...).
 // Exit code 0 if everything is within 1e-5, else 1.
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -275,59 +276,126 @@ void check_rope(Rng& rng) {
     }
 }
 
+// Paged attention and store_kv on a pool with several layers. Every row gets its own block table (blocks scattered
+// over the pool in a scrambled order); the rows are stored with store_kv and then attend through their tables.
+// The reference keeps each row's history as a plain array. Unused pool memory holds NaN.
 void check_attention(Rng& rng) {
     Group g("attention");
     struct Case {
-        int m, pos0, n_heads, kv_mul, head_size;
+        int m, n_heads, kv_mul, head_size, block_size;
+        int positions[6];
         float q_scale;
     };
-    const Case cases[] = {{1, 0, 2, 1, 4, 1.0f},  {1, 9, 4, 2, 6, 1.0f},  {5, 0, 4, 4, 8, 1.0f},   {6, 3, 6, 3, 2, 1.0f},
-                          {3, 30, 2, 1, 16, 1.0f}, {4, 20, 4, 2, 8, 60.0f}, {2, 40, 3, 1, 4, 300.0f}};
+    const Case cases[] = {{1, 2, 1, 4, 16, {0}, 1.0f},          {1, 4, 2, 6, 4, {9}, 1.0f},           {5, 4, 4, 8, 3, {0, 1, 2, 3, 4}, 1.0f},
+                          {6, 6, 3, 2, 1, {3, 0, 8, 5, 5, 1}, 1.0f}, {3, 2, 1, 16, 7, {30, 14, 21}, 1.0f}, {4, 4, 2, 8, 5, {20, 21, 4, 5}, 60.0f},
+                          {2, 3, 1, 4, 64, {40, 63}, 300.0f},   {3, 4, 2, 4, 2, {7, 7, 6}, 1.0f}};
+    const int n_layers = 3, layer = 1;
     for (const Case& c : cases) {
         const int kv_heads = c.n_heads / c.kv_mul, kv_dim = kv_heads * c.head_size, attn = c.n_heads * c.head_size;
-        const int len = c.pos0 + c.m;
+        const int bs = c.block_size;
+        int max_pos = 0;
+        for (int i = 0; i < c.m; ++i) max_pos = std::max(max_pos, c.positions[i]);
+        const int stride = max_pos / bs + 1;
+        const long block_floats = static_cast<long>(n_layers) * 2 * bs * kv_dim;
+        const int n_blocks = c.m * stride + 3;
+        // Scrambled block ids: row i, table index b -> a block of its own.
+        std::vector<int> order(static_cast<std::size_t>(n_blocks));
+        for (int b = 0; b < n_blocks; ++b) order[static_cast<std::size_t>(b)] = b;
+        for (int b = n_blocks - 1; b > 0; --b) std::swap(order[static_cast<std::size_t>(b)], order[rng.next() % static_cast<std::uint64_t>(b + 1)]);
+        std::vector<int> tables(static_cast<std::size_t>(c.m) * stride);
+        for (std::size_t i = 0; i < tables.size(); ++i) tables[i] = order[i];
+        // Histories: row i has positions 0 .. positions[i]; the last one is "new" and goes through store_kv.
+        std::vector<float> pool(static_cast<std::size_t>(n_blocks) * static_cast<std::size_t>(block_floats), NAN);
+        std::vector<std::vector<float>> hist_k(static_cast<std::size_t>(c.m)), hist_v(static_cast<std::size_t>(c.m));
+        std::vector<float> new_k(static_cast<std::size_t>(c.m) * kv_dim), new_v(new_k.size());
+        const long layer_off = static_cast<long>(layer) * 2 * bs * kv_dim;
+        for (int i = 0; i < c.m; ++i) {
+            const int n = c.positions[i] + 1;
+            hist_k[static_cast<std::size_t>(i)] = random_floats(rng, static_cast<std::size_t>(n) * kv_dim);
+            hist_v[static_cast<std::size_t>(i)] = random_floats(rng, static_cast<std::size_t>(n) * kv_dim);
+            for (int p = 0; p < n; ++p) {
+                const float* ks = hist_k[static_cast<std::size_t>(i)].data() + static_cast<std::size_t>(p) * kv_dim;
+                const float* vs = hist_v[static_cast<std::size_t>(i)].data() + static_cast<std::size_t>(p) * kv_dim;
+                if (p == c.positions[i]) {   // the new position: not in the pool yet
+                    std::memcpy(new_k.data() + static_cast<std::size_t>(i) * kv_dim, ks, static_cast<std::size_t>(kv_dim) * sizeof(float));
+                    std::memcpy(new_v.data() + static_cast<std::size_t>(i) * kv_dim, vs, static_cast<std::size_t>(kv_dim) * sizeof(float));
+                    continue;
+                }
+                const long base = static_cast<long>(tables[static_cast<std::size_t>(i) * stride + p / bs]) * block_floats + layer_off +
+                                  static_cast<long>(p % bs) * kv_dim;
+                std::memcpy(pool.data() + base, ks, static_cast<std::size_t>(kv_dim) * sizeof(float));
+                std::memcpy(pool.data() + base + static_cast<long>(bs) * kv_dim, vs, static_cast<std::size_t>(kv_dim) * sizeof(float));
+            }
+        }
         const std::vector<float> q = random_floats(rng, static_cast<std::size_t>(c.m) * attn, c.q_scale);
-        // Two extra cache rows hold NaN: no row may read beyond its own position.
-        std::vector<float> keys = random_floats(rng, static_cast<std::size_t>(len + 2) * kv_dim);
-        std::vector<float> values = random_floats(rng, static_cast<std::size_t>(len + 2) * kv_dim);
-        for (std::size_t i = static_cast<std::size_t>(len) * kv_dim; i < keys.size(); ++i) keys[i] = values[i] = NAN;
-        const Buf dq(q), dk(keys), dv(values);
+        const Buf dq(q), dpool(pool), dk(new_k), dv(new_v);
+        const Buf dtables(tables.data(), tables.size() * sizeof(int));
+        const Buf dpos(c.positions, static_cast<std::size_t>(c.m) * sizeof(int));
+        const gpu::PagedKv kv{dpool.f(), static_cast<const int*>(dtables.d), static_cast<const int*>(dpos.d), stride, block_floats, layer_off, bs, kv_dim};
+        dev->store_kv(kv, dk.f(), dv.f(), c.m);
+        // store_kv wrote exactly the new rows: the pool now equals the host copy with those rows filled in.
+        std::vector<float> want_pool = pool;
+        for (int i = 0; i < c.m; ++i) {
+            const int p = c.positions[i];
+            const long base = static_cast<long>(tables[static_cast<std::size_t>(i) * stride + p / bs]) * block_floats + layer_off +
+                              static_cast<long>(p % bs) * kv_dim;
+            std::memcpy(want_pool.data() + base, new_k.data() + static_cast<std::size_t>(i) * kv_dim, static_cast<std::size_t>(kv_dim) * sizeof(float));
+            std::memcpy(want_pool.data() + base + static_cast<long>(bs) * kv_dim, new_v.data() + static_cast<std::size_t>(i) * kv_dim,
+                        static_cast<std::size_t>(kv_dim) * sizeof(float));
+        }
+        const std::vector<float> got_pool = dpool.get();
+        const std::string what = shape({c.m, c.n_heads, c.kv_mul, c.head_size, bs}) + (c.q_scale > 1.0f ? " large scores" : "");
+        g.bits("store_kv " + what, std::memcmp(got_pool.data(), want_pool.data(), want_pool.size() * sizeof(float)) == 0);
+
         const std::size_t out_n = static_cast<std::size_t>(c.m) * attn;
         const Buf dout(std::vector<float>(out_n + 7, kSentinel));
-        const Buf scores(std::vector<float>(static_cast<std::size_t>(c.m) * c.n_heads * len, NAN));
+        const int max_len = max_pos + 1;
+        const Buf scores(std::vector<float>(static_cast<std::size_t>(c.m) * c.n_heads * max_len, NAN));
         const float inv_scale = 1.0f / std::sqrt(static_cast<float>(c.head_size));
-        dev->attention(dout.f(), dq.f(), dk.f(), dv.f(), c.m, c.pos0, c.n_heads, c.head_size, c.kv_mul, kv_dim, inv_scale, scores.f());
+        dev->attention(dout.f(), dq.f(), kv, c.m, max_len, c.n_heads, c.head_size, c.kv_mul, inv_scale, scores.f());
         std::vector<double> want(out_n + 7, 0.0);
         std::vector<char> is_out(out_n + 7, 0);
         for (int i = 0; i < c.m; ++i) {
-            const int n = c.pos0 + i + 1;
+            const int n = c.positions[i] + 1;
+            const std::vector<float>& keys = hist_k[static_cast<std::size_t>(i)];
+            const std::vector<float>& values = hist_v[static_cast<std::size_t>(i)];
             for (int h = 0; h < c.n_heads; ++h) {
                 const std::size_t qo = static_cast<std::size_t>(i) * attn + static_cast<std::size_t>(h) * c.head_size;
                 const std::size_t ko = static_cast<std::size_t>(h / c.kv_mul) * c.head_size;
-                std::vector<double> p(n);
+                std::vector<double> p(static_cast<std::size_t>(n));
                 double mx = -INFINITY;
                 for (int j = 0; j < n; ++j) {
                     double acc = 0.0;
                     for (int d = 0; d < c.head_size; ++d) acc += static_cast<double>(q[qo + d]) * keys[static_cast<std::size_t>(j) * kv_dim + ko + d];
-                    p[j] = static_cast<double>(static_cast<float>(acc) * inv_scale);
-                    mx = std::max(mx, p[j]);
+                    p[static_cast<std::size_t>(j)] = static_cast<double>(static_cast<float>(acc) * inv_scale);
+                    mx = std::max(mx, p[static_cast<std::size_t>(j)]);
                 }
                 double sum = 0.0;
                 for (int j = 0; j < n; ++j) {
-                    p[j] = std::exp(p[j] - mx);
-                    sum += p[j];
+                    p[static_cast<std::size_t>(j)] = std::exp(p[static_cast<std::size_t>(j)] - mx);
+                    sum += p[static_cast<std::size_t>(j)];
                 }
                 for (int d = 0; d < c.head_size; ++d) {
                     double acc = 0.0;
-                    for (int j = 0; j < n; ++j) acc += p[j] / sum * values[static_cast<std::size_t>(j) * kv_dim + ko + d];
+                    for (int j = 0; j < n; ++j) acc += p[static_cast<std::size_t>(j)] / sum * values[static_cast<std::size_t>(j) * kv_dim + ko + d];
                     want[qo + d] = acc;
                     is_out[qo + d] = 1;
                 }
             }
         }
-        g.check(shape({c.m, c.pos0, c.n_heads, c.kv_mul, c.head_size}) + (c.q_scale > 1.0f ? " large scores" : ""), dout.get(), want,
-                is_out);
+        g.check(what, dout.get(), want, is_out);
+        // The pool is only read by attention.
+        const std::vector<float> after = dpool.get();
+        g.bits("attention leaves the pool alone " + what, std::memcmp(after.data(), got_pool.data(), after.size() * sizeof(float)) == 0);
     }
+    // device -> device copy
+    const std::vector<float> src = random_floats(rng, 100);
+    const Buf a(src), b(std::vector<float>(100, kSentinel));
+    dev->copy(b.f() + 10, a.f() + 20, 30 * sizeof(float));
+    std::vector<float> want_b(100, kSentinel);
+    std::memcpy(want_b.data() + 10, src.data() + 20, 30 * sizeof(float));
+    const std::vector<float> got_b = b.get();
+    g.bits("copy", std::memcmp(got_b.data(), want_b.data(), 100 * sizeof(float)) == 0);
 }
 
 void check_elementwise(Rng& rng) {
@@ -373,7 +441,8 @@ void expect_throw(const char* what, F&& f) {
 void check_api(const std::string& model_dir) {
     const Checkpoint ck = Checkpoint::load(model_dir);
     const Config& cfg = ck.config();
-    const int ctx = std::min(cfg.seq_len, 24);
+    if (cfg.seq_len < 24) throw std::runtime_error("the API check needs a model with a context of at least 24 positions");
+    const int ctx = 24;
     GpuTransformer model(ck, dev, ctx, 5);
     std::printf("weight_bytes=%zu device_bytes=%zu\n", model.weight_bytes(), model.device_bytes());
     const std::size_t vocab = static_cast<std::size_t>(cfg.vocab_size);
@@ -418,6 +487,36 @@ void check_api(const std::string& model_dir) {
     if (std::memcmp(other, ref[0].data(), vocab * sizeof(float)) == 0) {
         ++failures;
         std::printf("FAIL api: another token gives the same logits\n");
+    }
+    // Sequences: one of another model's pool is refused; two sequences of this pool do not disturb each other.
+    {
+        GpuTransformer other(ck, dev, ctx, 5, 4, 0);
+        Sequence foreign = other.new_sequence();
+        expect_throw("forward on a sequence of another pool", [&] { model.forward(foreign, 1, 0); });
+        expect_throw("forward_batch on a sequence of another pool", [&] { model.forward_batch(foreign, tokens.data(), 2, 0); });
+        Sequence a = other.new_sequence(), b = other.new_sequence();
+        const int na = ctx / 2, nb = ctx / 2 - 4;   // block size 4: together they leave exactly one block free
+        for (int pos = 0; pos < na; ++pos) {
+            const float* la = other.forward(a, tokens[static_cast<std::size_t>(pos)], pos);
+            same("two sequences, first", la, pos);
+            if (pos < nb) other.forward(b, (tokens[static_cast<std::size_t>(pos)] + 3) % cfg.vocab_size, pos, false);
+        }
+        KvPool& pool = other.kv_pool();
+        const int free_before = pool.free_blocks(), blocks_before = b.n_blocks();
+        // 8 more positions need two blocks, one is free: refused, and the block taken on the way is given back.
+        expect_throw("batch the pool cannot hold", [&] { other.forward_batch(b, tokens.data(), 8, nb); });
+        if (ctx != 24 || free_before != 1 || b.length() != nb || b.n_blocks() != blocks_before || pool.free_blocks() != free_before) {
+            ++failures;
+            std::printf("FAIL api: a refused batch changed the sequence or kept a block (free %d -> %d, blocks %d -> %d)\n", free_before,
+                        pool.free_blocks(), blocks_before, b.n_blocks());
+        }
+        expect_throw("host access to device blocks", [&] { pool.keys(0, 0); });
+        GpuTransformer big_blocks(ck, dev, ctx, 5, 1000, 0);
+        if (model.kv_pool().block_size() != 16 || model.kv_pool().n_blocks() != 2 || big_blocks.kv_pool().block_size() != ctx ||
+            big_blocks.kv_pool().n_blocks() != 1 || pool.block_size() != 4 || pool.n_blocks() != 6) {
+            ++failures;
+            std::printf("FAIL api: default block size / pool size are wrong\n");
+        }
     }
     std::printf("api        checked\n");
 }

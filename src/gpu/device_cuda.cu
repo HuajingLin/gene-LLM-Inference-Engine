@@ -67,6 +67,10 @@ void cuda_download(void* dst, const void* src, std::size_t bytes) {
     check(cudaMemcpy(dst, src, bytes, cudaMemcpyDeviceToHost), "download");
 }
 
+void cuda_copy(void* dst, const void* src, std::size_t bytes) {
+    check(cudaMemcpy(dst, src, bytes, cudaMemcpyDeviceToDevice), "device copy");
+}
+
 void cuda_sync() { check(cudaDeviceSynchronize(), "synchronize"); }
 
 std::string cuda_describe() {
@@ -92,6 +96,7 @@ DeviceOps make_cuda_ops() {
     t.release = cuda_release;
     t.upload = cuda_upload;
     t.download = cuda_download;
+    t.copy = cuda_copy;
     t.sync = cuda_sync;
     t.describe = cuda_describe;
     fill_kernel_ops(t);

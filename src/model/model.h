@@ -9,6 +9,7 @@
 #include <string>
 
 #include "loader/checkpoint.h"
+#include "model/kv_cache.h"
 
 namespace geneinfer {
 
@@ -41,6 +42,23 @@ public:
     // While it is on, a device waits after every operation, which makes the whole pass a little slower.
     virtual void set_profiling(bool) {}
     virtual std::string profile_report() const { return std::string(); }   // empty when nothing was measured
+};
+
+// A model whose KV cache is a paged pool shared by any number of sequences (model/kv_cache.h). The plain forward()
+// and forward_batch() of Model use one built-in sequence.
+class SequenceModel : public Model {
+public:
+    using Model::forward;
+    using Model::forward_batch;
+
+    virtual KvPool& kv_pool() = 0;
+    Sequence new_sequence() { return Sequence(kv_pool()); }
+
+    // The same as Model's on an explicit sequence. `pos` may be at most seq.length(): the next free position
+    // appends, an earlier one rewinds the sequence to it; a larger one leaves a gap and throws std::out_of_range.
+    // If the pool has no free block left, std::runtime_error is thrown and the sequence is unchanged.
+    virtual const float* forward(Sequence& seq, int token, int pos, bool compute_logits = true) = 0;
+    virtual const float* forward_batch(Sequence& seq, const int* tokens, int n, int pos0, bool compute_logits = true) = 0;
 };
 
 // device: "cpu" (or empty), "cuda", "emu" (host emulation of the device kernels, for tests). An empty name means

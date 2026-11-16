@@ -39,7 +39,7 @@ struct ForwardProfile {
     std::chrono::steady_clock::time_point last;
 };
 
-class Transformer : public Model {
+class Transformer : public SequenceModel {
 public:
     // The weights are not copied: they point into the checkpoint's memory mapping, so the
     // Checkpoint object must stay alive as long as this Transformer is used.
@@ -65,9 +65,8 @@ public:
 
     // The paged KV cache. Sequences created on it can be run independently of each other; the plain forward()
     // and forward_batch() below use one built-in sequence (position 0 starts it again).
-    KvPool& kv_pool() { return *kv_; }
+    KvPool& kv_pool() override { return *kv_; }
     const KvPool& kv_pool() const { return *kv_; }
-    Sequence new_sequence() { return Sequence(*kv_); }
 
     // Processes `token` at position `pos` and returns the logits (vocab_size floats) that
     // predict the next token. The returned pointer stays valid until the next forward() call.
@@ -82,7 +81,7 @@ public:
     // earlier one rewinds the sequence to it (the later positions are forgotten); a larger one would leave a gap
     // and throws std::out_of_range, as does a position beyond the context length. If the pool has no free block
     // left, std::runtime_error is thrown and the sequence is unchanged. Afterwards seq.length() == pos + 1.
-    const float* forward(Sequence& seq, int token, int pos, bool compute_logits = true);
+    const float* forward(Sequence& seq, int token, int pos, bool compute_logits = true) override;
 
     // Processes n tokens at the consecutive positions pos0 .. pos0+n-1 in one go (prompt processing, "prefill")
     // and returns the logits of the LAST token if compute_logits is true, otherwise nullptr. The KV cache ends up
@@ -93,7 +92,7 @@ public:
     // pos0 may be > 0 when earlier positions are already in the cache. While a trace callback is set, the tokens
     // are processed one by one so that the trace sees every token (same results, no speedup).
     const float* forward_batch(const int* tokens, int n, int pos0, bool compute_logits = true) override;
-    const float* forward_batch(Sequence& seq, const int* tokens, int n, int pos0, bool compute_logits = true);
+    const float* forward_batch(Sequence& seq, const int* tokens, int n, int pos0, bool compute_logits = true) override;
 
     // One forward pass over rows that belong to different sequences (continuous batching). Every row is one token of
     // one sequence; a sequence may own several consecutive rows (a prefill chunk). A row is processed at position

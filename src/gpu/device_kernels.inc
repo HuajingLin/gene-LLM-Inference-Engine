@@ -230,14 +230,39 @@ struct RopeKernel {
 };
 
 // ---------------------------------------------------------------------------------------------------------------
+// Paged KV cache: where the keys of position `pos` of row `row` start (add block_size * kv_dim for the values).
+static GI_DEV const float* gi_kv_row(const PagedKv& kv, long row, int pos) {
+    const long block = kv.tables[row * kv.table_stride + pos / kv.block_size];
+    return kv.pool + block * kv.block_floats + kv.layer_offset + static_cast<long>(pos % kv.block_size) * kv.kv_dim;
+}
+
+// store_kv: index = (keys or values, row, d).
+struct StoreKvKernel {
+    struct Args {
+        PagedKv kv;
+        const float* k;
+        const float* v;
+        int m;
+    };
+    static GI_DEV void body(long i, const Args& a) {
+        const long per = static_cast<long>(a.m) * a.kv.kv_dim;
+        const int which = static_cast<int>(i / per);   // 0: keys, 1: values
+        const long rem = i % per;
+        const long row = rem / a.kv.kv_dim;
+        const long d = rem % a.kv.kv_dim;
+        const float* dst = gi_kv_row(a.kv, row, a.kv.positions[row]) + (which ? static_cast<long>(a.kv.block_size) * a.kv.kv_dim : 0) + d;
+        const_cast<float*>(dst)[0] = (which ? a.v : a.k)[rem];
+    }
+};
+
 // attention, step 1: index = (row, head, key position j). score = q . k_j / sqrt(head_size) for j <= the row's
 // own position; later positions are left untouched (and never read).
 struct AttScoreKernel {
     struct Args {
         float* scores;   // [m, n_heads, len]
         const float* q;
-        const float* keys;
-        int len, pos0, n_heads, head_size, kv_mul, kv_dim;
+        PagedKv kv;
+        int len, n_heads, head_size, kv_mul;
         float inv_scale;
     };
     static GI_DEV void body(long i, const Args& a) {
@@ -245,9 +270,9 @@ struct AttScoreKernel {
         const long rest = i / a.len;
         const int h = static_cast<int>(rest % a.n_heads);
         const long row = rest / a.n_heads;
-        if (j > a.pos0 + row) return;
+        if (j > a.kv.positions[row]) return;
         const float* q = a.q + (row * a.n_heads + h) * a.head_size;
-        const float* k = a.keys + static_cast<long>(j) * a.kv_dim + (h / a.kv_mul) * a.head_size;
+        const float* k = gi_kv_row(a.kv, row, j) + (h / a.kv_mul) * a.head_size;
         float acc = 0.0f;
         for (int d = 0; d < a.head_size; ++d) acc = fmaf(q[d], k[d], acc);
         a.scores[i] = acc * a.inv_scale;
@@ -259,11 +284,11 @@ struct AttScoreKernel {
 struct AttSoftmaxKernel {
     struct Args {
         float* scores;
-        int len, pos0, n_heads;
+        const int* positions;
+        int len, n_heads;
     };
     static GI_DEV void body(long i, const Args& a) {
-        const long row = i / a.n_heads;
-        const int n = a.pos0 + static_cast<int>(row) + 1;
+        const int n = a.positions[i / a.n_heads] + 1;
         float* s = a.scores + i * a.len;
         float max_val = s[0];
         for (int j = 1; j < n; ++j) {
@@ -279,24 +304,29 @@ struct AttSoftmaxKernel {
     }
 };
 
-// attention, step 3: index = (row, head, d). out = sum_j p_j * v_j[d].
+// attention, step 3: index = (row, head, d). out = sum_j p_j * v_j[d], block after block in position order (so
+// the chain of additions is the same for every block size).
 struct AttMixKernel {
     struct Args {
         float* out;
         const float* scores;
-        const float* values;
-        int len, pos0, n_heads, head_size, kv_mul, kv_dim;
+        PagedKv kv;
+        int len, n_heads, head_size, kv_mul;
     };
     static GI_DEV void body(long i, const Args& a) {
         const int d = static_cast<int>(i % a.head_size);
         const long rh = i / a.head_size;
         const int h = static_cast<int>(rh % a.n_heads);
         const long row = rh / a.n_heads;
-        const int n = a.pos0 + static_cast<int>(row) + 1;
+        const int pos = a.kv.positions[row];
         const float* p = a.scores + rh * a.len;
-        const float* v = a.values + (h / a.kv_mul) * a.head_size + d;
+        const long value_off = static_cast<long>(a.kv.block_size) * a.kv.kv_dim + (h / a.kv_mul) * a.head_size + d;
         float acc = 0.0f;
-        for (int j = 0; j < n; ++j) acc = fmaf(p[j], v[static_cast<long>(j) * a.kv_dim], acc);
+        for (int start = 0; start <= pos; start += a.kv.block_size) {
+            const float* v = gi_kv_row(a.kv, row, start) + value_off;
+            const int count = pos + 1 - start < a.kv.block_size ? pos + 1 - start : a.kv.block_size;
+            for (int j = 0; j < count; ++j) acc = fmaf(p[start + j], v[static_cast<long>(j) * a.kv.kv_dim], acc);
+        }
         a.out[i] = acc;
     }
 };
@@ -364,15 +394,19 @@ static void op_rope(float* v, long stride, int m, int n, const float* cos_rows, 
     launch<RopeKernel>(a, static_cast<long>(m) * (n / 2));
 }
 
-static void op_attention(float* out, const float* q, const float* keys, const float* values, int m, int pos0,
-                         int n_heads, int head_size, int kv_mul, int kv_dim, float inv_scale, float* scores) {
-    const int len = pos0 + m;
+static void op_store_kv(const PagedKv& kv, const float* k, const float* v, int m) {
+    const StoreKvKernel::Args a{kv, k, v, m};
+    launch<StoreKvKernel>(a, 2L * m * kv.kv_dim);
+}
+
+static void op_attention(float* out, const float* q, const PagedKv& kv, int m, int max_len, int n_heads, int head_size,
+                         int kv_mul, float inv_scale, float* scores) {
     const long row_heads = static_cast<long>(m) * n_heads;
-    const AttScoreKernel::Args s{scores, q, keys, len, pos0, n_heads, head_size, kv_mul, kv_dim, inv_scale};
-    launch<AttScoreKernel>(s, row_heads * len);
-    const AttSoftmaxKernel::Args f{scores, len, pos0, n_heads};
+    const AttScoreKernel::Args s{scores, q, kv, max_len, n_heads, head_size, kv_mul, inv_scale};
+    launch<AttScoreKernel>(s, row_heads * max_len);
+    const AttSoftmaxKernel::Args f{scores, kv.positions, max_len, n_heads};
     launch<AttSoftmaxKernel>(f, row_heads);
-    const AttMixKernel::Args x{out, scores, values, len, pos0, n_heads, head_size, kv_mul, kv_dim};
+    const AttMixKernel::Args x{out, scores, kv, max_len, n_heads, head_size, kv_mul};
     launch<AttMixKernel>(x, row_heads * head_size);
 }
 
@@ -391,6 +425,7 @@ static void fill_kernel_ops(DeviceOps& t) {
     t.rmsnorm = op_rmsnorm;
     t.matmul = op_matmul;
     t.rope = op_rope;
+    t.store_kv = op_store_kv;
     t.attention = op_attention;
     t.add = op_add;
     t.silu_mul = op_silu_mul;

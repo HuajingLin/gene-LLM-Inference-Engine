@@ -17,6 +17,18 @@
 namespace geneinfer {
 namespace gpu {
 
+// One layer of a paged KV cache on the device (model/kv_cache.h): the pool is [n_blocks][block_floats] floats, and
+// inside a block every layer has block_size rows of keys followed by block_size rows of values, kv_dim floats each.
+struct PagedKv {
+    float* pool;
+    const int* tables;      // [rows, table_stride]: the block ids of each row's sequence
+    const int* positions;   // [rows]: the position of each row in its sequence
+    long table_stride;
+    long block_floats;      // floats of one block (all layers, keys and values)
+    long layer_offset;      // floats from the start of a block to this layer's keys
+    int block_size, kv_dim;
+};
+
 struct DeviceOps {
     const char* name;   // "cuda" or "emu"
 
@@ -48,11 +60,18 @@ struct DeviceOps {
     void (*rope)(float* v, long stride, int m, int n, const float* cos_rows, const float* sin_rows, int head_size,
                  int half_split);
 
-    // Attention of m rows over one layer of a contiguous KV cache (keys, values: [positions, kv_dim]). Row i is
-    // position pos0 + i and attends to positions 0 .. pos0 + i. q and out are [m, n_heads * head_size]; query
-    // head h uses KV head h / kv_mul. `scores` is scratch for m * n_heads * (pos0 + m) floats.
-    void (*attention)(float* out, const float* q, const float* keys, const float* values, int m, int pos0,
-                      int n_heads, int head_size, int kv_mul, int kv_dim, float inv_scale, float* scores);
+    // Stores the new keys and values of m rows (k, v: [m, kv_dim]) into their blocks: row i goes to position
+    // kv.positions[i] of the sequence whose block table is row i of kv.tables.
+    void (*store_kv)(const PagedKv& kv, const float* k, const float* v, int m);
+
+    // Paged attention of m rows over one layer of the block pool. Row i attends to the positions
+    // 0 .. kv.positions[i] of its sequence, found through its block table. q and out are [m, n_heads * head_size];
+    // query head h uses KV head h / kv_mul. `scores` is scratch for m * n_heads * max_len floats, where max_len is
+    // the largest position + 1. The result of a row depends neither on the block size nor on where its blocks are.
+    void (*attention)(float* out, const float* q, const PagedKv& kv, int m, int max_len, int n_heads, int head_size,
+                      int kv_mul, float inv_scale, float* scores);
+
+    void (*copy)(void* dst, const void* src, std::size_t bytes);   // device -> device (ordered after the kernels)
 
     void (*add)(float* a, const float* b, long n);        // a += b
     void (*silu_mul)(float* a, const float* b, long n);   // a = silu(a) * b

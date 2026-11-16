@@ -1,16 +1,22 @@
-// gpu_transformer.h - the forward pass on a compute device (see gpu/device_ops.h), for ONE sequence.
+// gpu_transformer.h - the forward pass on a compute device (see gpu/device_ops.h).
 //
 // The weights are copied to device memory once (float32 or bfloat16, as the checkpoint holds them); activations
-// and the KV cache live there too. Per call only the token ids and the rotary cos/sin rows go to the device and
-// only the logits (vocab_size floats) come back. The KV cache is contiguous: [layer][position][kv_dim].
+// and the KV cache live there too. Per pass only the token ids, the rotary cos/sin rows and the block tables go to
+// the device and only the logits (vocab_size floats) come back.
+//
+// The KV cache is the paged pool of model/kv_cache.h: KvPool keeps the free list and the reference counts on the
+// host, the block memory is on the device, and the attention kernels find every key and value through the block
+// table of the row's sequence (vLLM's PagedAttention). Sequences, prefix sharing (retain + adopt) and
+// copy-on-write work as on the CPU.
 //
 // The math is the same as Transformer's, but sums are formed in a different order (32 partial sums per matrix
 // row, fused multiply-adds), so results agree with the CPU to rounding (about 1e-5 relative), not bit for bit.
-// forward_batch() and forward() give the same values for a position whatever the batch size.
+// The values of a position depend neither on the batch size, nor on the block size, nor on which blocks hold it.
 #pragma once
 
 #include <chrono>
 #include <cstddef>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -19,18 +25,24 @@
 
 namespace geneinfer {
 
-class GpuTransformer : public Model {
+class GpuTransformer : public SequenceModel {
 public:
     // The Checkpoint is only needed during construction. `max_seq_len` caps the context (0 = the model's);
     // `max_batch` is the most tokens one pass processes (0 = the environment variable GI_BATCH, default 64).
+    // `block_size` and `kv_blocks` shape the paged KV cache as for Transformer: positions per block (0 = the
+    // environment variable GI_BLOCK_SIZE, default 16) and blocks in the pool (0 = enough for one full sequence).
     // Throws std::runtime_error if the checkpoint holds int8 weights or the device has too little memory.
-    GpuTransformer(const Checkpoint& checkpoint, const gpu::DeviceOps* device, int max_seq_len = 0, int max_batch = 0);
+    GpuTransformer(const Checkpoint& checkpoint, const gpu::DeviceOps* device, int max_seq_len = 0, int max_batch = 0,
+                   int block_size = 0, int kv_blocks = 0);
     ~GpuTransformer() override;
     GpuTransformer(const GpuTransformer&) = delete;
     GpuTransformer& operator=(const GpuTransformer&) = delete;
 
     const float* forward(int token, int pos, bool compute_logits = true) override;
     const float* forward_batch(const int* tokens, int n, int pos0, bool compute_logits = true) override;
+    const float* forward(Sequence& seq, int token, int pos, bool compute_logits = true) override;
+    const float* forward_batch(Sequence& seq, const int* tokens, int n, int pos0, bool compute_logits = true) override;
+    KvPool& kv_pool() override { return *kv_; }
 
     const Config& config() const override { return cfg_; }
     int max_seq_len() const override { return ctx_len_; }
@@ -62,7 +74,9 @@ private:
     DMat upload_matrix(const Mat& m, std::size_t rows, std::size_t cols);
     const float* upload_vector(const float* v, std::size_t n);
     void matmul(float* out, long out_stride, const DMat& w, const float* x, long x_stride, int ntok, int rows, int cols);
-    void run(const int* tokens, int m, int pos0, bool want_logits);
+    // m rows in one pass: row i is tokens[i] at positions[i] of seqs[i] (blocks reserved and writable). Rows of one
+    // sequence come in increasing position order. Logits of the last row if want_logits.
+    void run_rows(const int* tokens, Sequence* const* seqs, const int* positions, int m, bool want_logits);
     void trace_row(const char* tag, int layer, const float* device_row);
 
     enum Section { Transfer, Embed, Norm, QkvProj, Rope, Attention, OutProj, FfnGateUp, Activation, FfnDown, Residual,
@@ -80,7 +94,6 @@ private:
     Config cfg_;
     int ctx_len_ = 0;
     int max_batch_ = 64;
-    int length_ = 0;   // positions in the KV cache
 
     std::vector<void*> allocations_;
     std::vector<std::pair<const void*, const void*>> uploaded_;   // host address -> device address (tied weights)
@@ -90,8 +103,14 @@ private:
     const float* rms_final_ = nullptr;
     std::vector<DLayer> layers_;
 
-    float* keys_ = nullptr;     // [n_layers, ctx_len, kv_dim]
-    float* values_ = nullptr;
+    float* pool_dev_ = nullptr;                // [kv_blocks][block_floats], the block memory of kv_
+    float *kbuf_ = nullptr, *vbuf_ = nullptr;  // [max_batch, kv_dim] new keys / values before they go into their blocks
+    int* tables_dev_ = nullptr;                // [max_batch, blocks of a full context]
+    int* positions_dev_ = nullptr;             // [max_batch]
+    std::vector<int> tables_host_;
+    std::vector<Sequence*> row_seq_;
+    std::vector<int> row_pos_;
+    std::vector<float> row_cos_, row_sin_;     // [max_batch, head_size / 2] rows gathered for one pass
     float *x_ = nullptr, *xb_ = nullptr, *xb2_ = nullptr, *hb_ = nullptr, *hb2_ = nullptr, *q_ = nullptr, *ao_ = nullptr;
     float* logits_dev_ = nullptr;
     float* partial_ = nullptr;
@@ -104,6 +123,9 @@ private:
     std::vector<float> logits_;                // host copy returned by forward()
     std::vector<float> trace_buf_;
     TraceFn trace_;
+
+    std::unique_ptr<KvPool> kv_;              // bookkeeping of the device blocks
+    std::unique_ptr<Sequence> default_seq_;   // declared after kv_: destroyed first, gives its blocks back
 };
 
 }  // namespace geneinfer

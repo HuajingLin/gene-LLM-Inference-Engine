@@ -1,7 +1,8 @@
 // multiseq_check_main.cpp - several sequences sharing one paged KV pool.
 //
-//   gi_multiseq <model> --max-seq-len N [--block-size B] [--kv-blocks K] [--seed S] [--mode interleave|rows|cow|exhaust|rows_exhaust]
+//   gi_multiseq <model> --max-seq-len N [--block-size B] [--kv-blocks K] [--seed S] [--mode interleave|rows|cow|exhaust|rows_exhaust] [--device cpu|cuda|emu]
 //
+// On a device (--device cuda or emu) the modes interleave, cow and exhaust run; rows and rows_exhaust need the CPU.
 // interleave: three sequences (random token streams) are run alone to get reference logits, then run again in a
 //   random interleaving of single-token steps and small batches on one shared pool, with random rewinds
 //   (re-running earlier positions). Every logits row must be bit-identical to the reference.
@@ -20,12 +21,14 @@
 #include <cstring>
 #include <algorithm>
 #include <exception>
+#include <memory>
 #include <stdexcept>
 #include <random>
 #include <utility>
 #include <string>
 #include <vector>
 
+#include "gpu/gpu_transformer.h"
 #include "model/transformer.h"
 
 using namespace geneinfer;
@@ -47,7 +50,7 @@ std::vector<int> random_tokens(std::mt19937& rng, int n, int vocab) {
 }
 
 // Reference: logits after every position, one token at a time, on a fresh sequence.
-std::vector<std::vector<float>> run_alone(Transformer& m, const std::vector<int>& toks, int vocab) {
+std::vector<std::vector<float>> run_alone(SequenceModel& m, const std::vector<int>& toks, int vocab) {
     Sequence seq = m.new_sequence();
     std::vector<std::vector<float>> out;
     for (std::size_t i = 0; i < toks.size(); ++i) {
@@ -61,7 +64,7 @@ bool same(const float* a, const std::vector<float>& b) {
     return std::memcmp(a, b.data(), b.size() * sizeof(float)) == 0;
 }
 
-void interleave(Transformer& m, std::mt19937& rng, int vocab, int ctx) {
+void interleave(SequenceModel& m, std::mt19937& rng, int vocab, int ctx) {
     const int nseq = 3;
     std::vector<std::vector<int>> toks;
     std::vector<std::vector<std::vector<float>>> ref;
@@ -255,7 +258,7 @@ void rows_exhaust(Transformer& m, std::mt19937& rng, int vocab) {
     std::printf("ok rows_exhaust: refused cleanly, state unchanged, still usable\n");
 }
 
-void cow_mode(Transformer& m, std::mt19937& rng, int vocab, int ctx) {
+void cow_mode(SequenceModel& m, std::mt19937& rng, int vocab, int ctx) {
     KvPool& pool = m.kv_pool();
     const int bs = pool.block_size();
     int rounds = 0;
@@ -290,11 +293,16 @@ void cow_mode(Transformer& m, std::mt19937& rng, int vocab, int ctx) {
         } else if (variant == 1) {
             const float* l = m.forward_batch(sb, b.data() + m_rewind, static_cast<int>(b.size()) - m_rewind, m_rewind, true);
             expect(same(l, ref_b.back()), "B (forward_batch) differs from its reference after copy-on-write");
-        } else {
+        } else if (Transformer* cpu = dynamic_cast<Transformer*>(&m)) {
             std::vector<Transformer::StepRow> rows;
             for (std::size_t i = static_cast<std::size_t>(m_rewind); i < b.size(); ++i) rows.push_back({&sb, b[i], i + 1 == b.size()});
-            const float* l = m.forward_rows(rows.data(), static_cast<int>(rows.size()));
+            const float* l = cpu->forward_rows(rows.data(), static_cast<int>(rows.size()));
             expect(l != nullptr && same(l, ref_b.back()), "B (forward_rows) differs from its reference after copy-on-write");
+        } else {   // a device model has no forward_rows yet: single steps and one batch mixed
+            const std::size_t split = static_cast<std::size_t>(m_rewind) + 2;
+            for (std::size_t i = static_cast<std::size_t>(m_rewind); i < split; ++i) m.forward(sb, b[i], static_cast<int>(i), false);
+            const float* l = m.forward_batch(sb, b.data() + split, static_cast<int>(b.size() - split), static_cast<int>(split), true);
+            expect(same(l, ref_b.back()), "B (steps + batch) differs from its reference after copy-on-write");
         }
         expect(sb.block_table()[(m_rewind) / bs] != sa.block_table()[m_rewind / bs], "B still shares the block it wrote into");
         // A goes on and must not have seen B's writes
@@ -314,7 +322,7 @@ void cow_mode(Transformer& m, std::mt19937& rng, int vocab, int ctx) {
     std::printf("ok cow: %d rounds, diverged sequences match their references\n", rounds);
 }
 
-void exhaust(Transformer& m, std::mt19937& rng, int vocab) {
+void exhaust(SequenceModel& m, std::mt19937& rng, int vocab) {
     KvPool& pool = m.kv_pool();
     const int capacity = pool.n_blocks() * pool.block_size();
     const std::vector<int> a = random_tokens(rng, capacity + 1, vocab);
@@ -373,7 +381,7 @@ int main(int argc, char** argv) {
     try {
         int ctx = 0, bs = 0, nblocks = 0;
         unsigned seed = 1;
-        std::string mode = "interleave";
+        std::string mode = "interleave", device = "cpu";
         for (int i = 2; i < argc; ++i) {
             const std::string a = argv[i];
             if (i + 1 >= argc) throw std::runtime_error(a + " needs a value");
@@ -383,15 +391,21 @@ int main(int argc, char** argv) {
             else if (a == "--kv-blocks") nblocks = std::stoi(v);
             else if (a == "--seed") seed = static_cast<unsigned>(std::stoul(v));
             else if (a == "--mode") mode = v;
+            else if (a == "--device") device = v;
             else throw std::runtime_error("unknown option " + a);
         }
         const Checkpoint ck = Checkpoint::load(argv[1]);
-        Transformer m(ck, ctx, 0, 0, bs, nblocks);
+        std::unique_ptr<SequenceModel> model;
+        if (device == "cpu") model = std::make_unique<Transformer>(ck, ctx, 0, 0, bs, nblocks);
+        else model = std::make_unique<GpuTransformer>(ck, gpu::device_by_name(device), ctx, 0, bs, nblocks);
+        SequenceModel& m = *model;
+        Transformer* cpu = dynamic_cast<Transformer*>(model.get());
+        if (!cpu && (mode == "rows" || mode == "rows_exhaust")) throw std::runtime_error("mode " + mode + " needs --device cpu");
         std::mt19937 rng(seed);
         const int vocab = m.config().vocab_size;
         if (mode == "interleave") interleave(m, rng, vocab, m.max_seq_len());
-        else if (mode == "rows") rows_mode(m, rng, vocab, m.max_seq_len());
-        else if (mode == "rows_exhaust") rows_exhaust(m, rng, vocab);
+        else if (mode == "rows") rows_mode(*cpu, rng, vocab, m.max_seq_len());
+        else if (mode == "rows_exhaust") rows_exhaust(*cpu, rng, vocab);
         else if (mode == "cow") cow_mode(m, rng, vocab, m.max_seq_len());
         else if (mode == "exhaust") exhaust(m, rng, vocab);
         else throw std::runtime_error("unknown mode " + mode);

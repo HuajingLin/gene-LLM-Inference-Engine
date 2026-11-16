@@ -7,19 +7,23 @@
 
 namespace geneinfer {
 
-KvPool::KvPool(int n_layers, int kv_dim, int block_size, int n_blocks)
-    : n_layers_(n_layers), kv_dim_(kv_dim), block_size_(block_size), n_blocks_(n_blocks) {
+KvPool::KvPool(int n_layers, int kv_dim, int block_size, int n_blocks) : KvPool(n_layers, kv_dim, block_size, n_blocks, nullptr) {
+    mem_.reset(new float[block_floats_ * static_cast<std::size_t>(n_blocks)]);   // not zero-filled, see the header
+}
+
+KvPool::KvPool(int n_layers, int kv_dim, int block_size, int n_blocks, CopyFn copy_storage)
+    : n_layers_(n_layers), kv_dim_(kv_dim), block_size_(block_size), n_blocks_(n_blocks), copy_storage_(std::move(copy_storage)) {
     if (n_layers < 1 || kv_dim < 1 || block_size < 1 || n_blocks < 1) {
         throw std::invalid_argument("KvPool: layers, kv_dim, block_size and n_blocks must all be >= 1");
     }
     block_floats_ = static_cast<std::size_t>(n_layers) * 2 * static_cast<std::size_t>(block_size) * static_cast<std::size_t>(kv_dim);
-    mem_.reset(new float[block_floats_ * static_cast<std::size_t>(n_blocks)]);   // not zero-filled, see the header
     refs_.assign(static_cast<std::size_t>(n_blocks), 0);
     free_.reserve(static_cast<std::size_t>(n_blocks));
     for (int b = n_blocks - 1; b >= 0; --b) free_.push_back(b);   // block 0 is handed out first
 }
 
 float* KvPool::base(int block, int layer) const {
+    if (!mem_) throw std::logic_error("KvPool: the block memory is not on the host");
     return mem_.get() + static_cast<std::size_t>(block) * block_floats_ +
            static_cast<std::size_t>(layer) * 2 * row_floats();
 }
@@ -55,6 +59,10 @@ void KvPool::copy_block(int from, int to) {
     if (from < 0 || from >= n_blocks_ || to < 0 || to >= n_blocks_ || from == to || refs_[static_cast<std::size_t>(from)] < 1 ||
         refs_[static_cast<std::size_t>(to)] < 1) {
         throw std::logic_error("KvPool::copy_block: both blocks must be different allocated blocks");
+    }
+    if (!mem_) {
+        copy_storage_(from, to);
+        return;
     }
     std::memcpy(mem_.get() + static_cast<std::size_t>(to) * block_floats_, mem_.get() + static_cast<std::size_t>(from) * block_floats_,
                 block_floats_ * sizeof(float));
@@ -120,6 +128,15 @@ bool Sequence::make_writable(int index) {
     pool_->copy_block(b, fresh);
     pool_->release(b);
     blocks_[static_cast<std::size_t>(index)] = fresh;
+    return true;
+}
+
+bool Sequence::prepare_write(int first, int last) {
+    if (!reserve(last + 1)) return false;
+    const int bs = pool_->block_size();
+    for (int idx = first / bs; idx <= last / bs; ++idx) {
+        if (!make_writable(idx)) return false;
+    }
     return true;
 }
 

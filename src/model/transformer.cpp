@@ -477,12 +477,7 @@ void Transformer::run_rows(const int* tokens, Sequence* const* seqs, const int* 
 // Room for positions first..last of seq, and every block they touch belongs to seq alone (copy-on-write). Blocks that are
 // still shared with the prefix cache or another sequence are copied first, so a write never changes what others read.
 bool Transformer::prepare_write(Sequence& seq, int first, int last) {
-    if (!seq.reserve(last + 1)) return false;
-    const int bs = kv_->block_size();
-    for (int idx = first / bs; idx <= last / bs; ++idx) {
-        if (!seq.make_writable(idx)) return false;
-    }
-    return true;
+    return seq.prepare_write(first, last);
 }
 
 const float* Transformer::forward_rows(const StepRow* rows, int n) {

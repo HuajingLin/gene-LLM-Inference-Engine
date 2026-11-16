@@ -91,6 +91,7 @@ DeviceOps make_emu_ops() {
     t.release = emu_release;
     t.upload = emu_copy;
     t.download = emu_copy;
+    t.copy = emu_copy;
     t.sync = emu_sync;
     t.describe = emu_describe;
     fill_kernel_ops(t);

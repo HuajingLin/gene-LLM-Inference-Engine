@@ -14,6 +14,7 @@
 #pragma once
 
 #include <cstddef>
+#include <functional>
 #include <memory>
 #include <vector>
 
@@ -23,6 +24,11 @@ class KvPool {
 public:
     // block_size >= 1 positions per block; n_blocks >= 1. Throws std::invalid_argument for bad sizes.
     KvPool(int n_layers, int kv_dim, int block_size, int n_blocks);
+    // A pool whose block memory lives somewhere else (on a GPU): this object then only does the bookkeeping (free
+    // list, reference counts) and calls `copy_storage(from, to)` when a block has to be copied. keys() / values()
+    // must not be used on such a pool (they throw std::logic_error).
+    using CopyFn = std::function<void(int from, int to)>;
+    KvPool(int n_layers, int kv_dim, int block_size, int n_blocks, CopyFn copy_storage);
     KvPool(const KvPool&) = delete;
     KvPool& operator=(const KvPool&) = delete;
 
@@ -31,7 +37,9 @@ public:
     int block_size() const { return block_size_; }
     int n_blocks() const { return n_blocks_; }
     int free_blocks() const { return static_cast<int>(free_.size()); }
+    std::size_t block_floats() const { return block_floats_; }   // floats of one block: all layers, keys and values
     std::size_t block_bytes() const { return block_floats_ * sizeof(float); }
+    bool has_host_memory() const { return mem_ != nullptr; }
     std::size_t bytes() const { return block_bytes() * static_cast<std::size_t>(n_blocks_); }
 
     // A free block with reference count 1, or -1 when the pool is exhausted. Blocks come back in the order they
@@ -54,7 +62,8 @@ private:
 
     int n_layers_, kv_dim_, block_size_, n_blocks_;
     std::size_t block_floats_;
-    std::unique_ptr<float[]> mem_;
+    std::unique_ptr<float[]> mem_;   // null when the storage is external
+    CopyFn copy_storage_;
     std::vector<int> refs_;
     std::vector<int> free_;   // stack of free block ids
 };
@@ -96,6 +105,11 @@ public:
     // fresh block if somebody else (another sequence, the prefix cache) shares it. Returns false when the pool has no
     // block left for the copy (nothing changed). Always call it before writing into a block that may be shared.
     bool make_writable(int index);
+
+    // Everything a forward pass needs before it writes the positions first .. last: room for them (reserve) and
+    // every block they touch owned by this sequence alone (make_writable). False when the pool has no block left;
+    // blocks obtained on the way are kept (truncate(length()) gives them back).
+    bool prepare_write(int first, int last);
 
 private:
     KvPool* pool_;

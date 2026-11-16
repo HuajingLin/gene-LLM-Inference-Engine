@@ -13,6 +13,8 @@ The device kernels are one source (src/gpu/device_kernels.inc) compiled twice: f
                   On a GPU all indices run at once, so a kernel whose result depends on their order is wrong.
   3. batching     prefill in batches of many sizes (around the kernel's 8-token chunks and the batch limit), on
                   top of an existing cache or not: bit-identical to feeding the tokens one by one
+  3b. paging      the KV cache is a block pool on the device: any block size gives the same bits; several sequences
+                  interleaved on one pool, shared prefix blocks with copy-on-write, and an exhausted pool (gi_multiseq)
   4. restart      a new sequence after an old one (stale keys and values in the cache): bit-identical
   5. generation   greedy text from gi_generate equals the CPU's
   6. errors       unknown device, int8 weights, a position gap, a token id out of range
@@ -73,9 +75,10 @@ def main() -> int:
     fwd = Path(args.build) / "gi_forward"
     gen = Path(args.build) / "gi_generate"
     check = Path(args.build) / "gi_device_check"
+    multiseq = Path(args.build) / "gi_multiseq"
     dev = {"GI_DEVICE": args.device}
     failures: list[str] = []
-    counts = {"operations": 0, "reference": 0, "order": 0, "batching": 0, "restart": 0, "generation": 0, "errors": 0, "cuda-vs-emu": 0}
+    counts = {"operations": 0, "reference": 0, "order": 0, "batching": 0, "paging": 0, "restart": 0, "generation": 0, "errors": 0, "cuda-vs-emu": 0}
 
     with tempfile.TemporaryDirectory() as tmp_s:
         tmp = Path(tmp_s)
@@ -144,6 +147,30 @@ def main() -> int:
                     g = got.reshape(-1, vocab) if got.size == base[prefill - 1:].size else None
                     e = err(g, base[prefill - 1:]) if g is not None else float("inf")
                     failures.append(f"[{label}] {' '.join(extra)}: logits differ from token by token (error {e:.2e})")
+            # The block size of the paged KV cache changes nothing, not even the last bit.
+            for bsize in (1, 3, 7, 64, 1000):
+                for extra in ([], ["--prefill", "150", "--max-batch", "23"]):
+                    got, stderr, code = forward(fwd, d, seq, extra, {**dev, "GI_BLOCK_SIZE": str(bsize)})
+                    counts["paging"] += 1
+                    first = int(extra[1]) - 1 if extra else 0
+                    if code != 0:
+                        failures.append(f"[{label}] block size {bsize} {' '.join(extra)}: {stderr.strip()}")
+                    elif got.tobytes() != base[first:].tobytes():
+                        failures.append(f"[{label}] block size {bsize} {' '.join(extra)}: logits differ from block size 16")
+            # Several sequences on one pool (gi_multiseq): interleaved steps, batches and rewinds, shared prefixes with
+            # copy-on-write, and a pool that runs out; every logits row bit-identical to the sequence running alone.
+            ctx = 40
+            for bsize in (1, 3, 4, 16, 64):
+                per = (ctx + bsize - 1) // bsize
+                runs = [(["--kv-blocks", str(3 * per + 3), "--seed", str(s)], "interleave") for s in (1, 2)]
+                runs += [(["--kv-blocks", str(6 * per + 6), "--seed", str(s), "--mode", "cow"], "cow") for s in (1, 2, 3)]
+                runs += [(["--kv-blocks", str(nb), "--seed", "7", "--mode", "exhaust"], "exhaust") for nb in (1, 2, 5) if nb * bsize <= ctx]
+                for extra, what in runs:
+                    p = subprocess.run([str(multiseq), str(d), "--max-seq-len", str(ctx), "--block-size", str(bsize), "--device", args.device, *extra],
+                                       capture_output=True, text=True)
+                    counts["paging"] += 1
+                    if p.returncode != 0 or not p.stdout.rstrip().endswith("PASS"):
+                        failures.append(f"[{label}] gi_multiseq {what} block size {bsize} {' '.join(extra)}: {(p.stdout + p.stderr).strip()[-200:]}")
             for extra in ([], ["--prefill", "150"], ["--prefill", "20", "--max-batch", "6"]):
                 got, stderr, code = forward(fwd, d, seq, ["--decoy", *extra], dev)
                 counts["restart"] += 1
